@@ -53,7 +53,13 @@ struct device_group {
   uint8_t initial_status_requests_remaining;
   uint8_t multicasts_remaining;
   char group_name[TOPSZ];
-  uint8_t message[128];
+  // Era 128 bytes — achado um overflow real aqui (memcpy de item string sem
+  // checagem de limite, ver o bounds-check adicionado no loop de
+  // ProcessDeviceGroupMessage/item-writing). Dobrado pra 256 como margem
+  // de segurança adicional, e a checagem de limite agora barra qualquer
+  // mensagem que não caiba, em vez de escrever fora do array (docs/00-diario-de-bordo.md
+  // no repo CasaInteligente tem o diagnóstico completo).
+  uint8_t message[256];
   struct device_group_member * device_group_members;
 #ifdef USE_DEVICE_GROUPS_SEND
   uint8_t values_8bit[DGR_ITEM_LAST_8BIT];
@@ -470,6 +476,16 @@ write_log:
 
   // If this is a message being sent, send it.
   else {
+    // Se o WiFi ainda não terminou de conectar (comum logo no boot, no
+    // pequeno intervalo entre o anúncio inicial do Device Groups e a
+    // associação com o AP completar), nem tenta mandar — só loga em
+    // DEBUG, sem gastar as 5 tentativas nem assustar ninguém com um
+    // "DGR: Error sending message" em nível ERROR pra algo esperado e
+    // que se resolve sozinho no próximo ciclo de anúncio periódico.
+    if (Wifi.status != WL_CONNECTED) {
+      AddLog(LOG_LEVEL_DEBUG, PSTR("DGR: WiFi ainda não conectado, adiando envio"));
+      goto cleanup;
+    }
     int attempt;
     IPAddress ip_address = (device_group_member ? device_group_member->ip_address : IPAddress(DEVICE_GROUPS_ADDRESS));
     AddLog(LOG_LEVEL_DEBUG, PSTR("DGR-DBG: about to send %d bytes to %s (member=%p)"), message_length, IPAddressToString(ip_address), device_group_member);
@@ -774,31 +790,24 @@ bool _SendDeviceGroupMessage(int32_t device, DevGroupMessageType message_type, .
         }
       }
       if (shared) {
-        if (item_ptr->flags) {
-          *message_ptr++ = DGR_ITEM_FLAGS;
-          *message_ptr++ = item_ptr->flags;
-        }
-        *message_ptr++ = item;
-
-        // For integer items, add the value to the message.
+        // BUGFIX: calcula o tamanho necessário ANTES de escrever qualquer
+        // byte, e recusa o item (com log de erro) se não couber no buffer
+        // fixo `device_group->message[]` — o código original escrevia
+        // (inclusive o memcpy do valor de itens string, ex: DGR_ITEM_COMMAND)
+        // sem NENHUMA checagem de limite, causando overflow de heap real e
+        // reproduzível (crash LoadProhibited, sempre no mesmo ponto —
+        // rastreado via addr2line, ver docs/00-diario-de-bordo.md no repo
+        // CasaInteligente). Isso não é hipotético: um `DevGroupSend` nosso
+        // com grupo+comando um pouco mais longos (~135 bytes) já estourava
+        // o limite de 128 bytes de antes.
+        int dgr_item_needed = (item_ptr->flags ? 2 : 0) + 1;  // flags(opcional) + byte do item
         if (item <= DGR_ITEM_MAX_32BIT) {
-          value = item_ptr->value;
-          *message_ptr++ = value & 0xff;
+          dgr_item_needed += 1;
           if (item > DGR_ITEM_MAX_8BIT) {
-            value >>= 8;
-            *message_ptr++ = value & 0xff;
-            if (item > DGR_ITEM_MAX_16BIT) {
-              value >>= 8;
-              *message_ptr++ = value & 0xff;
-              value >>= 8;
-              // For the power item, the device count is overlayed onto the highest 8 bits.
-              if (item == DGR_ITEM_POWER && !value) value = (!Settings->flag4.multiple_device_groups && device_group_index == 0 && first_device_group_is_local ? TasmotaGlobal.devices_present : 1);
-              *message_ptr++ = value;
-            }
+            dgr_item_needed += 1;
+            if (item > DGR_ITEM_MAX_16BIT) dgr_item_needed += 2;
           }
         }
-
-        // For string items and special items, get the value length.
         else {
           if (item <= DGR_ITEM_MAX_STRING) {
             value = strlen((const char *)item_ptr->value_ptr) + 1;
@@ -810,11 +819,45 @@ bool _SendDeviceGroupMessage(int32_t device, DevGroupMessageType message_type, .
                 break;
             }
           }
+          dgr_item_needed += 1 + value;  // byte de tamanho + dado
+        }
 
-          // Load the length and copy the value.
-          *message_ptr++ = value;
-          memcpy(message_ptr, item_ptr->value_ptr, value);
-          message_ptr += value;
+        uint8_t * dgr_message_end = device_group->message + sizeof(device_group->message);
+        if (message_ptr + dgr_item_needed > dgr_message_end) {
+          AddLog(LOG_LEVEL_ERROR, PSTR("DGR: mensagem do grupo '%s' grande demais (item=%u precisa de %d bytes, só %d disponíveis) - item descartado"),
+                 device_group->group_name, item, dgr_item_needed, (int)(dgr_message_end - message_ptr));
+        }
+        else {
+          if (item_ptr->flags) {
+            *message_ptr++ = DGR_ITEM_FLAGS;
+            *message_ptr++ = item_ptr->flags;
+          }
+          *message_ptr++ = item;
+
+          // For integer items, add the value to the message.
+          if (item <= DGR_ITEM_MAX_32BIT) {
+            value = item_ptr->value;
+            *message_ptr++ = value & 0xff;
+            if (item > DGR_ITEM_MAX_8BIT) {
+              value >>= 8;
+              *message_ptr++ = value & 0xff;
+              if (item > DGR_ITEM_MAX_16BIT) {
+                value >>= 8;
+                *message_ptr++ = value & 0xff;
+                value >>= 8;
+                // For the power item, the device count is overlayed onto the highest 8 bits.
+                if (item == DGR_ITEM_POWER && !value) value = (!Settings->flag4.multiple_device_groups && device_group_index == 0 && first_device_group_is_local ? TasmotaGlobal.devices_present : 1);
+                *message_ptr++ = value;
+              }
+            }
+          }
+
+          // For string items and special items, the length was already computed above.
+          else {
+            *message_ptr++ = value;
+            memcpy(message_ptr, item_ptr->value_ptr, value);
+            message_ptr += value;
+          }
         }
       }
     }
