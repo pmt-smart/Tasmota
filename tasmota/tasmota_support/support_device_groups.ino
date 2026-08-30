@@ -221,6 +221,8 @@ void SendReceiveDeviceGroupMessage(struct device_group * device_group, struct de
   int log_remaining;
   char * log_ptr;
 
+  AddLog(LOG_LEVEL_DEBUG, PSTR("DGR-DBG: SendReceiveDeviceGroupMessage enter, device_group=%p, device_group_member=%p, message=%p, len=%d, received=%d"), device_group, device_group_member, message, message_length, received);
+
   // Find the end and start of the actual message (after the header).
   uint8_t * message_end_ptr = message + message_length;
   uint8_t * message_ptr = message + strlen((char *)message) + 1;
@@ -254,9 +256,11 @@ void SendReceiveDeviceGroupMessage(struct device_group * device_group, struct de
   if (device_group_member) {
     if (received) {
       if (!(flags & DGR_FLAG_MORE_TO_COME)) {
+        AddLog(LOG_LEVEL_DEBUG, PSTR("DGR-DBG: recursing to send ACK back to member=%p"), device_group_member);
         *(message_ptr - 2) = DGR_FLAG_ACK;
         *(message_ptr - 1) = 0;
         SendReceiveDeviceGroupMessage(device_group, device_group_member, message, message_ptr - message, false);
+        AddLog(LOG_LEVEL_DEBUG, PSTR("DGR-DBG: back from ACK recursion, member=%p"), device_group_member);
       }
     }
 
@@ -468,6 +472,7 @@ write_log:
   else {
     int attempt;
     IPAddress ip_address = (device_group_member ? device_group_member->ip_address : IPAddress(DEVICE_GROUPS_ADDRESS));
+    AddLog(LOG_LEVEL_DEBUG, PSTR("DGR-DBG: about to send %d bytes to %s (member=%p)"), message_length, IPAddressToString(ip_address), device_group_member);
     for (attempt = 1; attempt <= 5; attempt++) {
       if (device_groups_udp.beginPacket(ip_address, DEVICE_GROUPS_PORT)) {
         device_groups_udp.write(message, message_length);
@@ -475,6 +480,7 @@ write_log:
       }
       delay(10);
     }
+    AddLog(LOG_LEVEL_DEBUG, PSTR("DGR-DBG: send attempt result, attempts_used=%d"), attempt);
     if (attempt > 5) AddLog(LOG_LEVEL_ERROR, PSTR("DGR: Error sending message"));
   }
   goto cleanup;
@@ -865,9 +871,14 @@ void ProcessDeviceGroupMessage(uint8_t * message, int message_length)
   uint8_t device_group_index = 0;
   struct device_group * device_group = device_groups;
   char * message_group_name = (char *)message + sizeof(DEVICE_GROUP_MESSAGE) - 1;
+  AddLog(LOG_LEVEL_DEBUG, PSTR("DGR-DBG: ProcessDeviceGroupMessage enter, len=%d, group_name='%s', device_groups=%p"), message_length, message_group_name, device_groups);
   for (;;) {
+    AddLog(LOG_LEVEL_DEBUG, PSTR("DGR-DBG: comparing group idx=%u ptr=%p name='%s'"), device_group_index, device_group, device_group->group_name);
     if (!strcmp(message_group_name, device_group->group_name)) break;
-    if (++device_group_index >= device_group_count) return;
+    if (++device_group_index >= device_group_count) {
+      AddLog(LOG_LEVEL_DEBUG, PSTR("DGR-DBG: no matching group, returning"));
+      return;
+    }
     device_group++;
   }
 
@@ -875,10 +886,14 @@ void ProcessDeviceGroupMessage(uint8_t * message, int message_length)
   struct device_group_member * device_group_member;
   IPAddress remote_ip = device_groups_udp.remoteIP();
   struct device_group_member * * flink = &device_group->device_group_members;
+  AddLog(LOG_LEVEL_DEBUG, PSTR("DGR-DBG: matched group idx=%u '%s', remote_ip=%s, members_head_ptr=%p, head=%p"), device_group_index, device_group->group_name, IPAddressToString(remote_ip), flink, *flink);
+  int walk_count = 0;
   for (;;) {
     device_group_member = *flink;
+    AddLog(LOG_LEVEL_DEBUG, PSTR("DGR-DBG: walk[%d] flink=%p device_group_member=%p"), walk_count, flink, device_group_member);
     if (!device_group_member) {
       device_group_member = (struct device_group_member *)calloc(1, sizeof(struct device_group_member));
+      AddLog(LOG_LEVEL_DEBUG, PSTR("DGR-DBG: calloc'd new member=%p"), device_group_member);
       if (device_group_member == nullptr) {
         AddLog(LOG_LEVEL_ERROR, PSTR("DGR: Error allocating member block"));
         return;
@@ -890,13 +905,18 @@ void ProcessDeviceGroupMessage(uint8_t * message, int message_length)
       AddLog(LOG_LEVEL_DEBUG, PSTR("DGR: Member %s added"), IPAddressToString(remote_ip));
       break;
     }
-    else if (device_group_member->ip_address == remote_ip) {
+    AddLog(LOG_LEVEL_DEBUG, PSTR("DGR-DBG: walk[%d] member=%p ->ip_address about to compare, ->flink=%p"), walk_count, device_group_member, device_group_member->flink);
+    if (device_group_member->ip_address == remote_ip) {
+      AddLog(LOG_LEVEL_DEBUG, PSTR("DGR-DBG: walk[%d] matched existing member=%p"), walk_count, device_group_member);
       break;
     }
     flink = &device_group_member->flink;
+    walk_count++;
   }
 
+  AddLog(LOG_LEVEL_DEBUG, PSTR("DGR-DBG: about to call SendReceiveDeviceGroupMessage, member=%p"), device_group_member);
   SendReceiveDeviceGroupMessage(device_group, device_group_member, message, message_length, true);
+  AddLog(LOG_LEVEL_DEBUG, PSTR("DGR-DBG: ProcessDeviceGroupMessage exit ok"));
 }
 
 void DeviceGroupStatus(uint8_t device_group_index)
@@ -974,7 +994,9 @@ AddLog(LOG_LEVEL_DEBUG, PSTR("DGR: Checking next_check_time=%u, now=%u"), next_c
             bool acked = true;
             struct device_group_member ** flink = &device_group->device_group_members;
             struct device_group_member * device_group_member;
+            AddLog(LOG_LEVEL_DEBUG, PSTR("DGR-DBG: ack-check loop start, group='%s', outgoing_sequence=%u"), device_group->group_name, device_group->outgoing_sequence);
             while ((device_group_member = *flink)) {
+              AddLog(LOG_LEVEL_DEBUG, PSTR("DGR-DBG: ack-check member=%p ip=%s acked_seq=%u outgoing_seq=%u flink=%p"), device_group_member, IPAddressToString(device_group_member->ip_address), device_group_member->acked_sequence, device_group->outgoing_sequence, device_group_member->flink);
 
               // If we have not received an ack to our last message from this member, ...
               if (device_group_member->acked_sequence != device_group->outgoing_sequence) {
@@ -982,9 +1004,15 @@ AddLog(LOG_LEVEL_DEBUG, PSTR("DGR: Checking next_check_time=%u, now=%u"), next_c
                 // If we haven't receive an ack from this member in DGR_MEMBER_TIMEOUT ms, assume
                 // they're offline and remove them from the group.
                 if ((int32_t)(now - device_group->member_timeout_time) >= 0) {
+                  // BUGFIX: logar (e capturar o IP) ANTES de free() — a ordem original lia
+                  // device_group_member->ip_address DEPOIS do free(), um use-after-free real
+                  // (achado rastreando o crash LoadProhibited via addr2line, ver
+                  // docs/00-diario-de-bordo.md no repo CasaInteligente).
+                  IPAddress removed_ip = device_group_member->ip_address;
+                  AddLog(LOG_LEVEL_DEBUG, PSTR("DGR-DBG: removing member=%p (timeout), now=%u member_timeout_time=%u"), device_group_member, now, device_group->member_timeout_time);
                   *flink = device_group_member->flink;
                   free(device_group_member);
-                  AddLog(LOG_LEVEL_DEBUG, PSTR("DGR: Member %s removed"), IPAddressToString(device_group_member->ip_address));
+                  AddLog(LOG_LEVEL_DEBUG, PSTR("DGR: Member %s removed"), IPAddressToString(removed_ip));
                   continue;
                 }
 
