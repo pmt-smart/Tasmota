@@ -101,7 +101,13 @@ void CmndEspNowPocPing(void) {
   ResponseCmndChar_P(PSTR("sent"));
 }
 
-const char kEspNowPocCommands[] PROGMEM = "EspNowPocPing";
+// "|" inicial = sem prefixo compartilhado (idiom estabelecido em todo
+// o codebase Tasmota pra driver com comando único/lista plana — achado
+// revisando xdrv_01_9_webserver.ino/xdrv_02_9_mqtt.ino depois do
+// comando dar "Unknown" no teste real, sem o "|" o parser de prefixo
+// do DecodeCommand() interpretava a string inteira como prefixo em vez
+// de nome de comando).
+const char kEspNowPocCommands[] PROGMEM = "|" "EspNowPocPing";
 void (* const kEspNowPocCommand[])(void) PROGMEM = { &CmndEspNowPocPing };
 
 bool Xdrv98(uint32_t function) {
