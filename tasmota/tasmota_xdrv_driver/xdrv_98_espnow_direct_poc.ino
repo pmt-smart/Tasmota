@@ -53,8 +53,20 @@ void EspNowPocDataRcvd(uint8_t* address, uint8_t* data, uint8_t len, signed int 
   }
 }
 
+// Chamado de FUNC_EVERY_SECOND, NÃO de FUNC_INIT — achado ao revisar o
+// driver antes de flashar (2026-09-01): FUNC_INIT roda cedo demais no
+// boot, mesma classe de bug que já derrubou o tcpserver() do modo tcp
+// mais cedo nesta sessão (chamar API de rede antes do WiFi/lwIP estar
+// pronto). `xdrv_77_wizmote.ino` (mesma lib QuickESPNow) evita isso do
+// mesmo jeito: só chama `quickEspNow.begin()` quando
+// `!TasmotaGlobal.global_state.wifi_down` (idiom estabelecido do
+// próprio Tasmota pra "WiFi está de pé", ver support_wifi.ino). Guard
+// `EspNowPoc.active` evita rechamar begin() a cada segundo depois que
+// já iniciou.
 void EspNowPocInit(void) {
-  WiFi.macAddress().length();  // no-op, garante WiFi já inicializado antes de ler o MAC abaixo
+  if (EspNowPoc.active) { return; }
+  if (TasmotaGlobal.global_state.wifi_down) { return; }  // WiFi ainda não subiu — espera o próximo tick
+
   uint8_t self_mac[6];
   WiFi.macAddress(self_mac);
   EspNowPoc.peer_mac = (0 == memcmp(self_mac, kEspNowPocMacNSPanel, 6))
@@ -95,7 +107,7 @@ void (* const kEspNowPocCommand[])(void) PROGMEM = { &CmndEspNowPocPing };
 bool Xdrv98(uint32_t function) {
   bool result = false;
   switch (function) {
-    case FUNC_INIT:
+    case FUNC_EVERY_SECOND:
       EspNowPocInit();
       break;
     case FUNC_COMMAND:
