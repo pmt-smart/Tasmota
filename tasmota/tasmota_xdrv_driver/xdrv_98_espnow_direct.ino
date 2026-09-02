@@ -614,6 +614,44 @@ void CmndEspNowEvent(void) {
   EspNowDirectCmndSendAs(ESPNOW_DIRECT_TYPE_EVENT);
 }
 
+#ifdef USE_BERRY
+// Going through the command handler costs a full command dispatch on this side,
+// measured at roughly 8 ms even for a command that does nothing, and it blocks
+// the main loop for that long. Scripts relaying traffic pay it per message, so
+// they get a direct entry point instead:
+//
+//   espnow_send(line)        -> command for the peer to run
+//   espnow_send(json, true)  -> event for the peer's rule engine
+//
+// Returns true when the frame was handed to the radio. Callers should treat a
+// missing global as "not available" and fall back to the commands above.
+int EspNowDirectBerrySend(struct bvm *vm);
+int EspNowDirectBerrySend(struct bvm *vm) {
+  int32_t argc = be_top(vm);
+  if ((argc >= 1) && be_isstring(vm, 1)) {
+    const char* text = be_tostring(vm, 1);
+    bool as_event = (argc >= 2) && be_tobool(vm, 2);
+    size_t len = strlen(text);
+
+    bool sent = false;
+    if (len && (len <= ESPNOW_DIRECT_MAX_PAYLOAD)) {
+      sent = EspNowDirectSend(as_event ? ESPNOW_DIRECT_TYPE_EVENT : ESPNOW_DIRECT_TYPE_CMD,
+                              (const uint8_t*)text, len);
+    }
+    be_pushbool(vm, sent);
+    be_return(vm);
+  }
+  be_raise(vm, kTypeError, nullptr);
+}
+
+static void EspNowDirectBerryRegister(void) {
+  if (nullptr == berry.vm) { return; }
+  be_pushntvfunction(berry.vm, EspNowDirectBerrySend);
+  be_setglobal(berry.vm, "espnow_send");
+  be_pop(berry.vm, 1);
+}
+#endif  // USE_BERRY
+
 void CmndEspNowStatus(void) {
   char mac_text[18];
   ToHex_P(EspNowDirectSettings.peer_mac, 6, mac_text, sizeof(mac_text), ':');
@@ -685,6 +723,11 @@ bool Xdrv98(uint32_t function) {
     case FUNC_PRE_INIT:
       EspNowDirectSettingsLoad();
       break;
+#ifdef USE_BERRY
+    case FUNC_INIT:
+      EspNowDirectBerryRegister();
+      break;
+#endif
     case FUNC_LOOP:
       EspNowDirectDrainRx();
       break;
