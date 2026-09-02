@@ -58,6 +58,7 @@
  *                       silent form that answers with asterisks either way
  *   EspNowChannel     - fixed channel, or 0 to follow the station
  *   EspNowSend        - send a command line to the peer, run there on arrival
+ *   EspNowEvent       - send a JSON event to the peer, fed to its rule engine
  *   EspNowStatus      - report link state, session and peer
  *   EspNowPing        - send a signed ping, RTT is logged when the pong lands
  *   EspNowForge       - send a deliberately mis-signed ping to check rejection
@@ -117,6 +118,7 @@ struct {
 #define ESPNOW_DIRECT_RX_QUEUE_DEPTH   4
 
 typedef struct {
+  uint8_t type;
   char text[ESPNOW_DIRECT_MAX_PAYLOAD + 1];
 } EspNowDirectRxItem_t;
 
@@ -314,6 +316,7 @@ void EspNowDirectRecvCb(const esp_now_recv_info_t* info, const uint8_t* frame, i
     case ESPNOW_DIRECT_TYPE_EVENT:
       if (payload_len && (nullptr != EspNowDirectRxQueue)) {
         EspNowDirectRxItem_t item;
+        item.type = type;
         memcpy(item.text, payload, payload_len);
         item.text[payload_len] = '\0';
         if (pdTRUE != xQueueSend(EspNowDirectRxQueue, &item, 0)) {
@@ -409,6 +412,12 @@ static bool EspNowDirectStart(void) {
   if (EspNowDirect.active) { return true; }
 
   if (!EspNowDirectConfigured()) { return false; }
+  // ESP-NOW sits on top of the WiFi stack, so touching it before that stack
+  // exists faults inside esp_now_deinit(). Reachable from the command as well
+  // as from the periodic retry, which is why the check lives here rather than
+  // in the caller: a script enabling the transport at startup would otherwise
+  // crash the device before the network is up, and keep crashing every boot.
+  if (TasmotaGlobal.global_state.wifi_down) { return false; }
 
   // Deinitialise first so a restart always begins from a known state. Without
   // it, a peer table left over from an earlier start would disagree with the
@@ -559,19 +568,28 @@ void CmndEspNowChannel(void) {
   ResponseCmndNumber(EspNowDirectSettings.channel);
 }
 
-// Runs whatever the peer sent, from the main loop. Nothing about the payload is
-// interpreted here: the two sides agree on plain command lines, which keeps the
-// transport interchangeable with the other ones the application already speaks.
+// Delivers what the peer sent, from the main loop.
+//
+// A CMD is a command line and has to go through the command handler. An EVENT
+// is already a JSON message, so it goes straight to the rule engine instead:
+// running it as a command would cost a second trip through the command handler
+// for no gain, and the rule path is the same one a locally generated event
+// takes, so the application sees no difference between transports.
 static void EspNowDirectDrainRx(void) {
   if (nullptr == EspNowDirectRxQueue) { return; }
 
   EspNowDirectRxItem_t item;
   while (pdTRUE == xQueueReceive(EspNowDirectRxQueue, &item, 0)) {
-    ExecuteCommand(item.text, SRC_RULE);
+    if (ESPNOW_DIRECT_TYPE_EVENT == item.type) {
+      Response_P(PSTR("%s"), item.text);
+      XdrvRulesProcess(0);
+    } else {
+      ExecuteCommand(item.text, SRC_RULE);
+    }
   }
 }
 
-void CmndEspNowSend(void) {
+static void EspNowDirectCmndSendAs(uint8_t type) {
   if (!EspNowDirect.active) {
     ResponseCmndChar_P(PSTR("not active"));
     return;
@@ -584,8 +602,16 @@ void CmndEspNowSend(void) {
     ResponseCmndChar_P(PSTR("too long"));
     return;
   }
-  bool sent = EspNowDirectSend(ESPNOW_DIRECT_TYPE_CMD, (const uint8_t*)XdrvMailbox.data, XdrvMailbox.data_len);
+  bool sent = EspNowDirectSend(type, (const uint8_t*)XdrvMailbox.data, XdrvMailbox.data_len);
   ResponseCmndChar_P(sent ? PSTR("sent") : PSTR("failed"));
+}
+
+void CmndEspNowSend(void) {
+  EspNowDirectCmndSendAs(ESPNOW_DIRECT_TYPE_CMD);
+}
+
+void CmndEspNowEvent(void) {
+  EspNowDirectCmndSendAs(ESPNOW_DIRECT_TYPE_EVENT);
 }
 
 void CmndEspNowStatus(void) {
@@ -643,10 +669,10 @@ void CmndEspNowForge(void) {
 }
 
 // Leading "|" marks a flat command list without a shared prefix.
-const char kEspNowDirectCommands[] PROGMEM = "|" "EspNowEnable|EspNowPeerMac|EspNowSecret|EspNowChannel|EspNowSend|EspNowStatus|EspNowPing|EspNowForge|EspNowReplay";
+const char kEspNowDirectCommands[] PROGMEM = "|" "EspNowEnable|EspNowPeerMac|EspNowSecret|EspNowChannel|EspNowSend|EspNowEvent|EspNowStatus|EspNowPing|EspNowForge|EspNowReplay";
 void (* const kEspNowDirectCommand[])(void) PROGMEM = {
   &CmndEspNowEnable, &CmndEspNowPeerMac, &CmndEspNowSecret, &CmndEspNowChannel,
-  &CmndEspNowSend, &CmndEspNowStatus, &CmndEspNowPing, &CmndEspNowForge, &CmndEspNowReplay };
+  &CmndEspNowSend, &CmndEspNowEvent, &CmndEspNowStatus, &CmndEspNowPing, &CmndEspNowForge, &CmndEspNowReplay };
 
 /*********************************************************************************************\
  * Interface
