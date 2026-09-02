@@ -52,7 +52,9 @@ static uint32_t EspNowPocTag(const uint8_t* data, size_t len) {
 }
 
 struct {
-  bool active = false;
+  bool active = false;        // ESP-NOW is currently running
+  bool enabled = false;       // runtime gate, see CmndEspNowPocEnable below
+  bool stop_latched = false;  // stop() ran in this boot, a restart is required before starting again
   const uint8_t* peer_mac = nullptr;
 } EspNowPoc;
 
@@ -123,6 +125,7 @@ void EspNowPocDataRcvd(uint8_t* address, uint8_t* data, uint8_t len, signed int 
 // `EspNowPoc.active` evita rechamar begin() a cada segundo depois que
 // já iniciou.
 void EspNowPocInit(void) {
+  if (!EspNowPoc.enabled) { return; }  // off until requested, see CmndEspNowPocEnable
   if (EspNowPoc.active) { return; }
   if (TasmotaGlobal.global_state.wifi_down) { return; }  // WiFi ainda não subiu — espera o próximo tick
 
@@ -144,6 +147,49 @@ void EspNowPocInit(void) {
   } else {
     AddLog(LOG_LEVEL_ERROR, PSTR("NOWPOC: falha ao iniciar quickEspNow"));
   }
+}
+
+// Shuts the radio down. Kept separate from the command handler so the
+// stop path stays callable from anywhere in the driver.
+static void EspNowPocStop(void) {
+  if (!EspNowPoc.active) { return; }
+  quickEspNow.stop();
+  EspNowPoc.active = false;
+  EspNowPoc.stop_latched = true;
+  AddLog(LOG_LEVEL_INFO, PSTR("NOWPOC: stopped, restart required to start again"));
+}
+
+// Console command: `EspNowPocEnable 1` starts ESP-NOW, `EspNowPocEnable 0`
+// stops it, no payload reports the current state.
+//
+// ESP-NOW shares the radio with the WiFi station interface. While it runs
+// with a peer installed for another station associated to the same access
+// point, unicast traffic between those two stations breaks: TCP connects
+// are reset on every port in both directions and ICMP becomes unreliable,
+// while traffic to any other host (gateway, other stations) is unaffected.
+// Defaulting to off means a build carrying this driver behaves exactly
+// like a build without it until the feature is explicitly asked for.
+//
+// Starting again after a stop is deliberately refused. QuickEspNow::stop()
+// calls esp_now_deinit() but leaves its own peer list populated, so the
+// next send() reaches addPeer(), takes the "peer already exists" branch and
+// runs ESP_ERROR_CHECK(esp_now_get_peer(...)) against an emptied driver
+// peer table. That aborts the firmware rather than returning an error, so
+// a reboot is the only way to bring both lists back in sync.
+void CmndEspNowPocEnable(void) {
+  if ((XdrvMailbox.payload >= 0) && (XdrvMailbox.payload <= 1)) {
+    if (XdrvMailbox.payload) {
+      if (EspNowPoc.stop_latched) {
+        ResponseCmndChar_P(PSTR("restart required"));
+        return;
+      }
+      EspNowPoc.enabled = true;  // actual start happens on the next FUNC_EVERY_SECOND tick
+    } else {
+      EspNowPoc.enabled = false;
+      EspNowPocStop();
+    }
+  }
+  ResponseCmndStateText(EspNowPoc.active);
 }
 
 // comando de console: `EspNowPocPing` manda um ping ASSINADO pro peer
@@ -186,8 +232,8 @@ void CmndEspNowPocForge(void) {
 // comando dar "Unknown" no teste real, sem o "|" o parser de prefixo
 // do DecodeCommand() interpretava a string inteira como prefixo em vez
 // de nome de comando).
-const char kEspNowPocCommands[] PROGMEM = "|" "EspNowPocPing|EspNowPocForge";
-void (* const kEspNowPocCommand[])(void) PROGMEM = { &CmndEspNowPocPing, &CmndEspNowPocForge };
+const char kEspNowPocCommands[] PROGMEM = "|" "EspNowPocEnable|EspNowPocPing|EspNowPocForge";
+void (* const kEspNowPocCommand[])(void) PROGMEM = { &CmndEspNowPocEnable, &CmndEspNowPocPing, &CmndEspNowPocForge };
 
 bool Xdrv98(uint32_t function) {
   bool result = false;
