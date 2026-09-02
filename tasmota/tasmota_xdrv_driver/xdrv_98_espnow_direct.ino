@@ -57,6 +57,7 @@
  *   EspNowSecret      - shared secret, never echoed back; EspNowSecret2 is the
  *                       silent form that answers with asterisks either way
  *   EspNowChannel     - fixed channel, or 0 to follow the station
+ *   EspNowSend        - send a command line to the peer, run there on arrival
  *   EspNowStatus      - report link state, session and peer
  *   EspNowPing        - send a signed ping, RTT is logged when the pong lands
  *   EspNowForge       - send a deliberately mis-signed ping to check rejection
@@ -75,8 +76,8 @@
 #define ESPNOW_DIRECT_MAX_FRAME        250
 #define ESPNOW_DIRECT_MAX_PAYLOAD      (ESPNOW_DIRECT_MAX_FRAME - ESPNOW_DIRECT_OVERHEAD)             // 233
 
-// Frame types. Only PING and PONG are handled so far; the rest are listed to
-// keep the wire protocol defined in one place.
+// Frame types. The pairing pair is listed to keep the wire protocol defined in
+// one place; it is not handled yet.
 #define ESPNOW_DIRECT_TYPE_PING        0x01
 #define ESPNOW_DIRECT_TYPE_PONG        0x02
 #define ESPNOW_DIRECT_TYPE_PAIR_REQ    0x10
@@ -107,6 +108,19 @@ struct {
   uint32_t peer_session = 0;               // session the peer announced in that HELLO
   uint32_t peer_counter = 0;               // highest counter accepted within that session
 } EspNowDirect;
+
+// Received command lines cross from the ESP-NOW task to the main loop through
+// this queue. The receive callback runs on its own task, where running a
+// command is not safe, so it only copies the line and lets the main loop
+// execute it. A full queue drops the oldest arrival rather than blocking the
+// radio task.
+#define ESPNOW_DIRECT_RX_QUEUE_DEPTH   4
+
+typedef struct {
+  char text[ESPNOW_DIRECT_MAX_PAYLOAD + 1];
+} EspNowDirectRxItem_t;
+
+static QueueHandle_t EspNowDirectRxQueue = nullptr;
 
 static bool EspNowDirectConfigured(void) {
   static const uint8_t no_mac[6] = {0};
@@ -295,6 +309,20 @@ void EspNowDirectRecvCb(const esp_now_recv_info_t* info, const uint8_t* frame, i
           TimeDifference(EspNowDirectGet32(payload), millis()), info->rx_ctrl->rssi);
       }
       break;
+
+    case ESPNOW_DIRECT_TYPE_CMD:
+    case ESPNOW_DIRECT_TYPE_EVENT:
+      if (payload_len && (nullptr != EspNowDirectRxQueue)) {
+        EspNowDirectRxItem_t item;
+        memcpy(item.text, payload, payload_len);
+        item.text[payload_len] = '\0';
+        if (pdTRUE != xQueueSend(EspNowDirectRxQueue, &item, 0)) {
+          EspNowDirectRxItem_t dropped;
+          xQueueReceive(EspNowDirectRxQueue, &dropped, 0);      // make room, keep the newest
+          xQueueSend(EspNowDirectRxQueue, &item, 0);
+        }
+      }
+      break;
   }
 }
 
@@ -327,6 +355,9 @@ static uint8_t EspNowDirectTargetChannel(void) {
 // association itself rather than off the "network is up" flag, which also waits
 // for an address: the moment this has to act on is exactly the one where the
 // network is down.
+static bool EspNowDirectStart(void);
+static void EspNowDirectStop(void);
+
 static void EspNowDirectApplyChannel(void) {
   uint8_t sta_channel = 0;
   bool associated = EspNowDirectStationChannel(&sta_channel);
@@ -344,14 +375,16 @@ static void EspNowDirectApplyChannel(void) {
     }
   }
 
-  esp_now_peer_info_t peer;
-  if (ESP_OK == esp_now_get_peer(EspNowDirectSettings.peer_mac, &peer)) {
-    peer.channel = target;
-    esp_now_mod_peer(&peer);
-  }
-
-  EspNowDirect.applied_channel = target;
+  // Re-initialise instead of only moving the peer to the new channel. Observed
+  // on hardware: after the radio changes channel and the station later comes
+  // back, a peer that was registered while the radio sat elsewhere stops
+  // carrying traffic, and both ends keep reporting the right channel while
+  // nothing gets through. Only a full deinit/init recovers it. That is cheap
+  // here and self-consistent, since starting re-derives the channel, registers
+  // the peer again and greets the peer with a fresh session.
   AddLog(LOG_LEVEL_INFO, PSTR("ENW: Channel %d, station %s"), target, associated ? PSTR("associated") : PSTR("down"));
+  EspNowDirectStop();
+  EspNowDirectStart();
 }
 
 static bool EspNowDirectAddPeer(void) {
@@ -396,6 +429,10 @@ static bool EspNowDirectStart(void) {
     esp_now_unregister_send_cb();
     esp_now_deinit();
     return false;
+  }
+
+  if (nullptr == EspNowDirectRxQueue) {
+    EspNowDirectRxQueue = xQueueCreate(ESPNOW_DIRECT_RX_QUEUE_DEPTH, sizeof(EspNowDirectRxItem_t));
   }
 
   EspNowDirect.session_id = esp_random();
@@ -522,6 +559,35 @@ void CmndEspNowChannel(void) {
   ResponseCmndNumber(EspNowDirectSettings.channel);
 }
 
+// Runs whatever the peer sent, from the main loop. Nothing about the payload is
+// interpreted here: the two sides agree on plain command lines, which keeps the
+// transport interchangeable with the other ones the application already speaks.
+static void EspNowDirectDrainRx(void) {
+  if (nullptr == EspNowDirectRxQueue) { return; }
+
+  EspNowDirectRxItem_t item;
+  while (pdTRUE == xQueueReceive(EspNowDirectRxQueue, &item, 0)) {
+    ExecuteCommand(item.text, SRC_RULE);
+  }
+}
+
+void CmndEspNowSend(void) {
+  if (!EspNowDirect.active) {
+    ResponseCmndChar_P(PSTR("not active"));
+    return;
+  }
+  if (!XdrvMailbox.data_len) {
+    ResponseCmndChar_P(PSTR("nothing to send"));
+    return;
+  }
+  if (XdrvMailbox.data_len > ESPNOW_DIRECT_MAX_PAYLOAD) {
+    ResponseCmndChar_P(PSTR("too long"));
+    return;
+  }
+  bool sent = EspNowDirectSend(ESPNOW_DIRECT_TYPE_CMD, (const uint8_t*)XdrvMailbox.data, XdrvMailbox.data_len);
+  ResponseCmndChar_P(sent ? PSTR("sent") : PSTR("failed"));
+}
+
 void CmndEspNowStatus(void) {
   char mac_text[18];
   ToHex_P(EspNowDirectSettings.peer_mac, 6, mac_text, sizeof(mac_text), ':');
@@ -577,10 +643,10 @@ void CmndEspNowForge(void) {
 }
 
 // Leading "|" marks a flat command list without a shared prefix.
-const char kEspNowDirectCommands[] PROGMEM = "|" "EspNowEnable|EspNowPeerMac|EspNowSecret|EspNowChannel|EspNowStatus|EspNowPing|EspNowForge|EspNowReplay";
+const char kEspNowDirectCommands[] PROGMEM = "|" "EspNowEnable|EspNowPeerMac|EspNowSecret|EspNowChannel|EspNowSend|EspNowStatus|EspNowPing|EspNowForge|EspNowReplay";
 void (* const kEspNowDirectCommand[])(void) PROGMEM = {
   &CmndEspNowEnable, &CmndEspNowPeerMac, &CmndEspNowSecret, &CmndEspNowChannel,
-  &CmndEspNowStatus, &CmndEspNowPing, &CmndEspNowForge, &CmndEspNowReplay };
+  &CmndEspNowSend, &CmndEspNowStatus, &CmndEspNowPing, &CmndEspNowForge, &CmndEspNowReplay };
 
 /*********************************************************************************************\
  * Interface
@@ -592,6 +658,9 @@ bool Xdrv98(uint32_t function) {
   switch (function) {
     case FUNC_PRE_INIT:
       EspNowDirectSettingsLoad();
+      break;
+    case FUNC_LOOP:
+      EspNowDirectDrainRx();
       break;
     case FUNC_EVERY_SECOND:
       EspNowDirectEverySecond();
