@@ -102,6 +102,7 @@ struct {
   bool active = false;                     // ESP-NOW is initialised and the peer is registered
   uint32_t session_id = 0;                 // drawn per start, travels in every frame we send
   uint32_t tx_counter = 0;                 // increases per frame sent within the session
+  uint8_t applied_channel = 0;             // channel the peer entry is currently on
   bool peer_known = false;                 // a HELLO from the peer has been accepted
   uint32_t peer_session = 0;               // session the peer announced in that HELLO
   uint32_t peer_counter = 0;               // highest counter accepted within that session
@@ -301,15 +302,60 @@ void EspNowDirectRecvCb(const esp_now_recv_info_t* info, const uint8_t* frame, i
  * Start and stop
 \*********************************************************************************************/
 
-static bool EspNowDirectAddPeer(void) {
-  // A configured channel pins the peer to it; 0 keeps it on whatever channel
-  // the station is using, which is what lets ESP-NOW share the radio without
-  // disturbing the WiFi connection.
-  uint8_t channel = EspNowDirectSettings.channel;
-  if (0 == channel) {
-    wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
-    esp_wifi_get_channel(&channel, &second);
+// The station and ESP-NOW share one radio, so while the station is associated
+// the channel is whatever the access point uses and nothing else may change it.
+// Only once the station is gone is the channel free for the configured
+// fallback, which is what keeps the link alive with the access point down.
+static bool EspNowDirectStationChannel(uint8_t* channel) {
+  wifi_ap_record_t ap;
+  if (ESP_OK != esp_wifi_sta_get_ap_info(&ap)) { return false; }
+  *channel = ap.primary;
+  return true;
+}
+
+static uint8_t EspNowDirectTargetChannel(void) {
+  uint8_t channel = 0;
+  if (EspNowDirectStationChannel(&channel)) { return channel; }
+  if (EspNowDirectSettings.channel) { return EspNowDirectSettings.channel; }
+
+  wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;   // no fallback configured, stay put
+  esp_wifi_get_channel(&channel, &second);
+  return channel;
+}
+
+// Follows the radio as the station comes and goes. Deliberately keyed off the
+// association itself rather than off the "network is up" flag, which also waits
+// for an address: the moment this has to act on is exactly the one where the
+// network is down.
+static void EspNowDirectApplyChannel(void) {
+  uint8_t sta_channel = 0;
+  bool associated = EspNowDirectStationChannel(&sta_channel);
+  uint8_t target = EspNowDirectTargetChannel();
+  if (target == EspNowDirect.applied_channel) { return; }
+
+  // Never move the radio out from under an associated station; that drops the
+  // association. When the station holds the radio, following it is the only
+  // option, and adopting its channel is all that is left to do here.
+  if (!associated) {
+    esp_err_t error = esp_wifi_set_channel(target, WIFI_SECOND_CHAN_NONE);
+    if (ESP_OK != error) {
+      AddLog(LOG_LEVEL_DEBUG, PSTR("ENW: Setting channel %d failed with error %d"), target, error);
+      return;
+    }
   }
+
+  esp_now_peer_info_t peer;
+  if (ESP_OK == esp_now_get_peer(EspNowDirectSettings.peer_mac, &peer)) {
+    peer.channel = target;
+    esp_now_mod_peer(&peer);
+  }
+
+  EspNowDirect.applied_channel = target;
+  AddLog(LOG_LEVEL_INFO, PSTR("ENW: Channel %d, station %s"), target, associated ? PSTR("associated") : PSTR("down"));
+}
+
+static bool EspNowDirectAddPeer(void) {
+  uint8_t channel = EspNowDirectTargetChannel();
 
   esp_now_peer_info_t peer = {};
   memcpy(peer.peer_addr, EspNowDirectSettings.peer_mac, 6);
@@ -322,6 +368,7 @@ static bool EspNowDirectAddPeer(void) {
     AddLog(LOG_LEVEL_ERROR, PSTR("ENW: Adding peer failed with error %d"), error);
     return false;
   }
+  EspNowDirect.applied_channel = channel;
   return true;
 }
 
@@ -386,6 +433,7 @@ static void EspNowDirectEverySecond(void) {
   if (!EspNowDirectConfigured()) { return; }        // cleared while enabled, nothing to retry
 
   if (EspNowDirect.active) {
+    EspNowDirectApplyChannel();
     // Keep greeting until the peer answers. Covers the peer booting later than
     // us, and a greeting lost to interference, without persisting anything.
     if (!EspNowDirect.peer_known) { EspNowDirectSend(ESPNOW_DIRECT_TYPE_HELLO, nullptr, 0); }
@@ -477,8 +525,8 @@ void CmndEspNowChannel(void) {
 void CmndEspNowStatus(void) {
   char mac_text[18];
   ToHex_P(EspNowDirectSettings.peer_mac, 6, mac_text, sizeof(mac_text), ':');
-  Response_P(PSTR("{\"EspNowStatus\":{\"Active\":%d,\"Peer\":\"%s\",\"Channel\":%d,\"SecretSet\":%d,\"Session\":\"%08X\",\"Sent\":%u,\"PeerKnown\":%d,\"PeerSession\":\"%08X\",\"PeerCounter\":%u,\"MaxPayload\":%u}}"),
-    EspNowDirect.active, mac_text, EspNowDirectSettings.channel,
+  Response_P(PSTR("{\"EspNowStatus\":{\"Active\":%d,\"Peer\":\"%s\",\"Channel\":%d,\"OnChannel\":%d,\"SecretSet\":%d,\"Session\":\"%08X\",\"Sent\":%u,\"PeerKnown\":%d,\"PeerSession\":\"%08X\",\"PeerCounter\":%u,\"MaxPayload\":%u}}"),
+    EspNowDirect.active, mac_text, EspNowDirectSettings.channel, EspNowDirect.applied_channel,
     (EspNowDirectSettings.secret_len > 0), EspNowDirect.session_id,
     EspNowDirect.tx_counter, EspNowDirect.peer_known, EspNowDirect.peer_session,
     EspNowDirect.peer_counter, ESPNOW_DIRECT_MAX_PAYLOAD);
