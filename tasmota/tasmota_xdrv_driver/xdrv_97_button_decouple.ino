@@ -92,7 +92,9 @@ struct BUTTON_DECOUPLE {
 } ButtonDecouple;
 
 void ButtonDecoupleSettingsLoad(void) {
-  BUTTON_DECOUPLE_SETTINGS loaded;
+  // NvmLoad() returns true as soon as the namespace opens, even when there is no
+  // blob to read, and then leaves the buffer as it was: version 0 is never ours
+  BUTTON_DECOUPLE_SETTINGS loaded = { 0, 0, 0 };
   if (NvmLoad(BUTTON_DECOUPLE_NVS_NAMESPACE, "settings", &loaded, sizeof(loaded)) &&
       (BUTTON_DECOUPLE_VERSION == loaded.version)) {
     ButtonDecoupleSettings = loaded;
