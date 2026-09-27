@@ -23,6 +23,7 @@
 #include <berry.h>
 #include "be_mem.h"
 #include "be_object.h"
+#include <t_bearssl.h>          // tasmota.ino includes it only with USE_TLS, and these classes need it anyway
 #include "include/ed25519.h"
 #include "crypto/refc/poly1305-donna.h"
 
