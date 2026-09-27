@@ -599,9 +599,13 @@ void setup(void) {
     Settings->flag4.network_wifi = 1;           // Make sure we're in control
 #endif  // ESP8266
 #ifdef ESP32
+#ifdef USE_ETHERNET
     if (!Settings->flag4.network_ethernet) {
       Settings->flag4.network_wifi = 1;         // Make sure we're in control
     }
+#else
+    Settings->flag4.network_wifi = 1;           // Make sure we're in control: without Ethernet, Wi-Fi is the only way in
+#endif  // USE_ETHERNET
 #endif  // ESP32
   }
 
