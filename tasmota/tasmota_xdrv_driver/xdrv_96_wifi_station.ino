@@ -113,6 +113,12 @@ static const char* StaCtrlReasonText(uint8_t reason) {
   return PSTR("NoAnswer");
 }
 
+// For the other users of the radio: a scan or a join of this driver owns it
+// while it runs.
+bool StaCtrlRadioInUse(void) {
+  return (STA_CTRL_IDLE != StaCtrl.state);
+}
+
 static bool StaCtrlTasmotaUp(void) {
   return Settings->flag4.network_wifi && !TasmotaGlobal.global_state.wifi_down;
 }
