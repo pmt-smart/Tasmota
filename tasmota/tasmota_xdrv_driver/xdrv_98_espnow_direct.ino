@@ -110,16 +110,17 @@ struct {
   uint32_t peer_counter = 0;               // highest counter accepted within that session
 } EspNowDirect;
 
-// Received command lines cross from the ESP-NOW task to the main loop through
-// this queue. The receive callback runs on its own task, where running a
-// command is not safe, so it only copies the line and lets the main loop
-// execute it. A full queue drops the oldest arrival rather than blocking the
-// radio task.
+// What the receive callback accepts crosses from the WiFi task to the main loop
+// through this queue: command lines and events, and the replies a greeting or a
+// ping calls for. The callback runs on its own task, where running a command is
+// not safe, so it only copies what arrived and lets the main loop act on it. A
+// full queue drops the oldest arrival rather than blocking the radio task.
 #define ESPNOW_DIRECT_RX_QUEUE_DEPTH   4
 
 typedef struct {
   uint8_t type;
-  char text[ESPNOW_DIRECT_MAX_PAYLOAD + 1];
+  uint8_t len;
+  uint8_t data[ESPNOW_DIRECT_MAX_PAYLOAD + 1];   // one more keeps a text payload terminated
 } EspNowDirectRxItem_t;
 
 static QueueHandle_t EspNowDirectRxQueue = nullptr;
@@ -228,11 +229,31 @@ static bool EspNowDirectSend(uint8_t type, const uint8_t* payload, size_t payloa
 /*********************************************************************************************\
  * Callbacks
  *
- * Both run on the ESP-NOW task, not on the main loop, so they stay short and
- * touch nothing that the main loop owns. Handing received frames to the rest of
- * the firmware needs a queue drained from the main loop; until that exists this
- * driver only answers pings, which it can do from here.
+ * Both run on the WiFi task, not on the main loop. The receive callback checks a
+ * frame and keeps the peer's session up to date, and hands whatever has to
+ * happen next to the main loop through the receive queue, replies included.
+ * Every frame this driver sends is therefore built on the main loop: the send
+ * counter has a single writer, and frames leave in counter order, which the
+ * peer's replay check depends on.
 \*********************************************************************************************/
+
+// Hands an accepted frame, or the reply it calls for, to the main loop.
+// `len` is at most ESPNOW_DIRECT_MAX_PAYLOAD, which the caller has ensured by
+// rejecting longer frames.
+static void EspNowDirectQueue(uint8_t type, const uint8_t* payload, size_t len) {
+  if (nullptr == EspNowDirectRxQueue) { return; }
+
+  EspNowDirectRxItem_t item;
+  item.type = type;
+  item.len = len;
+  if (len) { memcpy(item.data, payload, len); }
+  item.data[len] = '\0';
+  if (pdTRUE != xQueueSend(EspNowDirectRxQueue, &item, 0)) {
+    EspNowDirectRxItem_t dropped;
+    xQueueReceive(EspNowDirectRxQueue, &dropped, 0);      // make room, keep the newest
+    xQueueSend(EspNowDirectRxQueue, &item, 0);
+  }
+}
 
 // Both callbacks are declared before their definition so that the sketch
 // preprocessor does not hoist a generated prototype above the ESP-NOW include.
@@ -253,6 +274,13 @@ void EspNowDirectRecvCb(const esp_now_recv_info_t* info, const uint8_t* frame, i
   // Reject short frames before deriving any length from `len`.
   if (len < ESPNOW_DIRECT_OVERHEAD) {
     AddLog(LOG_LEVEL_DEBUG, PSTR("ENW: Frame of %d bytes is shorter than the %u byte header"), len, ESPNOW_DIRECT_OVERHEAD);
+    return;
+  }
+  // And long ones: ESP-NOW v2 carries up to 1470 bytes per frame, and every
+  // buffer below is sized for the 250 bytes this protocol uses. A valid tag
+  // proves only who sent the frame, not that it fits.
+  if (len > ESPNOW_DIRECT_MAX_FRAME) {
+    AddLog(LOG_LEVEL_DEBUG, PSTR("ENW: Frame of %d bytes is longer than the %u byte limit"), len, ESPNOW_DIRECT_MAX_FRAME);
     return;
   }
 
@@ -282,7 +310,7 @@ void EspNowDirectRecvCb(const esp_now_recv_info_t* info, const uint8_t* frame, i
       // Answer so the peer learns our session too. Bounded: the reply only goes
       // out when the announced session is new to us, so two devices greeting
       // each other settle after one exchange instead of echoing forever.
-      EspNowDirectSend(ESPNOW_DIRECT_TYPE_HELLO, nullptr, 0);
+      EspNowDirectQueue(ESPNOW_DIRECT_TYPE_HELLO, nullptr, 0);
       AddLog(LOG_LEVEL_INFO, PSTR("ENW: Peer session %08X"), session);
     }
     return;
@@ -300,9 +328,9 @@ void EspNowDirectRecvCb(const esp_now_recv_info_t* info, const uint8_t* frame, i
 
   switch (type) {
     case ESPNOW_DIRECT_TYPE_PING:
-      // Echo the payload untouched so the sender measures the round trip
-      // against its own clock, without needing the two clocks to agree.
-      EspNowDirectSend(ESPNOW_DIRECT_TYPE_PONG, payload, payload_len);
+      // The main loop echoes the payload untouched, so the sender measures the
+      // round trip against its own clock, without needing the two to agree.
+      EspNowDirectQueue(ESPNOW_DIRECT_TYPE_PING, payload, payload_len);
       break;
 
     case ESPNOW_DIRECT_TYPE_PONG:
@@ -314,17 +342,7 @@ void EspNowDirectRecvCb(const esp_now_recv_info_t* info, const uint8_t* frame, i
 
     case ESPNOW_DIRECT_TYPE_CMD:
     case ESPNOW_DIRECT_TYPE_EVENT:
-      if (payload_len && (nullptr != EspNowDirectRxQueue)) {
-        EspNowDirectRxItem_t item;
-        item.type = type;
-        memcpy(item.text, payload, payload_len);
-        item.text[payload_len] = '\0';
-        if (pdTRUE != xQueueSend(EspNowDirectRxQueue, &item, 0)) {
-          EspNowDirectRxItem_t dropped;
-          xQueueReceive(EspNowDirectRxQueue, &dropped, 0);      // make room, keep the newest
-          xQueueSend(EspNowDirectRxQueue, &item, 0);
-        }
-      }
+      if (payload_len) { EspNowDirectQueue(type, payload, payload_len); }
       break;
   }
 }
@@ -430,6 +448,18 @@ static bool EspNowDirectStart(void) {
     return false;
   }
 
+  // The session starts before the receive callback is registered, so the first
+  // frame it sees is judged against this session and not the previous one.
+  EspNowDirect.session_id = esp_random();
+  EspNowDirect.tx_counter = 0;
+  EspNowDirect.peer_known = false;          // the peer has to greet us again
+  EspNowDirect.peer_session = 0;
+  EspNowDirect.peer_counter = 0;
+
+  if (nullptr == EspNowDirectRxQueue) {
+    EspNowDirectRxQueue = xQueueCreate(ESPNOW_DIRECT_RX_QUEUE_DEPTH, sizeof(EspNowDirectRxItem_t));
+  }
+
   esp_now_register_recv_cb(EspNowDirectRecvCb);
   esp_now_register_send_cb(EspNowDirectSendCb);
 
@@ -440,15 +470,6 @@ static bool EspNowDirectStart(void) {
     return false;
   }
 
-  if (nullptr == EspNowDirectRxQueue) {
-    EspNowDirectRxQueue = xQueueCreate(ESPNOW_DIRECT_RX_QUEUE_DEPTH, sizeof(EspNowDirectRxItem_t));
-  }
-
-  EspNowDirect.session_id = esp_random();
-  EspNowDirect.tx_counter = 0;
-  EspNowDirect.peer_known = false;          // the peer has to greet us again
-  EspNowDirect.peer_session = 0;
-  EspNowDirect.peer_counter = 0;
   EspNowDirect.active = true;
 
   EspNowDirectSend(ESPNOW_DIRECT_TYPE_HELLO, nullptr, 0);   // retried every second until answered
@@ -568,7 +589,8 @@ void CmndEspNowChannel(void) {
   ResponseCmndNumber(EspNowDirectSettings.channel);
 }
 
-// Delivers what the peer sent, from the main loop.
+// Delivers what the peer sent, and sends the replies it called for, from the
+// main loop.
 //
 // A CMD is a command line and has to go through the command handler. An EVENT
 // is already a JSON message, so it goes straight to the rule engine instead:
@@ -580,11 +602,20 @@ static void EspNowDirectDrainRx(void) {
 
   EspNowDirectRxItem_t item;
   while (pdTRUE == xQueueReceive(EspNowDirectRxQueue, &item, 0)) {
-    if (ESPNOW_DIRECT_TYPE_EVENT == item.type) {
-      Response_P(PSTR("%s"), item.text);
-      XdrvRulesProcess(0);
-    } else {
-      ExecuteCommand(item.text, SRC_RULE);
+    switch (item.type) {
+      case ESPNOW_DIRECT_TYPE_HELLO:           // a new peer session, greet it back
+        EspNowDirectSend(ESPNOW_DIRECT_TYPE_HELLO, nullptr, 0);
+        break;
+      case ESPNOW_DIRECT_TYPE_PING:
+        EspNowDirectSend(ESPNOW_DIRECT_TYPE_PONG, item.data, item.len);
+        break;
+      case ESPNOW_DIRECT_TYPE_EVENT:
+        Response_P(PSTR("%s"), (const char*)item.data);
+        XdrvRulesProcess(0);
+        break;
+      default:
+        ExecuteCommand((const char*)item.data, SRC_RULE);
+        break;
     }
   }
 }
