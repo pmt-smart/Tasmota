@@ -123,7 +123,15 @@ struct {
   uint8_t hunt_wait = 0;                   // seconds on hunt_channel so far
   uint8_t hunt_dwell = 3;                  // seconds to stay on hunt_channel
   uint8_t keepalive_wait = 0;              // seconds since the last keepalive ping
+  volatile uint8_t foreign_frames = 0;     // signed frames in a session this side does not hold, in a row
 } EspNowDirect;
+
+// A HELLO replayed from an earlier session makes this side adopt that session,
+// and then refuse every frame of the session the peer really has, which it has
+// no reason to announce again: the link stays blocked until one side restarts.
+// The peer's own frames, signed and refused for their session this many times in
+// a row, restart the link here with a new session, which the real peer answers.
+#define ESPNOW_DIRECT_FOREIGN_LIMIT    3
 
 // A device with no network saved looks for its peer channel by channel, see
 // EspNowDirectHunt.
@@ -341,8 +349,10 @@ void EspNowDirectRecvCb(const esp_now_recv_info_t* info, const uint8_t* frame, i
 
   if (!EspNowDirect.peer_known || (session != EspNowDirect.peer_session)) {
     AddLog(LOG_LEVEL_DEBUG, PSTR("ENW: Frame rejected, session %08X is not the established one"), session);
+    if (EspNowDirect.peer_known && (EspNowDirect.foreign_frames < 255)) { EspNowDirect.foreign_frames++; }
     return;
   }
+  EspNowDirect.foreign_frames = 0;
   if (counter <= EspNowDirect.peer_counter) {
     AddLog(LOG_LEVEL_DEBUG, PSTR("ENW: Frame rejected, counter %u was already seen"), counter);
     return;
@@ -491,6 +501,7 @@ static bool EspNowDirectStart(void) {
   EspNowDirect.peer_counter = 0;
   EspNowDirect.last_heard = millis();       // silence is counted from the start
   EspNowDirect.keepalive_wait = 0;
+  EspNowDirect.foreign_frames = 0;
 
   if (nullptr == EspNowDirectRxQueue) {
     EspNowDirectRxQueue = xQueueCreate(ESPNOW_DIRECT_RX_QUEUE_DEPTH, sizeof(EspNowDirectRxItem_t));
@@ -606,6 +617,14 @@ static void EspNowDirectEverySecond(void) {
     EspNowDirect.radio_lost = false;
     EspNowDirect.active = false;
     AddLog(LOG_LEVEL_INFO, PSTR("ENW: WiFi restarted under the link, starting it again"));
+    EspNowDirectStart();
+    return;
+  }
+
+  if (EspNowDirect.active && (EspNowDirect.foreign_frames >= ESPNOW_DIRECT_FOREIGN_LIMIT)) {
+    AddLog(LOG_LEVEL_INFO, PSTR("ENW: The peer keeps a session this side does not hold, starting the link again"));
+    EspNowDirect.foreign_frames = 0;
+    EspNowDirectStop();
     EspNowDirectStart();
     return;
   }
