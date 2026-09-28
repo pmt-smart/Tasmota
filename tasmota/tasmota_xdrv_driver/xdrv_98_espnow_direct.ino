@@ -25,6 +25,11 @@
  * routing anything through the access point, so the link keeps working while
  * the WiFi infrastructure is unavailable.
  *
+ * The two peers have to share a channel. A device on an access point uses the
+ * access point's; with its station down it moves to the configured fallback
+ * channel; and a device with no network saved and no fallback looks for its
+ * peer channel by channel.
+ *
  * Frame layout, 17 bytes of fixed overhead (ESP-NOW allows 250 per frame):
  *
  *   type(1) | session_id(4) | counter(4) | payload(0..233) | tag(8)
@@ -109,7 +114,18 @@ struct {
   uint32_t peer_session = 0;               // session the peer announced in that HELLO
   uint32_t peer_counter = 0;               // highest counter accepted within that session
   volatile bool radio_lost = false;        // the WiFi stack stopped under the link, see EspNowDirectWifiEvent
+  volatile uint32_t last_heard = 0;        // when the peer's last accepted frame arrived
+  uint8_t hunt_channel = 0;                // channel tried while looking for the peer, 0 when not looking
+  uint8_t hunt_wait = 0;                   // seconds on hunt_channel so far
+  uint8_t hunt_dwell = 3;                  // seconds to stay on hunt_channel
+  uint8_t keepalive_wait = 0;              // seconds since the last keepalive ping
 } EspNowDirect;
+
+// A device with no network saved looks for its peer channel by channel, see
+// EspNowDirectHunt.
+#define ESPNOW_DIRECT_HUNT_CHANNELS    13     // 1 to 13, what every regulatory domain but Japan's 14 allows
+#define ESPNOW_DIRECT_KEEPALIVE_S      20     // a ping this often while the peer is quiet
+#define ESPNOW_DIRECT_LOST_MS          65000  // silent this long, the peer is looked for again
 
 // What the receive callback accepts crosses from the WiFi task to the main loop
 // through this queue: command lines and events, and the replies a greeting or a
@@ -308,6 +324,7 @@ void EspNowDirectRecvCb(const esp_now_recv_info_t* info, const uint8_t* frame, i
     EspNowDirect.peer_known = true;
     EspNowDirect.peer_session = session;
     EspNowDirect.peer_counter = counter;
+    EspNowDirect.last_heard = millis();
     if (new_session) {
       // Answer so the peer learns our session too. Bounded: the reply only goes
       // out when the announced session is new to us, so two devices greeting
@@ -327,6 +344,7 @@ void EspNowDirectRecvCb(const esp_now_recv_info_t* info, const uint8_t* frame, i
     return;
   }
   EspNowDirect.peer_counter = counter;
+  EspNowDirect.last_heard = millis();
 
   switch (type) {
     case ESPNOW_DIRECT_TYPE_PING:
@@ -368,6 +386,7 @@ static uint8_t EspNowDirectTargetChannel(void) {
   uint8_t channel = 0;
   if (EspNowDirectStationChannel(&channel)) { return channel; }
   if (EspNowDirectSettings.channel) { return EspNowDirectSettings.channel; }
+  if (EspNowDirect.hunt_channel) { return EspNowDirect.hunt_channel; }
 
   wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;   // no fallback configured, stay put
   esp_wifi_get_channel(&channel, &second);
@@ -466,6 +485,8 @@ static bool EspNowDirectStart(void) {
   EspNowDirect.peer_known = false;          // the peer has to greet us again
   EspNowDirect.peer_session = 0;
   EspNowDirect.peer_counter = 0;
+  EspNowDirect.last_heard = millis();       // silence is counted from the start
+  EspNowDirect.keepalive_wait = 0;
 
   if (nullptr == EspNowDirectRxQueue) {
     EspNowDirectRxQueue = xQueueCreate(ESPNOW_DIRECT_RX_QUEUE_DEPTH, sizeof(EspNowDirectRxItem_t));
@@ -518,6 +539,56 @@ void EspNowDirectWifiEvent(arduino_event_t *event) {
   }
 }
 
+// A device with no network saved has no access point whose channel it shares
+// with its peer, so it looks for the peer: while the peer is silent, the radio
+// moves on to the next channel every few seconds, greeting on each, and it stays
+// on the channel where the peer answers. Quiet for long, the peer gets a ping
+// now and then, and once nothing has come back for a while the search starts
+// again, with a new session, which the peer answers wherever it hears it.
+//
+// Only with the station down, no fallback channel configured and no network
+// saved, and never while something else owns the radio: a scan, a join, or the
+// WiFi Manager, whose AP would move with the channel. The time on each channel
+// varies, so that two devices looking for each other at once do not keep the
+// same distance between their channels forever.
+static bool EspNowDirectMayHunt(void) {
+  uint8_t channel;
+  if (EspNowDirectStationChannel(&channel) || EspNowDirectSettings.channel || Wifi.config_type) { return false; }
+  if (strlen(SettingsText(SET_STASSID1)) || strlen(SettingsText(SET_STASSID2))) { return false; }
+#ifdef USE_WIFI_STATION_CONTROL
+  if (StaCtrlRadioInUse()) { return false; }
+#endif
+  return (WIFI_SCAN_RUNNING != WiFi.scanComplete());
+}
+
+static void EspNowDirectHunt(void) {
+  if (!EspNowDirectMayHunt()) {
+    EspNowDirect.hunt_wait = 0;
+    return;
+  }
+  if (EspNowDirect.peer_known) {
+    if (TimePassedSince(EspNowDirect.last_heard) > ESPNOW_DIRECT_LOST_MS) {
+      AddLog(LOG_LEVEL_INFO, PSTR("ENW: Peer silent on channel %d, looking for it"), EspNowDirect.applied_channel);
+      EspNowDirectStop();
+      EspNowDirectStart();
+      return;
+    }
+    if (++EspNowDirect.keepalive_wait >= ESPNOW_DIRECT_KEEPALIVE_S) {
+      EspNowDirect.keepalive_wait = 0;
+      // Empty, so the pong that answers it is not logged as a measurement
+      if (TimePassedSince(EspNowDirect.last_heard) > ESPNOW_DIRECT_KEEPALIVE_S * 1000) {
+        EspNowDirectSend(ESPNOW_DIRECT_TYPE_PING, nullptr, 0);
+      }
+    }
+    return;
+  }
+  if (++EspNowDirect.hunt_wait < EspNowDirect.hunt_dwell) { return; }
+  EspNowDirect.hunt_wait = 0;
+  EspNowDirect.hunt_dwell = 2 + (esp_random() % 3);          // 2 to 4 s
+  EspNowDirect.hunt_channel = (EspNowDirect.hunt_channel % ESPNOW_DIRECT_HUNT_CHANNELS) + 1;
+  AddLog(LOG_LEVEL_DEBUG, PSTR("ENW: Looking for the peer on channel %d"), EspNowDirect.hunt_channel);
+}
+
 // Called every second rather than at init: ESP-NOW needs WiFi up, and the start
 // is retried until it is.
 static void EspNowDirectEverySecond(void) {
@@ -536,6 +607,8 @@ static void EspNowDirectEverySecond(void) {
   }
 
   if (EspNowDirect.active) {
+    EspNowDirectHunt();
+    if (!EspNowDirect.active) { return; }   // a lost peer's link starts again at the next second
     EspNowDirectApplyChannel();
     // Keep greeting until the peer answers. Covers the peer booting later than
     // us, and a greeting lost to interference, without persisting anything.
