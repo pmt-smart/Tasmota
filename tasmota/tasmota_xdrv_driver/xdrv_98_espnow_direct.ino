@@ -56,6 +56,10 @@
  * Settings live in their own NVS namespace rather than in the global settings
  * struct, so the driver stays self-contained and carries its own versioning.
  *
+ * The link coming up is reported to the rule engine, every time the peer's
+ * session is established: {"EspNowDirect":{"PeerUp":"<session>"}}. What the
+ * application sends before then is lost.
+ *
  * Commands:
  *   EspNowEnable 0|1  - stop/start the radio, reports state when called bare
  *   EspNowPeerMac     - peer address as AA:BB:CC:DD:EE:FF
@@ -712,8 +716,10 @@ static void EspNowDirectDrainRx(void) {
   EspNowDirectRxItem_t item;
   while (pdTRUE == xQueueReceive(EspNowDirectRxQueue, &item, 0)) {
     switch (item.type) {
-      case ESPNOW_DIRECT_TYPE_HELLO:           // a new peer session, greet it back
+      case ESPNOW_DIRECT_TYPE_HELLO:           // a new peer session: greet it back, and say the link is up
         EspNowDirectSend(ESPNOW_DIRECT_TYPE_HELLO, nullptr, 0);
+        Response_P(PSTR("{\"EspNowDirect\":{\"PeerUp\":\"%08X\"}}"), EspNowDirect.peer_session);
+        XdrvRulesProcess(0);
         break;
       case ESPNOW_DIRECT_TYPE_PING:
         EspNowDirectSend(ESPNOW_DIRECT_TYPE_PONG, item.data, item.len);
