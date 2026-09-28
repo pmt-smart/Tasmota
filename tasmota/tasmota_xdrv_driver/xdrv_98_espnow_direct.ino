@@ -108,6 +108,7 @@ struct {
   bool peer_known = false;                 // a HELLO from the peer has been accepted
   uint32_t peer_session = 0;               // session the peer announced in that HELLO
   uint32_t peer_counter = 0;               // highest counter accepted within that session
+  volatile bool radio_lost = false;        // the WiFi stack stopped under the link, see EspNowDirectWifiEvent
 } EspNowDirect;
 
 // What the receive callback accepts crosses from the WiFi task to the main loop
@@ -215,7 +216,8 @@ static bool EspNowDirectVerifyFrame(const uint8_t* frame, size_t len) {
 }
 
 static bool EspNowDirectSend(uint8_t type, const uint8_t* payload, size_t payload_len) {
-  if (!EspNowDirect.active) { return false; }
+  // Nothing goes out between a stop of the WiFi stack and the restart of the link
+  if (!EspNowDirect.active || EspNowDirect.radio_lost) { return false; }
 
   uint8_t frame[ESPNOW_DIRECT_MAX_FRAME];
   size_t frame_len = EspNowDirectBuildFrame(frame, type, payload, payload_len);
@@ -372,6 +374,16 @@ static uint8_t EspNowDirectTargetChannel(void) {
   return channel;
 }
 
+// ESP-NOW sits on top of the WiFi stack, started in station mode, and touching
+// it before that stack exists faults inside esp_now_deinit(): a script enabling
+// the transport at startup would crash the device before the network is up, and
+// keep crashing every boot. Whether the station is associated does not matter.
+// With no access point the radio sits on the fallback channel, and that is what
+// keeps the link up with the access point down, or with no network at all.
+static bool EspNowDirectRadioReady(void) {
+  return (WiFi.getMode() & WIFI_MODE_STA);
+}
+
 // Follows the radio as the station comes and goes. Deliberately keyed off the
 // association itself rather than off the "network is up" flag, which also waits
 // for an address: the moment this has to act on is exactly the one where the
@@ -430,16 +442,15 @@ static bool EspNowDirectStart(void) {
   if (EspNowDirect.active) { return true; }
 
   if (!EspNowDirectConfigured()) { return false; }
-  // ESP-NOW sits on top of the WiFi stack, so touching it before that stack
-  // exists faults inside esp_now_deinit(). Reachable from the command as well
-  // as from the periodic retry, which is why the check lives here rather than
-  // in the caller: a script enabling the transport at startup would otherwise
-  // crash the device before the network is up, and keep crashing every boot.
-  if (TasmotaGlobal.global_state.wifi_down) { return false; }
+  // Reachable from the command as well as from the periodic retry, which is why
+  // the check lives here rather than in the caller.
+  if (!EspNowDirectRadioReady()) { return false; }
 
   // Deinitialise first so a restart always begins from a known state. Without
   // it, a peer table left over from an earlier start would disagree with the
-  // peers this driver believes it registered.
+  // peers this driver believes it registered. A stop of the stack noted before
+  // this start is behind it.
+  EspNowDirect.radio_lost = false;
   esp_now_deinit();
 
   esp_err_t error = esp_now_init();
@@ -493,11 +504,36 @@ static void EspNowDirectStop(void) {
   AddLog(LOG_LEVEL_INFO, PSTR("ENW: Stopped"));
 }
 
+// The WiFi stack goes away under the link more often than it looks: every time
+// Tasmota connects its station again, WifiBegin() switches station mode off,
+// which stops the stack and deinitialises it, and then on again. ESP-NOW does
+// not survive that, and a link left as it was keeps reporting itself up while
+// nothing gets through, for good when the channel it comes back on is the one
+// it had. The stop is only noted here, on the network event task; the link is
+// started again from the main loop once the radio is back.
+void EspNowDirectWifiEvent(arduino_event_t *event);
+void EspNowDirectWifiEvent(arduino_event_t *event) {
+  if ((ARDUINO_EVENT_WIFI_STA_STOP == event->event_id) || (ARDUINO_EVENT_WIFI_OFF == event->event_id)) {
+    EspNowDirect.radio_lost = true;
+  }
+}
+
 // Called every second rather than at init: ESP-NOW needs WiFi up, and the start
 // is retried until it is.
 static void EspNowDirectEverySecond(void) {
   if (!EspNowDirect.enabled) { return; }
   if (!EspNowDirectConfigured()) { return; }        // cleared while enabled, nothing to retry
+
+  if (EspNowDirect.active && EspNowDirect.radio_lost) {
+    // What ESP-NOW held went with the stack: nothing of it is touched until the
+    // radio is back, and the start begins from a clean deinit.
+    if (!EspNowDirectRadioReady()) { return; }
+    EspNowDirect.radio_lost = false;
+    EspNowDirect.active = false;
+    AddLog(LOG_LEVEL_INFO, PSTR("ENW: WiFi restarted under the link, starting it again"));
+    EspNowDirectStart();
+    return;
+  }
 
   if (EspNowDirect.active) {
     EspNowDirectApplyChannel();
@@ -507,7 +543,7 @@ static void EspNowDirectEverySecond(void) {
     return;
   }
 
-  if (TasmotaGlobal.global_state.wifi_down) { return; }
+  if (!EspNowDirectRadioReady()) { return; }
   EspNowDirectStart();
 }
 
@@ -754,11 +790,12 @@ bool Xdrv98(uint32_t function) {
     case FUNC_PRE_INIT:
       EspNowDirectSettingsLoad();
       break;
-#ifdef USE_BERRY
     case FUNC_INIT:
+      WiFi.onEvent(EspNowDirectWifiEvent);
+#ifdef USE_BERRY
       EspNowDirectBerryRegister();
-      break;
 #endif
+      break;
     case FUNC_LOOP:
       EspNowDirectDrainRx();
       break;
