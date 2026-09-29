@@ -28,7 +28,9 @@
  * The two peers have to share a channel. A device on an access point uses the
  * access point's; with its station down it moves to the configured fallback
  * channel; and a device with no network saved and no fallback looks for its
- * peer channel by channel.
+ * peer channel by channel. Otherwise it stays on the channel the link is on,
+ * and a scan that leaves the radio elsewhere is followed by the radio moving
+ * back.
  *
  * Frame layout, 17 bytes of fixed overhead (ESP-NOW allows 250 per frame):
  *
@@ -407,10 +409,30 @@ static uint8_t EspNowDirectTargetChannel(void) {
   if (EspNowDirectStationChannel(&channel)) { return channel; }
   if (EspNowDirectSettings.channel) { return EspNowDirectSettings.channel; }
   if (EspNowDirect.hunt_channel) { return EspNowDirect.hunt_channel; }
+  // No fallback configured: stay on the channel the link is on. A scan leaves
+  // the radio on the last channel it listened to, and following the radio there
+  // would lose the peer.
+  if (EspNowDirect.applied_channel) { return EspNowDirect.applied_channel; }
 
-  wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;   // no fallback configured, stay put
+  wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;   // not started yet, stay put
   esp_wifi_get_channel(&channel, &second);
   return channel;
+}
+
+// Something else is using the radio: a scan, a join, or the WiFi Manager.
+static bool EspNowDirectRadioBusy(void) {
+  if (Wifi.config_type) { return true; }
+#ifdef USE_WIFI_STATION_CONTROL
+  if (StaCtrlRadioInUse()) { return true; }
+#endif
+  return (WIFI_SCAN_RUNNING == WiFi.scanComplete());
+}
+
+// The station keeps trying a saved network while WiFi is on: moving the radio
+// under a connection attempt is not allowed (esp_wifi_set_channel), and the
+// channel is the station's to set.
+static bool EspNowDirectStationJoining(void) {
+  return Settings->flag4.network_wifi && (strlen(SettingsText(SET_STASSID1)) || strlen(SettingsText(SET_STASSID2)));
 }
 
 // ESP-NOW sits on top of the WiFi stack, started in station mode, and touching
@@ -434,7 +456,20 @@ static void EspNowDirectApplyChannel(void) {
   uint8_t sta_channel = 0;
   bool associated = EspNowDirectStationChannel(&sta_channel);
   uint8_t target = EspNowDirectTargetChannel();
-  if (target == EspNowDirect.applied_channel) { return; }
+  if (target == EspNowDirect.applied_channel) {
+    // A scan with the station down moves the radio across every channel and
+    // leaves it on the last one, and nothing brings it back: the radio is put
+    // back on the link's channel once the scan is over. The peer is still
+    // registered on it, so moving the radio is enough.
+    if (associated || EspNowDirectRadioBusy() || EspNowDirectStationJoining()) { return; }
+    uint8_t radio = 0;
+    wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
+    if ((ESP_OK != esp_wifi_get_channel(&radio, &second)) || (radio == target)) { return; }
+    if (ESP_OK == esp_wifi_set_channel(target, WIFI_SECOND_CHAN_NONE)) {
+      AddLog(LOG_LEVEL_DEBUG, PSTR("ENW: Radio back from channel %d to the link's %d"), radio, target);
+    }
+    return;
+  }
 
   // Never move the radio out from under an associated station; that drops the
   // association. When the station holds the radio, following it is the only
@@ -574,12 +609,9 @@ void EspNowDirectWifiEvent(arduino_event_t *event) {
 // same distance between their channels forever.
 static bool EspNowDirectMayHunt(void) {
   uint8_t channel;
-  if (EspNowDirectStationChannel(&channel) || EspNowDirectSettings.channel || Wifi.config_type) { return false; }
+  if (EspNowDirectStationChannel(&channel) || EspNowDirectSettings.channel) { return false; }
   if (strlen(SettingsText(SET_STASSID1)) || strlen(SettingsText(SET_STASSID2))) { return false; }
-#ifdef USE_WIFI_STATION_CONTROL
-  if (StaCtrlRadioInUse()) { return false; }
-#endif
-  return (WIFI_SCAN_RUNNING != WiFi.scanComplete());
+  return !EspNowDirectRadioBusy();
 }
 
 // A peer that stays quiet gets a ping now and then, and once nothing has come
