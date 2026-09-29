@@ -60,6 +60,11 @@
  * session is established: {"EspNowDirect":{"PeerUp":"<session>"}}. What the
  * application sends before then is lost.
  *
+ * Build option USE_ESPNOW_DIRECT_EVENTS_ONLY: the device takes events from its
+ * peer and runs no command it receives. A command frame, however well signed,
+ * is dropped. For a device that only reports to its peer, this keeps a leaked
+ * secret from becoming a remote console on it.
+ *
  * Commands:
  *   EspNowEnable 0|1  - stop/start the radio, reports state when called bare
  *   EspNowPeerMac     - peer address as AA:BB:CC:DD:EE:FF
@@ -67,6 +72,7 @@
  *                       silent form that answers with asterisks either way
  *   EspNowChannel     - fixed channel, or 0 to follow the station
  *   EspNowSend        - send a command line to the peer, run there on arrival
+ *                       unless the peer is built with USE_ESPNOW_DIRECT_EVENTS_ONLY
  *   EspNowEvent       - send a JSON event to the peer, fed to its rule engine
  *   EspNowStatus      - report link state, session and peer
  *   EspNowPing        - send a signed ping, RTT is logged when the pong lands
@@ -757,7 +763,11 @@ static void EspNowDirectDrainRx(void) {
         XdrvRulesProcess(0);
         break;
       default:
+#ifdef USE_ESPNOW_DIRECT_EVENTS_ONLY
+        AddLog(LOG_LEVEL_INFO, PSTR("ENW: Command from the peer dropped, this device takes events only"));
+#else
         ExecuteCommand((const char*)item.data, SRC_RULE);
+#endif
         break;
     }
   }
