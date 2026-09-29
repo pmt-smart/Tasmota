@@ -68,7 +68,8 @@
  * secret from becoming a remote console on it.
  *
  * Commands:
- *   EspNowEnable 0|1  - stop/start the radio, reports state when called bare
+ *   EspNowEnable 0|1  - stop/start the radio, reports state when called bare;
+ *                       enabled with no peer set, it starts once one is
  *   EspNowPeerMac     - peer address as AA:BB:CC:DD:EE:FF
  *   EspNowSecret      - shared secret, never echoed back; EspNowSecret2 is the
  *                       silent form that answers with asterisks either way
@@ -655,7 +656,7 @@ static void EspNowDirectHunt(void) {
 // is retried until it is.
 static void EspNowDirectEverySecond(void) {
   if (!EspNowDirect.enabled) { return; }
-  if (!EspNowDirectConfigured()) { return; }        // cleared while enabled, nothing to retry
+  if (!EspNowDirectConfigured()) { return; }        // no peer yet: setting it starts the link (EspNowDirectReload)
 
   if (EspNowDirect.active && EspNowDirect.radio_lost) {
     // What ESP-NOW held went with the stack: nothing of it is touched until the
@@ -697,18 +698,22 @@ static void EspNowDirectEverySecond(void) {
 // ESP-NOW shares the radio with the WiFi station interface, so it stays off
 // until asked for. A build carrying this driver then behaves like a build
 // without it until someone enables the transport.
+// Enabled with no peer set, the transport waits for one: it starts once
+// EspNowPeerMac and EspNowSecret are both set, with nothing else to send. A
+// script that enables it before a pairing sets the peer used to be refused, and
+// the peer set afterwards left the radio off.
 void CmndEspNowEnable(void) {
   if ((XdrvMailbox.payload >= 0) && (XdrvMailbox.payload <= 1)) {
-    if (XdrvMailbox.payload && !EspNowDirectConfigured()) {
-      ResponseCmndChar_P(PSTR("set EspNowPeerMac and EspNowSecret first"));
-      return;
-    }
     EspNowDirect.enabled = XdrvMailbox.payload;
     if (EspNowDirect.enabled) {
-      EspNowDirectStart();       // retried every second while WiFi is still coming up
+      EspNowDirectStart();       // retried every second while WiFi is still coming up, or the peer unset
     } else {
       EspNowDirectStop();
     }
+  }
+  if (EspNowDirect.enabled && !EspNowDirectConfigured()) {
+    ResponseCmndChar_P(PSTR("waiting for EspNowPeerMac and EspNowSecret"));
+    return;
   }
   ResponseCmndStateText(EspNowDirect.active);
 }
