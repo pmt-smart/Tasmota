@@ -137,7 +137,7 @@ struct {
 // EspNowDirectHunt.
 #define ESPNOW_DIRECT_HUNT_CHANNELS    13     // 1 to 13, what every regulatory domain but Japan's 14 allows
 #define ESPNOW_DIRECT_KEEPALIVE_S      20     // a ping this often while the peer is quiet
-#define ESPNOW_DIRECT_LOST_MS          65000  // silent this long, the peer is looked for again
+#define ESPNOW_DIRECT_LOST_MS          65000  // silent this long, the link starts again
 
 // What the receive callback accepts crosses from the WiFi task to the main loop
 // through this queue: command lines and events, and the replies a greeting or a
@@ -557,9 +557,9 @@ void EspNowDirectWifiEvent(arduino_event_t *event) {
 // A device with no network saved has no access point whose channel it shares
 // with its peer, so it looks for the peer: while the peer is silent, the radio
 // moves on to the next channel every few seconds, greeting on each, and it stays
-// on the channel where the peer answers. Quiet for long, the peer gets a ping
-// now and then, and once nothing has come back for a while the search starts
-// again, with a new session, which the peer answers wherever it hears it.
+// on the channel where the peer answers. Once the peer is lost (see
+// EspNowDirectKeepAlive), the search starts again, with a new session, which
+// the peer answers wherever it hears it.
 //
 // Only with the station down, no fallback channel configured and no network
 // saved, and never while something else owns the radio: a scan, a join, or the
@@ -576,25 +576,34 @@ static bool EspNowDirectMayHunt(void) {
   return (WIFI_SCAN_RUNNING != WiFi.scanComplete());
 }
 
-static void EspNowDirectHunt(void) {
-  if (!EspNowDirectMayHunt()) {
-    EspNowDirect.hunt_wait = 0;
+// A peer that stays quiet gets a ping now and then, and once nothing has come
+// back from it for a while the link starts again, with a new session: the peer
+// is reported unknown until it answers again. This holds on an access point as
+// much as without one. A peer that is switched off, or moved to another channel
+// or mode, would otherwise keep being reported as established for good.
+static void EspNowDirectKeepAlive(void) {
+  if (TimePassedSince(EspNowDirect.last_heard) > ESPNOW_DIRECT_LOST_MS) {
+    AddLog(LOG_LEVEL_INFO, PSTR("ENW: Peer silent on channel %d, starting the link again"), EspNowDirect.applied_channel);
+    EspNowDirectStop();
+    EspNowDirectStart();
     return;
   }
+  if (++EspNowDirect.keepalive_wait >= ESPNOW_DIRECT_KEEPALIVE_S) {
+    EspNowDirect.keepalive_wait = 0;
+    // Empty, so the pong that answers it is not logged as a measurement
+    if (TimePassedSince(EspNowDirect.last_heard) > ESPNOW_DIRECT_KEEPALIVE_S * 1000) {
+      EspNowDirectSend(ESPNOW_DIRECT_TYPE_PING, nullptr, 0);
+    }
+  }
+}
+
+static void EspNowDirectHunt(void) {
   if (EspNowDirect.peer_known) {
-    if (TimePassedSince(EspNowDirect.last_heard) > ESPNOW_DIRECT_LOST_MS) {
-      AddLog(LOG_LEVEL_INFO, PSTR("ENW: Peer silent on channel %d, looking for it"), EspNowDirect.applied_channel);
-      EspNowDirectStop();
-      EspNowDirectStart();
-      return;
-    }
-    if (++EspNowDirect.keepalive_wait >= ESPNOW_DIRECT_KEEPALIVE_S) {
-      EspNowDirect.keepalive_wait = 0;
-      // Empty, so the pong that answers it is not logged as a measurement
-      if (TimePassedSince(EspNowDirect.last_heard) > ESPNOW_DIRECT_KEEPALIVE_S * 1000) {
-        EspNowDirectSend(ESPNOW_DIRECT_TYPE_PING, nullptr, 0);
-      }
-    }
+    EspNowDirectKeepAlive();
+    return;
+  }
+  if (!EspNowDirectMayHunt()) {
+    EspNowDirect.hunt_wait = 0;
     return;
   }
   if (++EspNowDirect.hunt_wait < EspNowDirect.hunt_dwell) { return; }
