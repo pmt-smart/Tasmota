@@ -51,9 +51,16 @@
  * Settings live in their own NVS namespace rather than in the global settings
  * struct, so the driver stays self-contained and carries its own versioning.
  *
+ * Inert: while a device installs something that must not be interrupted, as a
+ * display being flashed, every button with a relay does nothing, neither the tap
+ * nor the hold, whether the driver is enabled or not. It is not saved: a restart
+ * ends it, and the generic handling or this driver has the buttons again.
+ *
  * Commands:
  *   ButtonDecoupleEnable 0|1  - take the buttons over, or give them back to the
  *                               generic handling; bare, reports the state
+ *   ButtonDecoupleInert 0|1   - 1 makes every button with a relay do nothing until
+ *                               0 or a restart; bare, reports the state
  *   ButtonDecouple<x> 0|1     - 1 reports button <x>'s tap instead of toggling
  *                               relay <x>; bare, reports the current value
  *   ButtonDecouple            - the value of every button with a relay, as a list
@@ -89,6 +96,7 @@ struct BUTTON_DECOUPLE {
   uint8_t held;                      // bit n: this press has become a hold
   uint8_t toggled;                   // bit n: a hold has toggled relay n+1 since boot
   uint8_t tapped;                    // bit n: button n+1 has reported a tap since boot
+  bool inert;                        // no button with a relay does anything, until a restart
 } ButtonDecouple;
 
 void ButtonDecoupleSettingsLoad(void) {
@@ -144,9 +152,14 @@ void ButtonDecoupleTap(uint32_t index, uint32_t now) {
 // Called on every button scan. True takes the button away from the generic handling.
 bool ButtonDecouplePressed(void) {
   uint32_t index = XdrvMailbox.index;
-  if (!ButtonDecoupleSettings.enabled) { return false; }
+  if (!ButtonDecoupleSettings.enabled && !ButtonDecouple.inert) { return false; }
   if ((index >= BUTTON_DECOUPLE_MAX) || (index >= TasmotaGlobal.devices_present)) {
     return false;                    // no relay of its own: the generic handling keeps it
+  }
+  if (ButtonDecouple.inert) {
+    // taken, and nothing done: a press that started before ends as nothing too
+    ButtonDecouple.pressed &= ~(1 << index);
+    return true;
   }
   uint32_t mask = 1 << index;
   bool down = (PRESSED == XdrvMailbox.payload);
@@ -218,9 +231,19 @@ void CmndButtonDecoupleEnable(void) {
   ResponseCmndStateText(ButtonDecoupleSettings.enabled);
 }
 
+void CmndButtonDecoupleInert(void) {
+  if ((XdrvMailbox.payload == 0) || (XdrvMailbox.payload == 1)) {
+    ButtonDecouple.inert = XdrvMailbox.payload;
+    // presses under either state finish as nothing
+    ButtonDecouple.pressed = 0;
+    ButtonDecouple.held = 0xFF;
+  }
+  ResponseCmndStateText(ButtonDecouple.inert);
+}
+
 // Leading "|" marks a flat command list without a shared prefix.
-const char kButtonDecoupleCommands[] PROGMEM = "|" "ButtonDecouple|ButtonDecoupleEnable";
-void (* const kButtonDecoupleCommand[])(void) PROGMEM = { &CmndButtonDecouple, &CmndButtonDecoupleEnable };
+const char kButtonDecoupleCommands[] PROGMEM = "|" "ButtonDecouple|ButtonDecoupleEnable|ButtonDecoupleInert";
+void (* const kButtonDecoupleCommand[])(void) PROGMEM = { &CmndButtonDecouple, &CmndButtonDecoupleEnable, &CmndButtonDecoupleInert };
 
 /*********************************************************************************************\
  * Interface
