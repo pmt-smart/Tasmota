@@ -133,6 +133,13 @@
  * is dropped. For a device that only reports to its peer, this keeps a leaked
  * key from becoming a remote console on it.
  *
+ * Build option USE_ESPNOW_DIRECT_COMMANDS_TO_RULES: the device runs no command it
+ * receives either, and hands each to the rule engine instead, for the
+ * application to run the ones it takes:
+ *   {"EspNowDirect":{"Command":"<the line>"}}
+ * The mechanism stays here and the policy there: which commands a peer may send
+ * is the application's to say, not this driver's.
+ *
  * Commands:
  *   EspNowEnable 0|1  - stop/start the radio, reports state when called bare;
  *                       enabled with no peer set, it starts once one is
@@ -240,6 +247,7 @@ struct {
   volatile uint32_t hello_answered = 0;    // when an unproven HELLO was last answered
   volatile bool radio_lost = false;        // the WiFi stack stopped under ESP-NOW, see EspNowDirectWifiEvent
   volatile uint32_t last_heard = 0;        // when the peer's last accepted frame arrived
+  volatile int8_t peer_rssi = 0;           // and its signal
   uint8_t hunt_channel = 0;                // channel tried while looking for the peer, 0 when not looking
   uint8_t hunt_wait = 0;                   // seconds on hunt_channel so far
   uint8_t hunt_dwell = 3;                  // seconds to stay on hunt_channel
@@ -502,7 +510,7 @@ static void EspNowDirectQueueHello(uint32_t session, uint32_t challenge) {
 // that does not hold this side's session gets an answer, which carries its
 // challenge back: an unproven HELLO at most every ESPNOW_DIRECT_HELLO_ANSWER_MS,
 // since anyone can repeat a recorded one.
-static void EspNowDirectHello(uint32_t session, uint32_t counter, const uint8_t* payload, size_t len) {
+static void EspNowDirectHello(uint32_t session, uint32_t counter, const uint8_t* payload, size_t len, int8_t rssi) {
   bool known = EspNowDirect.peer_known && (session == EspNowDirect.peer_session);
   if (known && (counter <= EspNowDirect.peer_counter)) { return; }   // repeated within the session
 
@@ -536,6 +544,7 @@ static void EspNowDirectHello(uint32_t session, uint32_t counter, const uint8_t*
   }
   EspNowDirect.peer_counter = counter;
   EspNowDirect.last_heard = millis();
+  EspNowDirect.peer_rssi = rssi;
   if (!held) { EspNowDirectQueueHello(session, challenge); }
 }
 
@@ -595,7 +604,7 @@ void EspNowDirectRecvCb(const esp_now_recv_info_t* info, const uint8_t* frame, i
   uint32_t counter = EspNowDirectGet32(&frame[5]);
 
   if (ESPNOW_DIRECT_TYPE_HELLO == type) {
-    EspNowDirectHello(session, counter, payload, payload_len);
+    EspNowDirectHello(session, counter, payload, payload_len, info->rx_ctrl->rssi);
     return;
   }
 
@@ -609,6 +618,7 @@ void EspNowDirectRecvCb(const esp_now_recv_info_t* info, const uint8_t* frame, i
   }
   EspNowDirect.peer_counter = counter;
   EspNowDirect.last_heard = millis();
+  EspNowDirect.peer_rssi = info->rx_ctrl->rssi;
 
   switch (type) {
     case ESPNOW_DIRECT_TYPE_PING:
@@ -2092,8 +2102,11 @@ static void EspNowDirectDrainRx(void) {
         XdrvRulesProcess(0);
         break;
       case ESPNOW_DIRECT_TYPE_CMD:
-#ifdef USE_ESPNOW_DIRECT_EVENTS_ONLY
+#if defined(USE_ESPNOW_DIRECT_EVENTS_ONLY)
         AddLog(LOG_LEVEL_INFO, PSTR("ENW: Command from the peer dropped, this device takes events only"));
+#elif defined(USE_ESPNOW_DIRECT_COMMANDS_TO_RULES)
+        Response_P(PSTR("{\"EspNowDirect\":{\"Command\":\"%s\"}}"), EscapeJSONString((const char*)item.data).c_str());
+        XdrvRulesProcess(0);
 #else
         ExecuteCommand((const char*)item.data, SRC_RULE);
 #endif
@@ -2162,10 +2175,45 @@ int EspNowDirectBerrySend(struct bvm *vm) {
   be_raise(vm, kTypeError, nullptr);
 }
 
+// A key of the pair's for what the application signs another way, such as its
+// messages over the access point:
+//
+//   espnow_key(label)        -> bytes(32), or nil with no pair
+//
+// It is HMAC-SHA256 of the label under the pair's key, behind a prefix none of
+// the link's own derivations uses, so it changes with every pairing and gives
+// the pair's key away to nobody: that key never reaches a script.
+int EspNowDirectBerryKey(struct bvm *vm);
+int EspNowDirectBerryKey(struct bvm *vm) {
+  int32_t argc = be_top(vm);
+  if ((argc >= 1) && be_isstring(vm, 1)) {
+    static const char prefix[] = "ESP-NOW direct app ";
+    const char* label = be_tostring(vm, 1);
+    size_t label_len = strlen(label);
+    uint8_t message[sizeof(prefix) - 1 + 64];
+    const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+    if (!EspNowDirectSettings.key_len || (label_len > 64) || (nullptr == info)) { be_return_nil(vm); }
+    memcpy(message, prefix, sizeof(prefix) - 1);
+    memcpy(&message[sizeof(prefix) - 1], label, label_len);
+    uint8_t digest[32];
+    if (mbedtls_md_hmac(info, EspNowDirectSettings.key, EspNowDirectSettings.key_len,
+                        message, sizeof(prefix) - 1 + label_len, digest)) {
+      be_return_nil(vm);
+    }
+    be_pushbytes(vm, digest, sizeof(digest));
+    EspNowDirectWipe(digest, sizeof(digest));
+    be_return(vm);
+  }
+  be_raise(vm, kTypeError, nullptr);
+}
+
 static void EspNowDirectBerryRegister(void) {
   if (nullptr == berry.vm) { return; }
   be_pushntvfunction(berry.vm, EspNowDirectBerrySend);
   be_setglobal(berry.vm, "espnow_send");
+  be_pop(berry.vm, 1);
+  be_pushntvfunction(berry.vm, EspNowDirectBerryKey);
+  be_setglobal(berry.vm, "espnow_key");
   be_pop(berry.vm, 1);
 }
 #endif  // USE_BERRY
@@ -2178,13 +2226,17 @@ void CmndEspNowStatus(void) {
 #else
   const char* pairing = PSTR("");
 #endif
+  // Quiet: seconds since the peer's last frame, and Rssi its signal, while the link is up
+  bool heard = EspNowDirect.active && EspNowDirect.peer_known;
   Response_P(PSTR("{\"EspNowStatus\":{\"Active\":%d,\"Peer\":\"%s\",\"Channel\":%d,\"OnChannel\":%d,\"SecretSet\":%d,"
                   "\"Session\":\"%08X\",\"Sent\":%u,\"PeerKnown\":%d,\"PeerSession\":\"%08X\",\"PeerCounter\":%u,"
+                  "\"Quiet\":%d,\"Rssi\":%d,"
                   "\"Version\":%u,\"PeerVersion\":%u,\"Epoch\":%u,\"Mode\":%u,\"Config\":%u,\"Pairing\":\"%s\",\"MaxPayload\":%u}}"),
     EspNowDirect.active, mac_text, EspNowDirectSettings.channel, EspNowDirect.applied_channel,
     (EspNowDirectSettings.key_len > 0), EspNowDirect.session_id,
-    EspNowDirect.tx_counter, EspNowDirect.peer_known, EspNowDirect.peer_session,
-    EspNowDirect.peer_counter, ESPNOW_DIRECT_PROTOCOL, EspNowDirect.peer_version,
+    EspNowDirect.tx_counter, EspNowDirect.peer_known, EspNowDirect.peer_session, EspNowDirect.peer_counter,
+    heard ? TimePassedSince(EspNowDirect.last_heard) / 1000 : -1, heard ? EspNowDirect.peer_rssi : 0,
+    ESPNOW_DIRECT_PROTOCOL, EspNowDirect.peer_version,
     EspNowDirectSettings.epoch, EspNowDirectSettings.mode, EspNowDirectSettings.config, pairing, ESPNOW_DIRECT_MAX_PAYLOAD);
 }
 
