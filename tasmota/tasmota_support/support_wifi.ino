@@ -381,12 +381,18 @@ void WifiBegin(uint8_t flag, uint8_t channel) {
 #ifdef USE_WIFI_RANGE_EXTENDER
   if (WiFi.getMode() != WIFI_AP_STA || !RgxApUp()) {  // Preserve range extender connections (#17103)
 #endif  // USE_WIFI_RANGE_EXTENDER
+#ifdef USE_WIFI_STATION_CONTROL
+  if (!StaCtrlHotspotUp()) {  // Preserve the station driver's hotspot and the phones on it
+#endif  // USE_WIFI_STATION_CONTROL
 
   WifiMDNSBeforeDisconnect();
   
   WiFi.disconnect(true);  // Delete SDK wifi config
   delay(200);
   WifiSetMode(WIFI_STA);  // Disable AP mode
+#ifdef USE_WIFI_STATION_CONTROL
+  }
+#endif  // USE_WIFI_STATION_CONTROL
 #ifdef USE_WIFI_RANGE_EXTENDER
   }
 #endif  // USE_WIFI_RANGE_EXTENDER

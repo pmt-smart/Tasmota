@@ -1323,6 +1323,13 @@ void CmndSleep(void)
 }
 
 void CmndUpgrade(void) {
+#ifdef USE_WIFI_STATION_CONTROL
+  // the safeboot that runs the upgrade has no hotspot to come back on
+  if (StaCtrlHotspotAlone()) {
+    ResponseCmndChar_P(PSTR("Refused over the hotspot alone: join a network first"));
+    return;
+  }
+#endif  // USE_WIFI_STATION_CONTROL
   // Check if the payload is numerically 1, and had no trailing chars.
   //   e.g. "1foo" or "1.2.3" could fool us.
   // Check if the version we have been asked to upgrade to is higher than our current version.
