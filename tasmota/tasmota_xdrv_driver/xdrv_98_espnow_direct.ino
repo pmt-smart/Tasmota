@@ -525,6 +525,12 @@ static void EspNowDirectQueueHello(uint32_t session, uint32_t challenge) {
 // that does not hold this side's session gets an answer, which carries its
 // challenge back: an unproven HELLO at most every ESPNOW_DIRECT_HELLO_ANSWER_MS,
 // since anyone can repeat a recorded one.
+//
+// The answer is queued before the report of the session adopted. It is what
+// makes the peer take this side's session, and whatever the application sends
+// as the link comes up goes out after it: the other way round, the first frame
+// of the application reached a peer that did not hold the session yet, which
+// rejected it.
 static void EspNowDirectHello(uint32_t session, uint32_t counter, const uint8_t* payload, size_t len, int8_t rssi) {
   bool known = EspNowDirect.peer_known && (session == EspNowDirect.peer_session);
   if (known && (counter <= EspNowDirect.peer_counter)) { return; }   // repeated within the session
@@ -541,12 +547,13 @@ static void EspNowDirectHello(uint32_t session, uint32_t counter, const uint8_t*
   EspNowDirect.heard_session = session;
   EspNowDirect.heard_challenge = challenge;
 
+  bool adopted = false;
   if (echo == EspNowDirect.challenge) {
     if (!known) {
       EspNowDirect.peer_known = true;
       EspNowDirect.peer_session = session;
       EspNowDirect.challenge = EspNowDirectChallenge();
-      EspNowDirectQueue(ESPNOW_DIRECT_DO_PEER_UP, nullptr, 0);
+      adopted = true;
       AddLog(LOG_LEVEL_INFO, PSTR("ENW: Peer session %08X"), session);
     }
   } else if (!known) {
@@ -561,6 +568,7 @@ static void EspNowDirectHello(uint32_t session, uint32_t counter, const uint8_t*
   EspNowDirect.last_heard = millis();
   EspNowDirect.peer_rssi = rssi;
   if (!held) { EspNowDirectQueueHello(session, challenge); }
+  if (adopted) { EspNowDirectQueue(ESPNOW_DIRECT_DO_PEER_UP, nullptr, 0); }
 }
 
 // Both callbacks are declared before their definition so that the sketch
