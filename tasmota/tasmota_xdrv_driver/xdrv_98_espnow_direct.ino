@@ -37,18 +37,29 @@
  *   type(1) | session_id(4) | counter(4) | payload(0..233) | tag(8)
  *
  * `session_id` is drawn once per start and `counter` increases per frame, so a
- * receiver can tell a replayed frame from a fresh one. A session is adopted
- * only from a HELLO, never inferred from an ordinary frame: since a receiver
- * remembers just the latest (session, counter), letting any frame introduce a
- * session would make a frame captured from an earlier session acceptable again
- * as soon as the receiver moved on, which is routine after every reboot.
- * Within the established session the counter must strictly increase.
+ * receiver can tell a replayed frame from a fresh one. Within the established
+ * session the counter must strictly increase.
  *
- * `tag` holds an HMAC-SHA256 over the rest of the frame, keyed with a shared
- * secret and truncated to its first 8 bytes. The peer address and the secret
- * are configured per device and kept in NVS, so nothing about a given pair is
- * compiled in. Establishing the secret still has to be done by hand; deriving
- * it from a pairing exchange is not implemented.
+ * A session is adopted only from a HELLO, never inferred from an ordinary
+ * frame, and only from a HELLO that proves to be fresh. A HELLO carries the
+ * protocol version, a challenge the sender draws at every start and again
+ * every time it adopts a session, the peer's challenge as the sender last heard
+ * it, and whether the sender holds the receiver's session. A HELLO that repeats
+ * the receiver's current challenge was made after the receiver drew it, so one
+ * recorded earlier, from this session of the peer or any before it, is never
+ * adopted: a receiver that adopted a replayed session would refuse every frame
+ * of the session the peer really has. Every HELLO from a sender that does not
+ * hold the receiver's session is answered, so that it can prove itself with the
+ * answer, and three HELLOs set up both sides: a greeting, its answer, and the
+ * answer to the answer. A peer speaking another protocol version never gets a
+ * session, and the version it spoke is reported.
+ *
+ * `tag` holds an HMAC-SHA256 over the rest of the frame, keyed with the pair's
+ * key and truncated to its first 8 bytes. ESP-NOW also encrypts every frame to
+ * the peer (CCMP), with a local master key derived from the pair's key, so what
+ * the two send each other stays between them. The peer address and the key are
+ * kept per device in NVS, so nothing about a given pair is compiled in. The key
+ * is set by hand; deriving it from a pairing exchange is not implemented.
  *
  * Uses the ESP-NOW API directly instead of a wrapper library so that peer
  * bookkeeping stays owned here: esp_now_deinit() drops the driver peer table,
@@ -57,23 +68,34 @@
  *
  * Settings live in their own NVS namespace rather than in the global settings
  * struct, so the driver stays self-contained and carries its own versioning.
+ * They are one record: the peer's address, the key, the fallback channel, an
+ * epoch, and two values the application keeps with the pairing, its link mode
+ * and the version of its configuration. A record of version 1 held a secret
+ * for a protocol with no version, and is dropped at start, saying so in the
+ * log: that pair has to be set up again. Its fallback channel stays.
  *
- * The link coming up is reported to the rule engine, every time the peer's
- * session is established: {"EspNowDirect":{"PeerUp":"<session>"}}. What the
- * application sends before then is lost.
+ * Reported to the rule engine:
+ *   {"EspNowDirect":{"PeerUp":"<session>"}}   every time the peer's session is
+ *                                             established; what the application
+ *                                             sends before then is lost
+ *   {"EspNowDirect":{"PeerVersion":<n>}}      the peer speaks protocol version n,
+ *                                             not this one, and the link stays down
  *
  * Build option USE_ESPNOW_DIRECT_EVENTS_ONLY: the device takes events from its
  * peer and runs no command it receives. A command frame, however well signed,
  * is dropped. For a device that only reports to its peer, this keeps a leaked
- * secret from becoming a remote console on it.
+ * key from becoming a remote console on it.
  *
  * Commands:
  *   EspNowEnable 0|1  - stop/start the radio, reports state when called bare;
  *                       enabled with no peer set, it starts once one is
  *   EspNowPeerMac     - peer address as AA:BB:CC:DD:EE:FF
- *   EspNowSecret      - shared secret, never echoed back; EspNowSecret2 is the
- *                       silent form that answers with asterisks either way
+ *   EspNowSecret      - the pair's key, up to 32 bytes, never echoed back;
+ *                       EspNowSecret2 is the silent form that answers with
+ *                       asterisks either way
  *   EspNowChannel     - fixed channel, or 0 to follow the station
+ *   EspNowPeerMode    - a value from 0 to 255 kept with the pairing, for the application
+ *   EspNowPeerConfig  - a number kept with the pairing, for the application
  *   EspNowSend        - send a command line to the peer, run there on arrival
  *                       unless the peer is built with USE_ESPNOW_DIRECT_EVENTS_ONLY
  *   EspNowEvent       - send a JSON event to the peer, fed to its rule engine
@@ -89,6 +111,7 @@
 #include <esp_wifi.h>
 #include <mbedtls/md.h>
 
+#define ESPNOW_DIRECT_PROTOCOL         2                                                              // the wire protocol, in every HELLO
 #define ESPNOW_DIRECT_HEADER_SIZE      9                                                              // type + session_id + counter
 #define ESPNOW_DIRECT_TAG_SIZE         8
 #define ESPNOW_DIRECT_OVERHEAD         (ESPNOW_DIRECT_HEADER_SIZE + ESPNOW_DIRECT_TAG_SIZE)           // 17
@@ -105,16 +128,29 @@
 #define ESPNOW_DIRECT_TYPE_CMD         0x20
 #define ESPNOW_DIRECT_TYPE_EVENT       0x21
 
-#define ESPNOW_DIRECT_SETTINGS_VERSION 1
-#define ESPNOW_DIRECT_SECRET_SIZE      32
+// A HELLO's payload: version(1) | challenge(4) | the peer's challenge as last
+// heard(4) | whether the sender holds the receiver's session(1). Protocol 1
+// greeted with an empty one.
+#define ESPNOW_DIRECT_HELLO_SIZE       10
+// An unproven HELLO is answered at most this often: anyone can repeat one
+#define ESPNOW_DIRECT_HELLO_ANSWER_MS  500
+
+#define ESPNOW_DIRECT_SETTINGS_VERSION 2
+#define ESPNOW_DIRECT_KEY_SIZE         32
 #define ESPNOW_DIRECT_NVS_NAMESPACE    "espnowdir"
 
+// The peer record, saved as one block. The first twelve bytes are laid out as
+// in version 1, so a record of that version is told apart when it is loaded.
 struct {
   uint32_t version;
   uint8_t peer_mac[6];
   uint8_t channel;                         // 0 follows the station channel
-  uint8_t secret_len;
-  uint8_t secret[ESPNOW_DIRECT_SECRET_SIZE];
+  uint8_t key_len;
+  uint8_t key[ESPNOW_DIRECT_KEY_SIZE];
+  uint32_t epoch;                          // rises with every pairing saved on this device
+  uint32_t config;                         // EspNowPeerConfig, the application's
+  uint8_t mode;                            // EspNowPeerMode, the application's
+  uint8_t spare[3];
 } EspNowDirectSettings;
 
 struct {
@@ -122,25 +158,23 @@ struct {
   bool active = false;                     // ESP-NOW is initialised and the peer is registered
   uint32_t session_id = 0;                 // drawn per start, travels in every frame we send
   uint32_t tx_counter = 0;                 // increases per frame sent within the session
+  volatile uint32_t challenge = 0;         // drawn per start and per session adopted, see EspNowDirectHello
   uint8_t applied_channel = 0;             // channel the peer entry is currently on
-  bool peer_known = false;                 // a HELLO from the peer has been accepted
+  bool peer_known = false;                 // the peer's session is established, from a fresh HELLO
   uint32_t peer_session = 0;               // session the peer announced in that HELLO
   uint32_t peer_counter = 0;               // highest counter accepted within that session
+  volatile uint32_t heard_session = 0;     // session of the peer's last HELLO, fresh or not
+  volatile uint32_t heard_challenge = 0;   // and the challenge it carried
+  volatile uint8_t peer_version = 0;       // protocol of the peer's last HELLO, 0 before any
+  uint8_t reported_version = 0;            // the other version last reported, so it is said once
+  volatile uint32_t hello_answered = 0;    // when an unproven HELLO was last answered
   volatile bool radio_lost = false;        // the WiFi stack stopped under the link, see EspNowDirectWifiEvent
   volatile uint32_t last_heard = 0;        // when the peer's last accepted frame arrived
   uint8_t hunt_channel = 0;                // channel tried while looking for the peer, 0 when not looking
   uint8_t hunt_wait = 0;                   // seconds on hunt_channel so far
   uint8_t hunt_dwell = 3;                  // seconds to stay on hunt_channel
   uint8_t keepalive_wait = 0;              // seconds since the last keepalive ping
-  volatile uint8_t foreign_frames = 0;     // signed frames in a session this side does not hold, in a row
 } EspNowDirect;
-
-// A HELLO replayed from an earlier session makes this side adopt that session,
-// and then refuse every frame of the session the peer really has, which it has
-// no reason to announce again: the link stays blocked until one side restarts.
-// The peer's own frames, signed and refused for their session this many times in
-// a row, restart the link here with a new session, which the real peer answers.
-#define ESPNOW_DIRECT_FOREIGN_LIMIT    3
 
 // A device with no network saved looks for its peer channel by channel, see
 // EspNowDirectHunt.
@@ -149,11 +183,17 @@ struct {
 #define ESPNOW_DIRECT_LOST_MS          65000  // silent this long, the link starts again
 
 // What the receive callback accepts crosses from the WiFi task to the main loop
-// through this queue: command lines and events, and the replies a greeting or a
-// ping calls for. The callback runs on its own task, where running a command is
-// not safe, so it only copies what arrived and lets the main loop act on it. A
-// full queue drops the oldest arrival rather than blocking the radio task.
+// through this queue: command lines and events, and the replies and reports a
+// greeting or a ping calls for. The callback runs on its own task, where running
+// a command is not safe, so it only copies what arrived and lets the main loop
+// act on it. A full queue drops the oldest arrival rather than blocking the
+// radio task.
 #define ESPNOW_DIRECT_RX_QUEUE_DEPTH   4
+
+// What the main loop is asked to do besides delivering a frame
+#define ESPNOW_DIRECT_DO_HELLO         0xF0   // answer a HELLO: its session and challenge follow
+#define ESPNOW_DIRECT_DO_PEER_UP       0xF1   // report the peer's session
+#define ESPNOW_DIRECT_DO_VERSION       0xF2   // report the peer's protocol version, which follows
 
 typedef struct {
   uint8_t type;
@@ -165,7 +205,7 @@ static QueueHandle_t EspNowDirectRxQueue = nullptr;
 
 static bool EspNowDirectConfigured(void) {
   static const uint8_t no_mac[6] = {0};
-  return (EspNowDirectSettings.secret_len > 0) && memcmp(EspNowDirectSettings.peer_mac, no_mac, 6);
+  return (EspNowDirectSettings.key_len > 0) && memcmp(EspNowDirectSettings.peer_mac, no_mac, 6);
 }
 
 /*********************************************************************************************\
@@ -180,26 +220,34 @@ static void EspNowDirectSettingsLoad(void) {
   memset(&EspNowDirectSettings, 0, sizeof(EspNowDirectSettings));
   EspNowDirectSettings.version = ESPNOW_DIRECT_SETTINGS_VERSION;
 
+  // A shorter record loads what it has, as NVS does; the rest stays zero
   auto loaded = EspNowDirectSettings;
-  if (NvmLoad(ESPNOW_DIRECT_NVS_NAMESPACE, "settings", &loaded, sizeof(loaded)) &&
-      (ESPNOW_DIRECT_SETTINGS_VERSION == loaded.version) &&
-      (loaded.secret_len <= ESPNOW_DIRECT_SECRET_SIZE)) {
+  loaded.version = 0;
+  if (!NvmLoad(ESPNOW_DIRECT_NVS_NAMESPACE, "settings", &loaded, sizeof(loaded)) || !loaded.version) { return; }
+  if ((ESPNOW_DIRECT_SETTINGS_VERSION == loaded.version) && (loaded.key_len <= ESPNOW_DIRECT_KEY_SIZE)) {
     EspNowDirectSettings = loaded;
+    return;
   }
+  // Version 1 kept a secret for a protocol with no version, which this one does
+  // not speak: its peer has to be set up again. The fallback channel is the
+  // user's, and stays. Saved at once, so this is said once.
+  if (1 == loaded.version) { EspNowDirectSettings.channel = loaded.channel; }
+  AddLog(LOG_LEVEL_INFO, PSTR("ENW: Peer record of version %u dropped, the pair has to be set up again"), loaded.version);
+  EspNowDirectSettingsSave();
 }
 
 /*********************************************************************************************\
  * Framing
 \*********************************************************************************************/
 
-// HMAC-SHA256 over the frame, keyed with the shared secret, truncated to the
-// first 8 bytes. Truncation is the standard way to trade tag length for frame
-// budget; 64 bits still leaves a forgery one chance in 2^64 per attempt.
+// HMAC-SHA256 over the frame, keyed with the pair's key, truncated to the first
+// 8 bytes. Truncation is the standard way to trade tag length for frame budget;
+// 64 bits still leaves a forgery one chance in 2^64 per attempt.
 static void EspNowDirectTag(const uint8_t* data, size_t len, uint8_t* tag) {
   uint8_t digest[32];
   const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
   if ((nullptr == info) ||
-      mbedtls_md_hmac(info, EspNowDirectSettings.secret, EspNowDirectSettings.secret_len, data, len, digest)) {
+      mbedtls_md_hmac(info, EspNowDirectSettings.key, EspNowDirectSettings.key_len, data, len, digest)) {
     memset(tag, 0, ESPNOW_DIRECT_TAG_SIZE);   // never leave a stale tag behind on failure
     return;
   }
@@ -212,6 +260,23 @@ static bool EspNowDirectTagEqual(const uint8_t* a, const uint8_t* b) {
   uint8_t diff = 0;
   for (uint32_t i = 0; i < ESPNOW_DIRECT_TAG_SIZE; i++) { diff |= a[i] ^ b[i]; }
   return (0 == diff);
+}
+
+// The local master key ESP-NOW encrypts the frames to the peer with, derived
+// from the pair's key, so both sides derive the same one. False when the key
+// cannot be derived: the link then does not start, rather than go unencrypted.
+static bool EspNowDirectLocalKey(uint8_t* lmk) {
+  static const char label[] = "ESP-NOW direct LMK";
+  uint8_t digest[32];
+  const mbedtls_md_info_t* info = mbedtls_md_info_from_type(MBEDTLS_MD_SHA256);
+  if ((nullptr == info) ||
+      mbedtls_md_hmac(info, EspNowDirectSettings.key, EspNowDirectSettings.key_len,
+                      (const uint8_t*)label, sizeof(label) - 1, digest)) {
+    return false;
+  }
+  memcpy(lmk, digest, ESP_NOW_KEY_LEN);
+  memset(digest, 0, sizeof(digest));
+  return true;
 }
 
 static void EspNowDirectPut32(uint8_t* out, uint32_t value) {
@@ -265,6 +330,25 @@ static bool EspNowDirectSend(uint8_t type, const uint8_t* payload, size_t payloa
   return (ESP_OK == esp_now_send(EspNowDirectSettings.peer_mac, frame, frame_len));
 }
 
+// A challenge is never 0, which a HELLO sends as the peer's challenge before it
+// has heard one.
+static uint32_t EspNowDirectChallenge(void) {
+  uint32_t challenge;
+  do { challenge = esp_random(); } while (!challenge);
+  return challenge;
+}
+
+// Greets the peer: this side's challenge, the one `echo` repeats, and whether
+// this side holds `session`, the session the HELLO answers.
+static void EspNowDirectSendHello(uint32_t echo, uint32_t session) {
+  uint8_t hello[ESPNOW_DIRECT_HELLO_SIZE];
+  hello[0] = ESPNOW_DIRECT_PROTOCOL;
+  EspNowDirectPut32(&hello[1], EspNowDirect.challenge);
+  EspNowDirectPut32(&hello[5], echo);
+  hello[9] = (EspNowDirect.peer_known && (EspNowDirect.peer_session == session)) ? 1 : 0;
+  EspNowDirectSend(ESPNOW_DIRECT_TYPE_HELLO, hello, sizeof(hello));
+}
+
 /*********************************************************************************************\
  * Callbacks
  *
@@ -292,6 +376,57 @@ static void EspNowDirectQueue(uint8_t type, const uint8_t* payload, size_t len) 
     xQueueReceive(EspNowDirectRxQueue, &dropped, 0);      // make room, keep the newest
     xQueueSend(EspNowDirectRxQueue, &item, 0);
   }
+}
+
+// Asks the main loop to answer a HELLO of `session` that carried `challenge`.
+static void EspNowDirectQueueHello(uint32_t session, uint32_t challenge) {
+  uint8_t answer[8];
+  EspNowDirectPut32(&answer[0], session);
+  EspNowDirectPut32(&answer[4], challenge);
+  EspNowDirectQueue(ESPNOW_DIRECT_DO_HELLO, answer, sizeof(answer));
+}
+
+// A HELLO that repeats this side's current challenge is fresh, and only a fresh
+// one establishes the sender's session. The challenge is drawn again as soon as
+// a session is adopted, so the proof that established it is used up. A sender
+// that does not hold this side's session gets an answer, which carries its
+// challenge back: an unproven HELLO at most every ESPNOW_DIRECT_HELLO_ANSWER_MS,
+// since anyone can repeat a recorded one.
+static void EspNowDirectHello(uint32_t session, uint32_t counter, const uint8_t* payload, size_t len) {
+  bool known = EspNowDirect.peer_known && (session == EspNowDirect.peer_session);
+  if (known && (counter <= EspNowDirect.peer_counter)) { return; }   // repeated within the session
+
+  uint8_t version = (len >= ESPNOW_DIRECT_HELLO_SIZE) ? payload[0] : 1;
+  EspNowDirect.peer_version = version;
+  if (ESPNOW_DIRECT_PROTOCOL != version) {
+    EspNowDirectQueue(ESPNOW_DIRECT_DO_VERSION, &version, 1);
+    return;
+  }
+  uint32_t challenge = EspNowDirectGet32(&payload[1]);
+  uint32_t echo = EspNowDirectGet32(&payload[5]);
+  bool held = payload[9];
+  EspNowDirect.heard_session = session;
+  EspNowDirect.heard_challenge = challenge;
+
+  if (echo == EspNowDirect.challenge) {
+    if (!known) {
+      EspNowDirect.peer_known = true;
+      EspNowDirect.peer_session = session;
+      EspNowDirect.challenge = EspNowDirectChallenge();
+      EspNowDirectQueue(ESPNOW_DIRECT_DO_PEER_UP, nullptr, 0);
+      AddLog(LOG_LEVEL_INFO, PSTR("ENW: Peer session %08X"), session);
+    }
+  } else if (!known) {
+    // Never adopted: answered, so that the sender proves itself with the answer
+    if (!held && (TimePassedSince(EspNowDirect.hello_answered) >= ESPNOW_DIRECT_HELLO_ANSWER_MS)) {
+      EspNowDirect.hello_answered = millis();
+      EspNowDirectQueueHello(session, challenge);
+    }
+    return;
+  }
+  EspNowDirect.peer_counter = counter;
+  EspNowDirect.last_heard = millis();
+  if (!held) { EspNowDirectQueueHello(session, challenge); }
 }
 
 // Both callbacks are declared before their definition so that the sketch
@@ -334,34 +469,15 @@ void EspNowDirectRecvCb(const esp_now_recv_info_t* info, const uint8_t* frame, i
   uint32_t session = EspNowDirectGet32(&frame[1]);
   uint32_t counter = EspNowDirectGet32(&frame[5]);
 
-  // A session is only ever adopted from a HELLO. Letting any frame introduce a
-  // session would reopen the replay hole this is here to close: only the latest
-  // (session, counter) is remembered, so a frame captured from an earlier
-  // session becomes acceptable again as soon as the receiver has moved on.
   if (ESPNOW_DIRECT_TYPE_HELLO == type) {
-    bool new_session = (!EspNowDirect.peer_known) || (session != EspNowDirect.peer_session);
-    if (!new_session && (counter <= EspNowDirect.peer_counter)) { return; }   // replayed HELLO
-
-    EspNowDirect.peer_known = true;
-    EspNowDirect.peer_session = session;
-    EspNowDirect.peer_counter = counter;
-    EspNowDirect.last_heard = millis();
-    if (new_session) {
-      // Answer so the peer learns our session too. Bounded: the reply only goes
-      // out when the announced session is new to us, so two devices greeting
-      // each other settle after one exchange instead of echoing forever.
-      EspNowDirectQueue(ESPNOW_DIRECT_TYPE_HELLO, nullptr, 0);
-      AddLog(LOG_LEVEL_INFO, PSTR("ENW: Peer session %08X"), session);
-    }
+    EspNowDirectHello(session, counter, payload, payload_len);
     return;
   }
 
   if (!EspNowDirect.peer_known || (session != EspNowDirect.peer_session)) {
     AddLog(LOG_LEVEL_DEBUG, PSTR("ENW: Frame rejected, session %08X is not the established one"), session);
-    if (EspNowDirect.peer_known && (EspNowDirect.foreign_frames < 255)) { EspNowDirect.foreign_frames++; }
     return;
   }
-  EspNowDirect.foreign_frames = 0;
   if (counter <= EspNowDirect.peer_counter) {
     AddLog(LOG_LEVEL_DEBUG, PSTR("ENW: Frame rejected, counter %u was already seen"), counter);
     return;
@@ -503,9 +619,14 @@ static bool EspNowDirectAddPeer(void) {
   memcpy(peer.peer_addr, EspNowDirectSettings.peer_mac, 6);
   peer.channel = channel;
   peer.ifidx = WIFI_IF_STA;
-  peer.encrypt = false;
+  if (!EspNowDirectLocalKey(peer.lmk)) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("ENW: No local master key for the peer"));
+    return false;
+  }
+  peer.encrypt = true;
 
   esp_err_t error = esp_now_add_peer(&peer);
+  memset(peer.lmk, 0, sizeof(peer.lmk));
   if (ESP_OK != error) {
     AddLog(LOG_LEVEL_ERROR, PSTR("ENW: Adding peer failed with error %d"), error);
     return false;
@@ -539,12 +660,14 @@ static bool EspNowDirectStart(void) {
   // frame it sees is judged against this session and not the previous one.
   EspNowDirect.session_id = esp_random();
   EspNowDirect.tx_counter = 0;
+  EspNowDirect.challenge = EspNowDirectChallenge();
   EspNowDirect.peer_known = false;          // the peer has to greet us again
   EspNowDirect.peer_session = 0;
   EspNowDirect.peer_counter = 0;
+  EspNowDirect.heard_session = 0;
+  EspNowDirect.heard_challenge = 0;
   EspNowDirect.last_heard = millis();       // silence is counted from the start
   EspNowDirect.keepalive_wait = 0;
-  EspNowDirect.foreign_frames = 0;
 
   if (nullptr == EspNowDirectRxQueue) {
     EspNowDirectRxQueue = xQueueCreate(ESPNOW_DIRECT_RX_QUEUE_DEPTH, sizeof(EspNowDirectRxItem_t));
@@ -562,7 +685,7 @@ static bool EspNowDirectStart(void) {
 
   EspNowDirect.active = true;
 
-  EspNowDirectSend(ESPNOW_DIRECT_TYPE_HELLO, nullptr, 0);   // retried every second until answered
+  EspNowDirectSendHello(0, 0);              // retried every second until answered
 
   AddLog(LOG_LEVEL_INFO, PSTR("ENW: Started, peer %02X:%02X:%02X:%02X:%02X:%02X, session %08X"),
     EspNowDirectSettings.peer_mac[0], EspNowDirectSettings.peer_mac[1], EspNowDirectSettings.peer_mac[2],
@@ -670,21 +793,13 @@ static void EspNowDirectEverySecond(void) {
     return;
   }
 
-  if (EspNowDirect.active && (EspNowDirect.foreign_frames >= ESPNOW_DIRECT_FOREIGN_LIMIT)) {
-    AddLog(LOG_LEVEL_INFO, PSTR("ENW: The peer keeps a session this side does not hold, starting the link again"));
-    EspNowDirect.foreign_frames = 0;
-    EspNowDirectStop();
-    EspNowDirectStart();
-    return;
-  }
-
   if (EspNowDirect.active) {
     EspNowDirectHunt();
     if (!EspNowDirect.active) { return; }   // a lost peer's link starts again at the next second
     EspNowDirectApplyChannel();
     // Keep greeting until the peer answers. Covers the peer booting later than
     // us, and a greeting lost to interference, without persisting anything.
-    if (!EspNowDirect.peer_known) { EspNowDirectSend(ESPNOW_DIRECT_TYPE_HELLO, nullptr, 0); }
+    if (!EspNowDirect.peer_known) { EspNowDirectSendHello(EspNowDirect.heard_challenge, EspNowDirect.heard_session); }
     return;
   }
 
@@ -746,19 +861,19 @@ void CmndEspNowPeerMac(void) {
   ResponseCmndChar(mac_text);
 }
 
-// Never echoes the secret. Index 2 (EspNowSecret2) is the silent form, matching
+// Never echoes the key. Index 2 (EspNowSecret2) is the silent form, matching
 // how the other secret-bearing commands in the firmware behave.
 void CmndEspNowSecret(void) {
   bool show_asterisk = (2 == XdrvMailbox.index);
   if (XdrvMailbox.data_len > 0) {
     uint32_t len = XdrvMailbox.data_len;
-    if (len > ESPNOW_DIRECT_SECRET_SIZE) { len = ESPNOW_DIRECT_SECRET_SIZE; }
-    memset(EspNowDirectSettings.secret, 0, ESPNOW_DIRECT_SECRET_SIZE);
+    if (len > ESPNOW_DIRECT_KEY_SIZE) { len = ESPNOW_DIRECT_KEY_SIZE; }
+    memset(EspNowDirectSettings.key, 0, ESPNOW_DIRECT_KEY_SIZE);
     if (SC_CLEAR == Shortcut()) {
-      EspNowDirectSettings.secret_len = 0;
+      EspNowDirectSettings.key_len = 0;
     } else {
-      memcpy(EspNowDirectSettings.secret, XdrvMailbox.data, len);
-      EspNowDirectSettings.secret_len = len;
+      memcpy(EspNowDirectSettings.key, XdrvMailbox.data, len);
+      EspNowDirectSettings.key_len = len;
     }
     EspNowDirectReload();
   }
@@ -772,6 +887,23 @@ void CmndEspNowChannel(void) {
     EspNowDirectReload();
   }
   ResponseCmndNumber(EspNowDirectSettings.channel);
+}
+
+// Kept with the pairing for the application, which the link itself does not read
+void CmndEspNowPeerMode(void) {
+  if ((XdrvMailbox.data_len > 0) && (XdrvMailbox.payload >= 0) && (XdrvMailbox.payload <= 255)) {
+    EspNowDirectSettings.mode = XdrvMailbox.payload;
+    EspNowDirectSettingsSave();
+  }
+  ResponseCmndNumber(EspNowDirectSettings.mode);
+}
+
+void CmndEspNowPeerConfig(void) {
+  if (XdrvMailbox.data_len > 0) {
+    EspNowDirectSettings.config = strtoul(XdrvMailbox.data, nullptr, 0);
+    EspNowDirectSettingsSave();
+  }
+  Response_P(PSTR("{\"%s\":%u}"), XdrvMailbox.command, EspNowDirectSettings.config);
 }
 
 // Delivers what the peer sent, and sends the replies it called for, from the
@@ -788,9 +920,19 @@ static void EspNowDirectDrainRx(void) {
   EspNowDirectRxItem_t item;
   while (pdTRUE == xQueueReceive(EspNowDirectRxQueue, &item, 0)) {
     switch (item.type) {
-      case ESPNOW_DIRECT_TYPE_HELLO:           // a new peer session: greet it back, and say the link is up
-        EspNowDirectSend(ESPNOW_DIRECT_TYPE_HELLO, nullptr, 0);
+      case ESPNOW_DIRECT_DO_HELLO:
+        EspNowDirectSendHello(EspNowDirectGet32(&item.data[4]), EspNowDirectGet32(&item.data[0]));
+        break;
+      case ESPNOW_DIRECT_DO_PEER_UP:
+        EspNowDirect.reported_version = 0;
         Response_P(PSTR("{\"EspNowDirect\":{\"PeerUp\":\"%08X\"}}"), EspNowDirect.peer_session);
+        XdrvRulesProcess(0);
+        break;
+      case ESPNOW_DIRECT_DO_VERSION:
+        if (item.data[0] == EspNowDirect.reported_version) { break; }
+        EspNowDirect.reported_version = item.data[0];
+        AddLog(LOG_LEVEL_INFO, PSTR("ENW: The peer speaks protocol version %u, this device %u"), item.data[0], ESPNOW_DIRECT_PROTOCOL);
+        Response_P(PSTR("{\"EspNowDirect\":{\"PeerVersion\":%u}}"), item.data[0]);
         XdrvRulesProcess(0);
         break;
       case ESPNOW_DIRECT_TYPE_PING:
@@ -800,7 +942,7 @@ static void EspNowDirectDrainRx(void) {
         Response_P(PSTR("%s"), (const char*)item.data);
         XdrvRulesProcess(0);
         break;
-      default:
+      case ESPNOW_DIRECT_TYPE_CMD:
 #ifdef USE_ESPNOW_DIRECT_EVENTS_ONLY
         AddLog(LOG_LEVEL_INFO, PSTR("ENW: Command from the peer dropped, this device takes events only"));
 #else
@@ -877,11 +1019,14 @@ static void EspNowDirectBerryRegister(void) {
 void CmndEspNowStatus(void) {
   char mac_text[18];
   ToHex_P(EspNowDirectSettings.peer_mac, 6, mac_text, sizeof(mac_text), ':');
-  Response_P(PSTR("{\"EspNowStatus\":{\"Active\":%d,\"Peer\":\"%s\",\"Channel\":%d,\"OnChannel\":%d,\"SecretSet\":%d,\"Session\":\"%08X\",\"Sent\":%u,\"PeerKnown\":%d,\"PeerSession\":\"%08X\",\"PeerCounter\":%u,\"MaxPayload\":%u}}"),
+  Response_P(PSTR("{\"EspNowStatus\":{\"Active\":%d,\"Peer\":\"%s\",\"Channel\":%d,\"OnChannel\":%d,\"SecretSet\":%d,"
+                  "\"Session\":\"%08X\",\"Sent\":%u,\"PeerKnown\":%d,\"PeerSession\":\"%08X\",\"PeerCounter\":%u,"
+                  "\"Version\":%u,\"PeerVersion\":%u,\"Epoch\":%u,\"Mode\":%u,\"Config\":%u,\"MaxPayload\":%u}}"),
     EspNowDirect.active, mac_text, EspNowDirectSettings.channel, EspNowDirect.applied_channel,
-    (EspNowDirectSettings.secret_len > 0), EspNowDirect.session_id,
+    (EspNowDirectSettings.key_len > 0), EspNowDirect.session_id,
     EspNowDirect.tx_counter, EspNowDirect.peer_known, EspNowDirect.peer_session,
-    EspNowDirect.peer_counter, ESPNOW_DIRECT_MAX_PAYLOAD);
+    EspNowDirect.peer_counter, ESPNOW_DIRECT_PROTOCOL, EspNowDirect.peer_version,
+    EspNowDirectSettings.epoch, EspNowDirectSettings.mode, EspNowDirectSettings.config, ESPNOW_DIRECT_MAX_PAYLOAD);
 }
 
 static uint8_t EspNowDirectLastPing[ESPNOW_DIRECT_OVERHEAD + 4];   // kept for EspNowReplay
@@ -929,9 +1074,11 @@ void CmndEspNowForge(void) {
 }
 
 // Leading "|" marks a flat command list without a shared prefix.
-const char kEspNowDirectCommands[] PROGMEM = "|" "EspNowEnable|EspNowPeerMac|EspNowSecret|EspNowChannel|EspNowSend|EspNowEvent|EspNowStatus|EspNowPing|EspNowForge|EspNowReplay";
+const char kEspNowDirectCommands[] PROGMEM = "|"
+  "EspNowEnable|EspNowPeerMac|EspNowSecret|EspNowChannel|EspNowPeerMode|EspNowPeerConfig|"
+  "EspNowSend|EspNowEvent|EspNowStatus|EspNowPing|EspNowForge|EspNowReplay";
 void (* const kEspNowDirectCommand[])(void) PROGMEM = {
-  &CmndEspNowEnable, &CmndEspNowPeerMac, &CmndEspNowSecret, &CmndEspNowChannel,
+  &CmndEspNowEnable, &CmndEspNowPeerMac, &CmndEspNowSecret, &CmndEspNowChannel, &CmndEspNowPeerMode, &CmndEspNowPeerConfig,
   &CmndEspNowSend, &CmndEspNowEvent, &CmndEspNowStatus, &CmndEspNowPing, &CmndEspNowForge, &CmndEspNowReplay };
 
 /*********************************************************************************************\
