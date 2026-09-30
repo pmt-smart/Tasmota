@@ -41,6 +41,15 @@
  *   Tasmota's WiFi is off, for a radio user that needs the channel without an
  *   access point, as ESP-NOW does. It is not saved: whoever needs it asks again
  *   after a restart.
+ * - The radio has one owner at a time, which sets its channel. From the one that
+ *   wins to the one that yields: the WiFi Manager, a join, a pairing session that
+ *   another driver claims (StaCtrlRadioClaim), a scan. A scan passes under the
+ *   WiFi Manager and a connected station, but waits for a join and a pairing,
+ *   which need the channel to stay put. The station, and a transport that
+ *   follows its channel, come below them all: they leave the channel alone
+ *   while StaCtrlRadioOwner names anyone, and follow it again once it is free.
+ *   A pairing does not cut a join short, and the other way round: whoever asks
+ *   for the second ends the first. StaState says who has the radio.
  *
  * The station's disconnect reasons are also kept while Tasmota connects on its
  * own, so the device can say why its saved network does not come up.
@@ -59,8 +68,8 @@
  *                       first when it is on
  *   StaForget         - clear SSId1, Password1 and BSSId1; Tasmota's WiFi goes off
  *   StaHold 0|1       - keep the radio in station mode while Tasmota's WiFi is off
- *   StaState          - what the driver is doing, and the station's last
- *                       disconnect reason
+ *   StaState          - what the driver is doing, who has the radio, and the
+ *                       station's last disconnect reason
 \*********************************************************************************************/
 
 #define XDRV_96                         96
@@ -79,6 +88,8 @@ struct {
   bool hold = false;                       // StaHold 1
   bool restore = false;                    // Tasmota's WiFi was on when this driver took the radio
   bool borrowed = false;                   // the radio is on for this driver, with Tasmota's WiFi off
+  bool claimed = false;                    // a pairing session holds the radio, StaCtrlRadioClaim
+  bool paused = false;                     // and has Tasmota's WiFi paused, StaCtrlRadioPause
   uint32_t started = 0;                    // when the scan or the join began
   uint32_t linger_until = 0;               // when a borrowed radio goes back off
   volatile uint32_t associated = 0;        // when the station associated during a join, 0 before
@@ -111,12 +122,6 @@ static const char* StaCtrlReasonText(uint8_t reason) {
       return PSTR("");
   }
   return PSTR("NoAnswer");
-}
-
-// For the other users of the radio: a scan or a join of this driver owns it
-// while it runs.
-bool StaCtrlRadioInUse(void) {
-  return (STA_CTRL_IDLE != StaCtrl.state);
 }
 
 static bool StaCtrlTasmotaUp(void) {
@@ -154,13 +159,13 @@ static void StaCtrlGiveRadio(uint32_t linger) {
 }
 
 // Runs every 250 ms while idle: a borrowed radio goes back off once nothing
-// needs it, and a held one comes back after Tasmota switched it off.
+// needs it, and a held or claimed one comes back after Tasmota switched it off.
 static void StaCtrlKeepRadio(void) {
   if (Settings->flag4.network_wifi) {
     StaCtrl.borrowed = false;              // Tasmota's again, through `Wifi 1`
     return;
   }
-  if (StaCtrl.hold) {
+  if (StaCtrl.hold || StaCtrl.claimed) {
     if (WIFI_OFF == WiFi.getMode()) {
       WifiSetMode(WIFI_STA);
       AddLog(LOG_LEVEL_DEBUG, PSTR("STA: Radio held in station mode"));
@@ -171,6 +176,86 @@ static void StaCtrlKeepRadio(void) {
     StaCtrl.borrowed = false;
     WifiSetMode(WIFI_OFF);
   }
+}
+
+/*********************************************************************************************\
+ * Radio owners
+ *
+ * For the other users of the radio. The station, and a transport that follows
+ * its channel, ask StaCtrlRadioOwner before they move the channel, and leave it
+ * alone while it names anyone. A driver that has to hold the channel where it
+ * puts it, as a pairing session does, claims the radio for as long as it needs
+ * it, pauses Tasmota's WiFi when it has to move the channel away from the
+ * station's, and releases the radio at the end, with the WiFi back as it was.
+\*********************************************************************************************/
+
+// From the one that wins to the one that yields.
+enum StaCtrlRadioOwners {
+  STA_RADIO_FREE,                          // nobody: the station, or a transport, sets the channel
+  STA_RADIO_WIFI_MANAGER,                  // Tasmota's WiFi Manager, with its AP
+  STA_RADIO_JOIN,                          // StaJoin
+  STA_RADIO_PAIRING,                       // a pairing session, StaCtrlRadioClaim
+  STA_RADIO_SCAN,                          // StaScan, or Tasmota's own scan
+};
+
+uint32_t StaCtrlRadioOwner(void) {
+  if (Wifi.config_type) { return STA_RADIO_WIFI_MANAGER; }
+  if (STA_CTRL_JOINING == StaCtrl.state) { return STA_RADIO_JOIN; }
+  if (StaCtrl.claimed) { return STA_RADIO_PAIRING; }
+  if ((STA_CTRL_SCANNING == StaCtrl.state) || Wifi.scan_state || (WIFI_SCAN_RUNNING == WiFi.scanComplete())) {
+    return STA_RADIO_SCAN;
+  }
+  return STA_RADIO_FREE;
+}
+
+const char* StaCtrlRadioOwnerText(uint32_t owner) {
+  switch (owner) {
+    case STA_RADIO_WIFI_MANAGER: return PSTR("WifiManager");
+    case STA_RADIO_JOIN:         return PSTR("Join");
+    case STA_RADIO_PAIRING:      return PSTR("Pairing");
+    case STA_RADIO_SCAN:         return PSTR("Scan");
+  }
+  return PSTR("");
+}
+
+// Holds the radio for a pairing session. Refused while the WiFi Manager, a join
+// or a scan has it: the scan is short, and the one who asked tries again once it
+// is over. A radio that was off comes on in station mode for the session.
+bool StaCtrlRadioClaim(void) {
+  uint32_t owner = StaCtrlRadioOwner();
+  if ((STA_RADIO_FREE != owner) && (STA_RADIO_PAIRING != owner)) { return false; }
+  if (!StaCtrl.claimed && (WIFI_OFF == WiFi.getMode())) {
+    WifiSetMode(WIFI_STA);
+    StaCtrl.borrowed = true;
+  }
+  StaCtrl.claimed = true;
+  return true;
+}
+
+// Takes the station out of the way of a claim that moves the channel: Tasmota's
+// WiFi pauses, as it does for a join, and stops a connection attempt in flight.
+// The WiFi stack stops and starts again on the way when Tasmota's WiFi was on.
+void StaCtrlRadioPause(void) {
+  if (!StaCtrl.claimed || StaCtrl.paused) { return; }
+  StaCtrl.paused = true;
+  StaCtrlTakeRadio();
+  AddLog(LOG_LEVEL_DEBUG, PSTR("STA: WiFi paused for a pairing"));
+}
+
+// Gives Tasmota its WiFi back, as it was before the pause, with the claim kept.
+void StaCtrlRadioResume(void) {
+  if (!StaCtrl.paused) { return; }
+  StaCtrl.paused = false;
+  StaCtrlGiveRadio(0);
+}
+
+// Ends the claim, with the WiFi back as it was before it. A radio that came on
+// for it goes off again, unless something holds it.
+void StaCtrlRadioRelease(void) {
+  if (!StaCtrl.claimed) { return; }
+  StaCtrlRadioResume();
+  StaCtrl.claimed = false;
+  if (StaCtrl.borrowed) { StaCtrl.linger_until = millis(); }
 }
 
 /*********************************************************************************************\
@@ -213,8 +298,8 @@ void StaCtrlEvent(arduino_event_t *event) {
 \*********************************************************************************************/
 
 static bool StaCtrlBusy(void) {
-  // The WiFi Manager and Tasmota's own scan own the radio while they run.
-  return (STA_CTRL_IDLE != StaCtrl.state) || Wifi.config_type || Wifi.scan_state;
+  // The WiFi Manager, Tasmota's own scan and a pairing own the radio while they run.
+  return (STA_CTRL_IDLE != StaCtrl.state) || Wifi.config_type || Wifi.scan_state || StaCtrl.claimed;
 }
 
 void CmndStaScan(void) {
@@ -425,6 +510,7 @@ void CmndStaForget(void) {
     Settings->flag4.network_wifi = 0;
     WifiDisable();
   }
+  StaCtrl.restore = false;                 // a pause gives the WiFi back off: it has no network to go to
   SettingsUpdateText(SET_STASSID1, "");
   SettingsUpdateText(SET_STAPWD1, "");
   SettingsUpdateText(SET_APBSSID1, "");
@@ -455,8 +541,9 @@ void CmndStaHold(void) {
 void CmndStaState(void) {
   const char* state = (STA_CTRL_SCANNING == StaCtrl.state) ? PSTR("Scanning") :
                       (STA_CTRL_JOINING == StaCtrl.state) ? PSTR("Joining") : PSTR("Idle");
-  Response_P(PSTR("{\"StaState\":{\"State\":\"%s\",\"Hold\":%d,\"Radio\":%d,\"Reason\":\"%s\",\"Code\":%d}}"),
-    state, StaCtrl.hold, (WIFI_OFF != WiFi.getMode()), StaCtrlReasonText(StaCtrl.reason), StaCtrl.reason);
+  Response_P(PSTR("{\"StaState\":{\"State\":\"%s\",\"Hold\":%d,\"Radio\":%d,\"Owner\":\"%s\",\"Reason\":\"%s\",\"Code\":%d}}"),
+    state, StaCtrl.hold, (WIFI_OFF != WiFi.getMode()), StaCtrlRadioOwnerText(StaCtrlRadioOwner()),
+    StaCtrlReasonText(StaCtrl.reason), StaCtrl.reason);
 }
 
 const char kStaCtrlCommands[] PROGMEM = "Sta|"

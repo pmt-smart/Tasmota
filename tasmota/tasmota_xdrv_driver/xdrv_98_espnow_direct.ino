@@ -420,13 +420,14 @@ static uint8_t EspNowDirectTargetChannel(void) {
   return channel;
 }
 
-// Something else is using the radio: a scan, a join, or the WiFi Manager.
+// Something above the link holds the radio: the WiFi Manager, a join or a scan,
+// which the WiFi station driver names when it is built in.
 static bool EspNowDirectRadioBusy(void) {
-  if (Wifi.config_type) { return true; }
 #ifdef USE_WIFI_STATION_CONTROL
-  if (StaCtrlRadioInUse()) { return true; }
+  return (STA_RADIO_FREE != StaCtrlRadioOwner());
+#else
+  return Wifi.config_type || (WIFI_SCAN_RUNNING == WiFi.scanComplete());
 #endif
-  return (WIFI_SCAN_RUNNING == WiFi.scanComplete());
 }
 
 // The station keeps trying a saved network while WiFi is on: moving the radio
