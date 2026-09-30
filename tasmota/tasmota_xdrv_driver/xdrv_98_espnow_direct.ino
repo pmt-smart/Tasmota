@@ -133,6 +133,13 @@
  * is dropped. For a device that only reports to its peer, this keeps a leaked
  * key from becoming a remote console on it.
  *
+ * The saved network, with USE_WIFI_STATION_CONTROL: EspNowGiveWifi sends the
+ * device's saved network to its peer, over the encrypted link, and the peer
+ * reports the offer, {"EspNowDirect":{"WifiOffered":"<ssid>"}}, keeps it for
+ * two minutes, and joins it on EspNowTakeWifi, with the WiFi station driver's
+ * join, which saves the network only once it works. The password reaches no
+ * script, no rule and no log on either side.
+ *
  * Build option USE_ESPNOW_DIRECT_COMMANDS_TO_RULES: the device runs no command it
  * receives either, and hands each to the rule engine instead, for the
  * application to run the ones it takes:
@@ -157,6 +164,9 @@
  *   EspNowPing        - send a signed ping, RTT is logged when the pong lands
  *   EspNowForge       - send a deliberately mis-signed ping to check rejection
  *   EspNowReplay      - resend the previous ping to check replay rejection
+ * With USE_WIFI_STATION_CONTROL:
+ *   EspNowGiveWifi    - offer the saved network to the peer
+ *   EspNowTakeWifi [0] - join the network the peer offered; 0 drops the offer
  * With USE_ESPNOW_DIRECT_PAIRING:
  *   EspNowPairOpen <s>[,<zigbee>] - open a pairing window for s seconds, up to
  *                       600, announcing a Zigbee channel, 0 for none; reports
@@ -195,6 +205,7 @@
 #define ESPNOW_DIRECT_TYPE_CMD         0x20
 #define ESPNOW_DIRECT_TYPE_EVENT       0x21
 #define ESPNOW_DIRECT_TYPE_TAKEN       0x22   // the sender paired with another device
+#define ESPNOW_DIRECT_TYPE_WIFI        0x23   // the sender's saved network: ssid_len | ssid | password_len | password
 // Pairing frames, sent before there is a key: 0x10 to 0x17, all but the HELLO
 #define ESPNOW_DIRECT_TYPE_PAIR_REQ    0x10
 #define ESPNOW_DIRECT_TYPE_PAIR_ACK    0x11
@@ -303,6 +314,10 @@ static volatile uint8_t EspNowDirectPairAccept = 0;   // the pairing frame types
 #else
 static bool EspNowDirectPairing(void) { return false; }
 static bool EspNowDirectPairKeepsLink(void) { return false; }
+#endif
+
+#ifdef USE_WIFI_STATION_CONTROL
+static void EspNowDirectWifiExpire(void);
 #endif
 
 // The link runs when it is enabled, and after a pairing saved its record, until
@@ -642,6 +657,10 @@ void EspNowDirectRecvCb(const esp_now_recv_info_t* info, const uint8_t* frame, i
     case ESPNOW_DIRECT_TYPE_TAKEN:
       EspNowDirectQueue(type, nullptr, 0);
       break;
+
+    case ESPNOW_DIRECT_TYPE_WIFI:
+      if (payload_len) { EspNowDirectQueue(type, payload, payload_len); }
+      break;
   }
 }
 
@@ -954,6 +973,9 @@ static void EspNowDirectHunt(void) {
 // Called every second rather than at init: ESP-NOW needs WiFi up, and the start
 // is retried until it is.
 static void EspNowDirectEverySecond(void) {
+#ifdef USE_WIFI_STATION_CONTROL
+  EspNowDirectWifiExpire();
+#endif
   if (!EspNowDirectWanted()) { return; }
   if (!EspNowDirectConfigured()) { return; }        // no peer yet: setting it starts the link (EspNowDirectReload)
 
@@ -1961,6 +1983,109 @@ void CmndEspNowPairStop(void) {
 }
 #endif  // USE_ESPNOW_DIRECT_PAIRING
 
+#ifdef USE_WIFI_STATION_CONTROL
+/*********************************************************************************************\
+ * The saved network, handed over the link
+\*********************************************************************************************/
+
+#define ESPNOW_DIRECT_WIFI_KEEP_MS     120000 // an offer not taken by then is dropped
+
+// The network the peer offered, on the heap only while it is kept. Its name is
+// reported; the password stays here until the join takes it.
+typedef struct {
+  char ssid[33];
+  char password[65];
+  uint32_t until;
+} EspNowDirectWifiOffer_t;
+
+static EspNowDirectWifiOffer_t* EspNowDirectOffer = nullptr;
+
+static void EspNowDirectWifiDrop(void) {
+  if (!EspNowDirectOffer) { return; }
+  EspNowDirectWipe(EspNowDirectOffer, sizeof(EspNowDirectWifiOffer_t));
+  free(EspNowDirectOffer);
+  EspNowDirectOffer = nullptr;
+}
+
+// An offer not taken in ESPNOW_DIRECT_WIFI_KEEP_MS goes
+static void EspNowDirectWifiExpire(void) {
+  if (!EspNowDirectOffer || !TimeReached(EspNowDirectOffer->until)) { return; }
+  AddLog(LOG_LEVEL_INFO, PSTR("ENW: The peer's network was not taken, dropped"));
+  EspNowDirectWifiDrop();
+}
+
+// ssid_len(1) | ssid(1..32) | password_len(1) | password(0, or 8..64)
+static void EspNowDirectWifiOffered(const uint8_t* data, size_t len) {
+  if (len < 3) { return; }
+  size_t ssid_len = data[0];
+  if (!ssid_len || (ssid_len > 32) || (ssid_len + 2 > len)) { return; }
+  size_t password_len = data[1 + ssid_len];
+  if ((password_len && (password_len < 8)) || (password_len > 64) || (2 + ssid_len + password_len != len)) { return; }
+  if (!EspNowDirectOffer) {
+    EspNowDirectOffer = (EspNowDirectWifiOffer_t*)calloc(1, sizeof(EspNowDirectWifiOffer_t));
+    if (!EspNowDirectOffer) { return; }
+  }
+  memset(EspNowDirectOffer, 0, sizeof(EspNowDirectWifiOffer_t));
+  memcpy(EspNowDirectOffer->ssid, &data[1], ssid_len);
+  memcpy(EspNowDirectOffer->password, &data[2 + ssid_len], password_len);
+  EspNowDirectOffer->until = millis() + ESPNOW_DIRECT_WIFI_KEEP_MS;
+  AddLog(LOG_LEVEL_INFO, PSTR("ENW: The peer offers its network %s"), EspNowDirectOffer->ssid);
+  Response_P(PSTR("{\"EspNowDirect\":{\"WifiOffered\":\"%s\"}}"), EscapeJSONString(EspNowDirectOffer->ssid).c_str());
+  XdrvRulesProcess(0);
+}
+
+// The saved network this device is on, to the peer: only over a link that is up,
+// which is encrypted, and never repeated back
+void CmndEspNowGiveWifi(void) {
+  if (!EspNowDirect.active || !EspNowDirect.peer_known) {
+    ResponseCmndChar_P(PSTR("not active"));
+    return;
+  }
+  uint32_t active = Settings->sta_active ? 1 : 0;
+  const char* ssid = SettingsText(SET_STASSID1 + active);
+  const char* password = SettingsText(SET_STAPWD1 + active);
+  size_t ssid_len = strlen(ssid);
+  size_t password_len = strlen(password);
+  if (!ssid_len) {
+    ResponseCmndChar_P(PSTR("no network"));
+    return;
+  }
+  if ((ssid_len > 32) || (password_len > 64)) {
+    ResponseCmndError();
+    return;
+  }
+  uint8_t payload[2 + 32 + 64];
+  payload[0] = ssid_len;
+  memcpy(&payload[1], ssid, ssid_len);
+  payload[1 + ssid_len] = password_len;
+  memcpy(&payload[2 + ssid_len], password, password_len);
+  bool sent = EspNowDirectSend(ESPNOW_DIRECT_TYPE_WIFI, payload, 2 + ssid_len + password_len);
+  EspNowDirectWipe(payload, sizeof(payload));
+  ResponseCmndChar_P(sent ? PSTR("sent") : PSTR("failed"));
+}
+
+// The network the peer offered, joined; kept while the radio is busy, so the
+// application may try again once it is free. 0 drops it.
+void CmndEspNowTakeWifi(void) {
+  if (!EspNowDirectOffer) {
+    ResponseCmndChar_P(PSTR("no offer"));
+    return;
+  }
+  if (0 == XdrvMailbox.payload) {
+    EspNowDirectWifiDrop();
+    ResponseCmndChar_P(PSTR("dropped"));
+    return;
+  }
+  uint32_t result = StaCtrlJoin(EspNowDirectOffer->ssid, EspNowDirectOffer->password, 0, nullptr);
+  if (STA_JOIN_BUSY == result) {
+    ResponseCmndChar_P(PSTR("Busy"));
+    return;
+  }
+  EspNowDirectWifiDrop();
+  ResponseCmndChar_P((STA_JOIN_STARTED == result) ? PSTR("Joining") : PSTR("Error"));
+}
+#endif  // USE_WIFI_STATION_CONTROL
+
 /*********************************************************************************************\
  * Commands
 \*********************************************************************************************/
@@ -2096,6 +2221,12 @@ static void EspNowDirectDrainRx(void) {
         Response_P(PSTR("%s"), (const char*)item.data);
         XdrvRulesProcess(0);
         break;
+#ifdef USE_WIFI_STATION_CONTROL
+      case ESPNOW_DIRECT_TYPE_WIFI:
+        EspNowDirectWifiOffered(item.data, item.len);
+        EspNowDirectWipe(item.data, sizeof(item.data));   // the password was in it
+        break;
+#endif
       case ESPNOW_DIRECT_TYPE_TAKEN:
         AddLog(LOG_LEVEL_INFO, PSTR("ENW: The peer paired with another device"));
         Response_P(PSTR("{\"EspNowDirect\":{\"Taken\":1}}"));
@@ -2288,6 +2419,9 @@ void CmndEspNowForge(void) {
 const char kEspNowDirectCommands[] PROGMEM = "|"
   "EspNowEnable|EspNowPeerMac|EspNowSecret|EspNowChannel|EspNowPeerMode|EspNowPeerConfig|"
   "EspNowSend|EspNowEvent|EspNowStatus|EspNowPing|EspNowForge|EspNowReplay"
+#ifdef USE_WIFI_STATION_CONTROL
+  "|EspNowGiveWifi|EspNowTakeWifi"
+#endif
 #ifdef USE_ESPNOW_DIRECT_PAIRING
   "|EspNowPairOpen|EspNowPairScan|EspNowPairHeard|EspNowPairBlink|EspNowPairWith|EspNowPairStop"
 #endif
@@ -2295,6 +2429,9 @@ const char kEspNowDirectCommands[] PROGMEM = "|"
 void (* const kEspNowDirectCommand[])(void) PROGMEM = {
   &CmndEspNowEnable, &CmndEspNowPeerMac, &CmndEspNowSecret, &CmndEspNowChannel, &CmndEspNowPeerMode, &CmndEspNowPeerConfig,
   &CmndEspNowSend, &CmndEspNowEvent, &CmndEspNowStatus, &CmndEspNowPing, &CmndEspNowForge, &CmndEspNowReplay,
+#ifdef USE_WIFI_STATION_CONTROL
+  &CmndEspNowGiveWifi, &CmndEspNowTakeWifi,
+#endif
 #ifdef USE_ESPNOW_DIRECT_PAIRING
   &CmndEspNowPairOpen, &CmndEspNowPairScan, &CmndEspNowPairHeard, &CmndEspNowPairBlink, &CmndEspNowPairWith, &CmndEspNowPairStop,
 #endif

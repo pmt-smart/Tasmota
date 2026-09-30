@@ -370,36 +370,19 @@ static void StaCtrlScanCheck(void) {
  * Join
 \*********************************************************************************************/
 
-void CmndStaJoin(void) {
-  if (StaCtrlBusy()) {
-    ResponseCmndChar_P(PSTR("Busy"));
-    return;
-  }
-  JsonParser parser(XdrvMailbox.data);
-  JsonParserObject root = parser.getRootObject();
-  if (!root) {
-    ResponseCmndError();
-    return;
-  }
-  const char* ssid = root.getStr(PSTR("SSId"), "");
-  const char* password = root.getStr(PSTR("Password"), "");
-  uint32_t channel = root.getUInt(PSTR("Channel"), 0);
-  const char* bssid_text = root.getStr(PSTR("BSSId"), "");
+// A join, for StaJoin and for another driver that holds credentials it never
+// hands to a command line, as ESP-NOW direct does with the network its peer gave
+// it. The result goes to the rules as StaJoin's.
+enum StaCtrlJoinResults { STA_JOIN_STARTED, STA_JOIN_BUSY, STA_JOIN_INVALID };
+
+uint32_t StaCtrlJoin(const char* ssid, const char* password, uint32_t channel, const uint8_t* bssid) {
+  if (StaCtrlBusy()) { return STA_JOIN_BUSY; }
   size_t ssid_len = strlen(ssid);
   size_t password_len = strlen(password);
   // A WPA passphrase has 8 to 63 characters, or is 64 hexadecimal digits; an
   // open network has none.
   if (!ssid_len || (ssid_len > 32) || (password_len && (password_len < 8)) || (password_len > 64) || (channel > 14)) {
-    ResponseCmndError();
-    return;
-  }
-  uint8_t bssid[6];
-  unsigned int octet[6] = { 0 };
-  bool use_bssid = (6 == sscanf(bssid_text, "%x:%x:%x:%x:%x:%x",
-                                &octet[0], &octet[1], &octet[2], &octet[3], &octet[4], &octet[5]));
-  for (uint32_t i = 0; i < 6; i++) {
-    if (octet[i] > 255) { use_bssid = false; }
-    bssid[i] = octet[i];
+    return STA_JOIN_INVALID;
   }
   strlcpy(StaCtrl.ssid, ssid, sizeof(StaCtrl.ssid));
   strlcpy(StaCtrl.password, password, sizeof(StaCtrl.password));
@@ -430,10 +413,33 @@ void CmndStaJoin(void) {
   StaCtrl.got_address = false;
   StaCtrl.started = millis();
   StaCtrl.state = STA_CTRL_JOINING;
-  WiFiHelper::begin(StaCtrl.ssid, password_len ? StaCtrl.password : nullptr, (use_bssid) ? channel : 0,
-                    (use_bssid) ? bssid : nullptr);
+  WiFiHelper::begin(StaCtrl.ssid, password_len ? StaCtrl.password : nullptr, bssid ? channel : 0, bssid);
   AddLog(LOG_LEVEL_INFO, PSTR("STA: Joining %s"), StaCtrl.ssid);
-  ResponseCmndChar_P(PSTR("Joining"));
+  return STA_JOIN_STARTED;
+}
+
+void CmndStaJoin(void) {
+  if (StaCtrlBusy()) {
+    ResponseCmndChar_P(PSTR("Busy"));
+    return;
+  }
+  JsonParser parser(XdrvMailbox.data);
+  JsonParserObject root = parser.getRootObject();
+  if (!root) {
+    ResponseCmndError();
+    return;
+  }
+  uint8_t bssid[6];
+  unsigned int octet[6] = { 0 };
+  bool use_bssid = (6 == sscanf(root.getStr(PSTR("BSSId"), ""), "%x:%x:%x:%x:%x:%x",
+                                &octet[0], &octet[1], &octet[2], &octet[3], &octet[4], &octet[5]));
+  for (uint32_t i = 0; i < 6; i++) {
+    if (octet[i] > 255) { use_bssid = false; }
+    bssid[i] = octet[i];
+  }
+  uint32_t result = StaCtrlJoin(root.getStr(PSTR("SSId"), ""), root.getStr(PSTR("Password"), ""),
+                                root.getUInt(PSTR("Channel"), 0), use_bssid ? bssid : nullptr);
+  ResponseCmndChar_P((STA_JOIN_STARTED == result) ? PSTR("Joining") : (STA_JOIN_BUSY == result) ? PSTR("Busy") : PSTR("Error"));
 }
 
 static void StaCtrlJoinReport(bool connected, const char* why) {
