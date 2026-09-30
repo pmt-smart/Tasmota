@@ -139,6 +139,10 @@
  * two minutes, and joins it on EspNowTakeWifi, with the WiFi station driver's
  * join, which saves the network only once it works. The password reaches no
  * script, no rule and no log on either side.
+ * A network named in the command goes instead of the saved one, for a device
+ * that moves its peer to another network before it joins it itself. Its
+ * password is then in the command line, as Password1's is, and the debug log
+ * level shows it as it shows any command's data.
  *
  * Build option USE_ESPNOW_DIRECT_COMMANDS_TO_RULES: the device runs no command it
  * receives either, and hands each to the rule engine instead, for the
@@ -165,7 +169,8 @@
  *   EspNowForge       - send a deliberately mis-signed ping to check rejection
  *   EspNowReplay      - resend the previous ping to check replay rejection
  * With USE_WIFI_STATION_CONTROL:
- *   EspNowGiveWifi    - offer the saved network to the peer
+ *   EspNowGiveWifi [{"SSId":"<ssid>","Password":"<password>"}] - offer the
+ *                       saved network to the peer, or the one named
  *   EspNowTakeWifi [0] - join the network the peer offered; 0 drops the offer
  * With USE_ESPNOW_DIRECT_PAIRING:
  *   EspNowPairOpen <s>[,<zigbee>] - open a pairing window for s seconds, up to
@@ -2042,24 +2047,53 @@ static void EspNowDirectWifiOffered(const uint8_t* data, size_t len) {
   XdrvRulesProcess(0);
 }
 
-// The saved network this device is on, to the peer: only over a link that is up,
-// which is encrypted, and never repeated back
+// The saved network this device is on, or the one the command names, to the
+// peer: only over a link that is up, which is encrypted, and never repeated back
 void CmndEspNowGiveWifi(void) {
   if (!EspNowDirect.active || !EspNowDirect.peer_known) {
     ResponseCmndChar_P(PSTR("not active"));
     return;
   }
-  uint32_t active = Settings->sta_active ? 1 : 0;
-  const char* ssid = SettingsText(SET_STASSID1 + active);
-  const char* password = SettingsText(SET_STAPWD1 + active);
+  char ssid[33] = { 0 };
+  char password[65] = { 0 };
+  bool named = (XdrvMailbox.data_len > 0);
+  bool fits = true;
+  if (named) {
+    JsonParser parser(XdrvMailbox.data);
+    JsonParserObject root = parser.getRootObject();
+    if (!root) {
+      EspNowDirectWipe(XdrvMailbox.data, XdrvMailbox.data_len);
+      ResponseCmndError();
+      return;
+    }
+    const char* name = root.getStr(PSTR("SSId"), "");
+    const char* key = root.getStr(PSTR("Password"), "");
+    fits = (strlen(name) <= 32) && (strlen(key) <= 64);
+    if (fits) {
+      strlcpy(ssid, name, sizeof(ssid));
+      strlcpy(password, key, sizeof(password));
+    }
+    // the command's buffer held the password: parsed in place, and wiped
+    EspNowDirectWipe(XdrvMailbox.data, XdrvMailbox.data_len);
+  } else {
+    uint32_t active = Settings->sta_active ? 1 : 0;
+    fits = (strlen(SettingsText(SET_STASSID1 + active)) <= 32) && (strlen(SettingsText(SET_STAPWD1 + active)) <= 64);
+    if (fits) {
+      strlcpy(ssid, SettingsText(SET_STASSID1 + active), sizeof(ssid));
+      strlcpy(password, SettingsText(SET_STAPWD1 + active), sizeof(password));
+    }
+  }
   size_t ssid_len = strlen(ssid);
   size_t password_len = strlen(password);
-  if (!ssid_len) {
-    ResponseCmndChar_P(PSTR("no network"));
+  // the peer takes no password of 1 to 7 characters, which WPA does not allow
+  if (!fits || (password_len && (password_len < 8))) {
+    EspNowDirectWipe(password, sizeof(password));
+    ResponseCmndError();
     return;
   }
-  if ((ssid_len > 32) || (password_len > 64)) {
-    ResponseCmndError();
+  if (!ssid_len) {
+    EspNowDirectWipe(password, sizeof(password));
+    ResponseCmndChar_P(PSTR("no network"));
     return;
   }
   uint8_t payload[2 + 32 + 64];
@@ -2069,6 +2103,7 @@ void CmndEspNowGiveWifi(void) {
   memcpy(&payload[2 + ssid_len], password, password_len);
   bool sent = EspNowDirectSend(ESPNOW_DIRECT_TYPE_WIFI, payload, 2 + ssid_len + password_len);
   EspNowDirectWipe(payload, sizeof(payload));
+  EspNowDirectWipe(password, sizeof(password));
   ResponseCmndChar_P(sent ? PSTR("sent") : PSTR("failed"));
 }
 
