@@ -792,6 +792,11 @@ bool HttpCheckPriviledgedAccess(bool autorequestauth = true) {
       if ((referer.indexOf(hostname) == 7) || (referer.indexOf(WiFi.localIP().toString()) == 7)) {
         return true;
       }
+#ifdef USE_WIFI_STATION_CONTROL
+      if (StaCtrlHotspotUp() && (referer.indexOf(WiFi.softAPIP().toString()) == 7)) {  // the station driver's hotspot
+        return true;
+      }
+#endif  // USE_WIFI_STATION_CONTROL
 //#if defined(ESP32) && CONFIG_IDF_TARGET_ESP32 && defined(USE_ETHERNET)
 #if defined(ESP32) && defined(USE_ETHERNET)
       hostname = EthernetHostname();
@@ -3854,6 +3859,13 @@ void HandleSwitchBootPartition(void) {
     switch_factory = true;
   }
 
+#ifdef USE_WIFI_STATION_CONTROL
+  // the safeboot that writes the upload has no hotspot to come back on
+  if (switch_factory && StaCtrlHotspotAlone()) {
+    AddLog(LOG_LEVEL_INFO, PSTR(D_LOG_UPLOAD "Refused over the hotspot alone, which the safeboot does not have: join a network first"));
+    switch_factory = false;
+  }
+#endif  // USE_WIFI_STATION_CONTROL
   // apply the change in flash and return result
   if (switch_factory || switch_ota) {
     XsnsXdrvCall(FUNC_ABOUT_TO_RESTART);

@@ -41,10 +41,20 @@
  *   Tasmota's WiFi is off, for a radio user that needs the channel without an
  *   access point, as ESP-NOW does. It is not saved: whoever needs it asks again
  *   after a restart.
+ * - Hotspot is an access point of the device's own, for a phone to reach its web
+ *   UI directly: WPA2, with the name and password the command gives, beside the
+ *   station, on the channel the radio is on, which is the station's when it is
+ *   connected. The web server comes up with it when it was not running, and its
+ *   pages take requests made to the hotspot's address. It closes on StaHotspot 0,
+ *   a restart, the WiFi Manager opening its own, or STA_CTRL_HOTSPOT_IDLE_MS
+ *   with nobody on it. An upgrade over the hotspot alone is refused: it runs from
+ *   the safeboot, which has no hotspot to come back on, and the device would be
+ *   left with no way to reach it.
  * - The radio has one owner at a time, which sets its channel. From the one that
  *   wins to the one that yields: the WiFi Manager, a join, a pairing session that
- *   another driver claims (StaCtrlRadioClaim), a scan. A scan passes under the
- *   WiFi Manager and a connected station, but waits for a join and a pairing,
+ *   another driver claims (StaCtrlRadioClaim), the hotspot, which holds its
+ *   phones' channel, a scan. A scan passes under the WiFi Manager, the hotspot
+ *   and a connected station, but waits for a join and a pairing,
  *   which need the channel to stay put. The station, and a transport that
  *   follows its channel, come below them all: they leave the channel alone
  *   while StaCtrlRadioOwner names anyone, and follow it again once it is free.
@@ -58,6 +68,9 @@
  *   {"StaScan":{"Networks":[["<ssid>",<rssi>,<auth>,<channel>,"<bssid>"],...]}}
  *   {"StaJoin":{"State":"Connected","SSId":"<ssid>","IP":"<ip>"}}
  *   {"StaJoin":{"State":"Failed","SSId":"<ssid>","Reason":"<why>","Code":<n>}}
+ *   {"StaHotspot":{"State":"Up","SSId":"<ssid>","Channel":<n>,"IP":"<ip>","Clients":<n>}},
+ *     again whenever the number of phones on it changes
+ *   {"StaHotspot":{"State":"Off","Reason":"Stop"|"Idle"|"WifiManager"|"Lost"}}
  * `auth` is the ESP-IDF wifi_auth_mode_t, and `why` is WrongPassword, NotFound,
  * NoAnswer or NoAddress.
  *
@@ -70,6 +83,9 @@
  *   StaHold 0|1       - keep the radio in station mode while Tasmota's WiFi is off
  *   StaState          - what the driver is doing, who has the radio, and the
  *                       station's last disconnect reason
+ *   StaHotspot {"SSId":"<ssid>","Password":"<password>"} - open the hotspot, with a
+ *                       password of 8 to 63 characters, never echoed back; 0 closes
+ *                       it; bare, its state
 \*********************************************************************************************/
 
 #define XDRV_96                         96
@@ -80,6 +96,8 @@
 #define STA_CTRL_RETRY_GRACE_MS         8000     // a failure the stack did not retry within this is final
 #define STA_CTRL_LINGER_MS              60000    // the radio stays up this long after a scan, for the join that follows
 #define STA_CTRL_SCAN_REPORT_MAX        900      // bytes of scan report, to stay within one MQTT message
+#define STA_CTRL_HOTSPOT_IDLE_MS        900000   // the hotspot closes after this long with nobody on it
+#define STA_CTRL_HOTSPOT_CLIENTS        4        // phones the hotspot takes at once
 
 enum StaCtrlStates { STA_CTRL_IDLE, STA_CTRL_SCANNING, STA_CTRL_JOINING };
 
@@ -97,6 +115,10 @@ struct {
   volatile uint8_t disconnects = 0;        // failures reported during a join
   volatile uint8_t reason = 0;             // the last failure reported, joining or not
   volatile bool got_address = false;       // the join has an address
+  bool hotspot = false;                    // StaHotspot: the access point is up
+  uint8_t hotspot_clients = 0;             // the phones on it, as last reported
+  uint32_t hotspot_quiet = 0;              // since when nobody is on it
+  char hotspot_ssid[33];
   char ssid[33];
   char password[65];
 } StaCtrl;
@@ -195,6 +217,7 @@ enum StaCtrlRadioOwners {
   STA_RADIO_WIFI_MANAGER,                  // Tasmota's WiFi Manager, with its AP
   STA_RADIO_JOIN,                          // StaJoin
   STA_RADIO_PAIRING,                       // a pairing session, StaCtrlRadioClaim
+  STA_RADIO_HOTSPOT,                       // StaHotspot, which holds its phones' channel
   STA_RADIO_SCAN,                          // StaScan, or Tasmota's own scan
 };
 
@@ -202,6 +225,7 @@ uint32_t StaCtrlRadioOwner(void) {
   if (Wifi.config_type) { return STA_RADIO_WIFI_MANAGER; }
   if (STA_CTRL_JOINING == StaCtrl.state) { return STA_RADIO_JOIN; }
   if (StaCtrl.claimed) { return STA_RADIO_PAIRING; }
+  if (StaCtrl.hotspot) { return STA_RADIO_HOTSPOT; }
   if ((STA_CTRL_SCANNING == StaCtrl.state) || Wifi.scan_state || (WIFI_SCAN_RUNNING == WiFi.scanComplete())) {
     return STA_RADIO_SCAN;
   }
@@ -213,6 +237,7 @@ const char* StaCtrlRadioOwnerText(uint32_t owner) {
     case STA_RADIO_WIFI_MANAGER: return PSTR("WifiManager");
     case STA_RADIO_JOIN:         return PSTR("Join");
     case STA_RADIO_PAIRING:      return PSTR("Pairing");
+    case STA_RADIO_HOTSPOT:      return PSTR("Hotspot");
     case STA_RADIO_SCAN:         return PSTR("Scan");
   }
   return PSTR("");
@@ -504,6 +529,116 @@ static void StaCtrlJoinCheck(void) {
 }
 
 /*********************************************************************************************\
+ * Hotspot
+\*********************************************************************************************/
+
+// The hotspot is up: Tasmota's reconnection keeps it (support_wifi.ino, WifiBegin),
+// and its pages take requests made to its address (xdrv_01_9_webserver.ino)
+bool StaCtrlHotspotUp(void) {
+  return StaCtrl.hotspot;
+}
+
+// Up with no network beside it: an upgrade is refused, since it runs from the
+// safeboot, which has no hotspot to come back on
+bool StaCtrlHotspotAlone(void) {
+  return StaCtrl.hotspot && !StaCtrlTasmotaUp();
+}
+
+static void StaCtrlHotspotReport(void) {
+  if (StaCtrl.hotspot) {
+    Response_P(PSTR("{\"StaHotspot\":{\"State\":\"Up\",\"SSId\":\"%s\",\"Channel\":%d,\"IP\":\"%s\",\"Clients\":%d}}"),
+      EscapeJSONString(StaCtrl.hotspot_ssid).c_str(), WiFi.channel(), WiFi.softAPIP().toString().c_str(), StaCtrl.hotspot_clients);
+  } else {
+    Response_P(PSTR("{\"StaHotspot\":{\"State\":\"Off\"}}"));
+  }
+}
+
+// WPA2, beside the station, on the channel the radio is on: the station's when it
+// is connected, and where ESP-NOW or a held radio left it otherwise
+static bool StaCtrlHotspotStart(const char* ssid, const char* password) {
+  if (Wifi.config_type) { return false; }  // the WiFi Manager's own access point is up
+  size_t ssid_len = strlen(ssid);
+  size_t password_len = strlen(password);
+  if (!ssid_len || (ssid_len > 32) || (password_len < 8) || (password_len > 63)) { return false; }
+  WifiSetMode(WIFI_AP_STA);
+  int32_t channel = WiFi.channel();
+  if ((channel < 1) || (channel > 13)) { channel = 1; }
+  if (!WiFi.softAP(ssid, password, channel, 0, STA_CTRL_HOTSPOT_CLIENTS)) {
+    if (!StaCtrl.hotspot) { WifiSetMode(StaCtrlTasmotaUp() || StaCtrl.hold || StaCtrl.claimed || StaCtrl.borrowed ? WIFI_STA : WIFI_OFF); }
+    return false;
+  }
+  strlcpy(StaCtrl.hotspot_ssid, ssid, sizeof(StaCtrl.hotspot_ssid));
+  StaCtrl.hotspot = true;
+  StaCtrl.hotspot_clients = 0;
+  StaCtrl.hotspot_quiet = millis();
+#ifdef USE_WEBSERVER
+  // with no network, the web server never came up
+  if (Settings->webserver) { StartWebserver(Settings->webserver); }
+#endif  // USE_WEBSERVER
+  AddLog(LOG_LEVEL_INFO, PSTR("STA: Hotspot %s up on channel %d"), StaCtrl.hotspot_ssid, channel);
+  StaCtrlHotspotReport();
+  MqttPublishPrefixTopicRulesProcess_P(RESULT_OR_STAT, PSTR("StaHotspot"));
+  return true;
+}
+
+// The access point down, and the station as whoever needs it left it. The WiFi
+// Manager's own, which takes the same interface over, is left alone
+static void StaCtrlHotspotStop(const char* why) {
+  if (!StaCtrl.hotspot) { return; }
+  StaCtrl.hotspot = false;
+  StaCtrl.hotspot_clients = 0;
+  if ((WiFi.getMode() & WIFI_MODE_AP) && !Wifi.config_type) {
+    WiFi.softAPdisconnect(true);
+    WifiSetMode(StaCtrlTasmotaUp() || StaCtrl.hold || StaCtrl.claimed || StaCtrl.borrowed || Settings->flag4.network_wifi ? WIFI_STA : WIFI_OFF);
+  }
+  AddLog(LOG_LEVEL_INFO, PSTR("STA: Hotspot %s closed, %s"), StaCtrl.hotspot_ssid, why);
+  Response_P(PSTR("{\"StaHotspot\":{\"State\":\"Off\",\"Reason\":\"%s\"}}"), why);
+  MqttPublishPrefixTopicRulesProcess_P(RESULT_OR_STAT, PSTR("StaHotspot"));
+}
+
+// Every 250 ms while it is up: the phones on it, and its time with none
+static void StaCtrlHotspotCheck(void) {
+  if (!StaCtrl.hotspot) { return; }
+  if (Wifi.config_type) {
+    StaCtrlHotspotStop(PSTR("WifiManager"));
+    return;
+  }
+  if (!(WiFi.getMode() & WIFI_MODE_AP)) {  // something took the radio down under it
+    StaCtrlHotspotStop(PSTR("Lost"));
+    return;
+  }
+  uint8_t clients = WiFi.softAPgetStationNum();
+  if (clients != StaCtrl.hotspot_clients) {
+    StaCtrl.hotspot_clients = clients;
+    StaCtrlHotspotReport();
+    MqttPublishPrefixTopicRulesProcess_P(RESULT_OR_STAT, PSTR("StaHotspot"));
+  }
+  if (clients) {
+    StaCtrl.hotspot_quiet = millis();
+  } else if (TimeReached(StaCtrl.hotspot_quiet + STA_CTRL_HOTSPOT_IDLE_MS)) {
+    StaCtrlHotspotStop(PSTR("Idle"));
+  }
+}
+
+void CmndStaHotspot(void) {
+  if (XdrvMailbox.data_len && ('{' == XdrvMailbox.data[0])) {
+    JsonParser parser(XdrvMailbox.data);
+    JsonParserObject root = parser.getRootObject();
+    bool started = false;
+    if (!!root) { started = StaCtrlHotspotStart(root.getStr(PSTR("SSId"), ""), root.getStr(PSTR("Password"), "")); }
+    // the command's buffer held the password: parsed in place, and wiped
+    memset(XdrvMailbox.data, 0, XdrvMailbox.data_len);
+    if (!started) {
+      ResponseCmndChar_P(Wifi.config_type ? PSTR("Busy") : PSTR("Error"));
+      return;
+    }
+  } else if (XdrvMailbox.data_len && (0 == XdrvMailbox.payload)) {
+    StaCtrlHotspotStop(PSTR("Stop"));
+  }
+  StaCtrlHotspotReport();
+}
+
+/*********************************************************************************************\
  * Forget, hold and state
 \*********************************************************************************************/
 
@@ -553,9 +688,9 @@ void CmndStaState(void) {
 }
 
 const char kStaCtrlCommands[] PROGMEM = "Sta|"
-  "Scan|Join|Forget|Hold|State";
+  "Scan|Join|Forget|Hold|State|Hotspot";
 void (* const kStaCtrlCommand[])(void) PROGMEM = {
-  &CmndStaScan, &CmndStaJoin, &CmndStaForget, &CmndStaHold, &CmndStaState };
+  &CmndStaScan, &CmndStaJoin, &CmndStaForget, &CmndStaHold, &CmndStaState, &CmndStaHotspot };
 
 /*********************************************************************************************\
  * Interface
@@ -569,6 +704,7 @@ bool Xdrv96(uint32_t function) {
       WiFi.onEvent(StaCtrlEvent);
       break;
     case FUNC_EVERY_250_MSECOND:
+      StaCtrlHotspotCheck();
       if (STA_CTRL_SCANNING == StaCtrl.state) {
         StaCtrlScanCheck();
       } else if (STA_CTRL_JOINING == StaCtrl.state) {
