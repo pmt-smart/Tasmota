@@ -28,7 +28,9 @@
  * `WifiConfig 2` opens it, for its own WIFI_CONFIG_SEC, instead of the settings
  * being erased. It opens BOOT_RESCUE_OPEN_S seconds into that boot, once a
  * script that turns the WiFi off at boot has done so, and turns the WiFi on
- * first, as `Wifi 1` does.
+ * first, as `Wifi 1` does. Its time runs on a device with no network saved
+ * too, as on one with a network: each page served gives it again, and the
+ * device restarts when it runs out.
  *
  * For a device whose button no longer reaches the WiFi Manager (a button driver
  * that takes it, or SetOption1), whose screen does not work, or whose network
@@ -105,6 +107,14 @@ static void BootRescueEverySecond(void) {
     AddLog(LOG_LEVEL_INFO, PSTR("RSC: %d short boots in a row, the WiFi Manager opens for %d s"), BOOT_RESCUE_BOOTS, WIFI_CONFIG_SEC);
     Settings->flag4.network_wifi = 1;    // as Wifi 1: a script may have turned the WiFi off at boot
     WifiConfig(WIFI_MANAGER);
+#ifdef USE_WEBSERVER
+    // A device with no network saved is in its initial configuration, where the
+    // web server holds Wifi.config_counter up and the WiFi Manager stays open with
+    // no time limit, its administration with it. Opened as a rescue, it closes as
+    // on a device with a network: in WIFI_CONFIG_SEC, each page giving that time
+    // again, and with a restart
+    Web.initial_config = false;
+#endif  // USE_WEBSERVER
   }
 }
 
