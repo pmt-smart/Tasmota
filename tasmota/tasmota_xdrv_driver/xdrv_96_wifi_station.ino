@@ -497,6 +497,16 @@ static void StaCtrlJoinDone(void) {
   StaCtrl.state = STA_CTRL_IDLE;
   StaCtrl.restore = false;
   StaCtrl.borrowed = false;
+#ifdef USE_WEBSERVER
+  // The web server a blank device brings up, as the hotspot does, holds Tasmota's
+  // WiFi check in its initial configuration: Web.initial_config keeps
+  // Wifi.config_counter up, and the check never gets to the station. The device
+  // has a network now, as after the WiFi Manager's restart
+  if (Web.initial_config && !Wifi.config_type) {
+    Web.initial_config = false;
+    Wifi.config_counter = 0;
+  }
+#endif  // USE_WEBSERVER
   AddLog(LOG_LEVEL_INFO, PSTR("STA: Joined %s, saved as SSId1"), StaCtrl.ssid);
   StaCtrlJoinReport(true, nullptr);
   // Handed over connected: Tasmota's next check finds the station up and
