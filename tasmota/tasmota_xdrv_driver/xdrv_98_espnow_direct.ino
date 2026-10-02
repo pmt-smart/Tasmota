@@ -1626,6 +1626,10 @@ static void EspNowDirectScanFailed(const char* why) {
 // Keeps what an announcement says, by key. The first address a key is heard
 // from keeps it: a copy of the announcement from elsewhere changes nothing.
 // A name keeps printable ASCII only, and none of the two characters JSON escapes.
+// With the list full, a device heard stronger than the weakest takes its place
+// and its id, while the scan listens: with more devices announcing at once than
+// the list holds, the nearest are kept, and not the first heard. Once the scan
+// is over, the ids are what the user picks by, and they stay put.
 static void EspNowDirectHeard(const EspNowDirectRxItem_t* item);
 static void EspNowDirectHeard(const EspNowDirectRxItem_t* item) {
   EspNowDirectPair_t* p = EspNowPair;
@@ -1640,9 +1644,20 @@ static void EspNowDirectHeard(const EspNowDirectRxItem_t* item) {
     if (!memcmp(p->heard[i].key, key, 32)) { h = &p->heard[i]; break; }
   }
   bool fresh = (nullptr == h);
+  char replaced[18] = "";
   if (fresh) {
-    if (p->heard_count >= ESPNOW_DIRECT_HEARD_MAX) { return; }
-    h = &p->heard[p->heard_count++];
+    if (p->heard_count < ESPNOW_DIRECT_HEARD_MAX) {
+      h = &p->heard[p->heard_count++];
+    } else {
+      if ((ESPNOW_PAIR_LISTEN != p->phase) && (ESPNOW_PAIR_SWEEP != p->phase)) { return; }
+      h = &p->heard[0];
+      for (uint32_t i = 1; i < p->heard_count; i++) {
+        if (p->heard[i].rssi < h->rssi) { h = &p->heard[i]; }
+      }
+      if (item->rssi <= h->rssi) { return; }
+      EspNowDirectMacText(h->mac, replaced);
+      memset(h, 0, sizeof(EspNowDirectHeard_t));
+    }
     memcpy(h->key, key, 32);
     memcpy(h->mac, item->mac, 6);
     h->rssi = item->rssi;
@@ -1664,10 +1679,14 @@ static void EspNowDirectHeard(const EspNowDirectRxItem_t* item) {
 
   char text[18];
   EspNowDirectMacText(h->mac, text);
-  AddLog(LOG_LEVEL_INFO, PSTR("ENW: Heard %s on channel %d"), text, h->channel);
+  if (replaced[0]) {
+    AddLog(LOG_LEVEL_INFO, PSTR("ENW: Heard %s on channel %d, in the place of %s"), text, h->channel, replaced);
+  } else {
+    AddLog(LOG_LEVEL_INFO, PSTR("ENW: Heard %s on channel %d"), text, h->channel);
+  }
   Response_P(PSTR("{\"EspNowPair\":{\"Heard\":{\"Id\":%u,\"Mac\":\"%s\",\"Rssi\":%d,\"Channel\":%u,\"Version\":%u,"
                   "\"Name\":\"%s\",\"Zigbee\":%u,\"Network\":%u,\"Busy\":%u}}}"),
-    p->heard_count, text, h->rssi, h->channel, h->version, h->name, h->zigbee,
+    (uint32_t)(h - p->heard) + 1, text, h->rssi, h->channel, h->version, h->name, h->zigbee,
     (h->flags & ESPNOW_DIRECT_ANNOUNCE_NETWORK) ? 1 : 0, (h->flags & ESPNOW_DIRECT_ANNOUNCE_BUSY) ? 1 : 0);
   XdrvRulesProcess(0);
 }
