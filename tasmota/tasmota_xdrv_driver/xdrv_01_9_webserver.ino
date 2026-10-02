@@ -3861,7 +3861,8 @@ void HandleSwitchBootPartition(void) {
 
 #ifdef USE_WIFI_STATION_CONTROL
   // the safeboot that writes the upload has no hotspot to come back on
-  if (switch_factory && StaCtrlHotspotAlone()) {
+  bool hotspot_refused = switch_factory && StaCtrlHotspotAlone();
+  if (hotspot_refused) {
     AddLog(LOG_LEVEL_INFO, PSTR(D_LOG_UPLOAD "Refused over the hotspot alone, which the safeboot does not have: join a network first"));
     switch_factory = false;
   }
@@ -3886,6 +3887,12 @@ void HandleSwitchBootPartition(void) {
     }
   } else {
     if (api_mode) {
+#ifdef USE_WIFI_STATION_CONTROL
+      if (hotspot_refused) {
+        // not `true`, which has the page upload into the partition that runs
+        WSReturnSimpleString("refused");
+      } else
+#endif  // USE_WIFI_STATION_CONTROL
       // return `none` or `true`
       WSReturnSimpleString(EspSingleOtaPartition() ? "true" : "none");
     } else {
