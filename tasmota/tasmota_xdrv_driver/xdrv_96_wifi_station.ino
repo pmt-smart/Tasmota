@@ -47,7 +47,9 @@
  *   connected. The web server comes up with it when it was not running, and its
  *   pages take requests made to the hotspot's address. It closes on StaHotspot 0,
  *   a restart, the WiFi Manager opening its own, or STA_CTRL_HOTSPOT_IDLE_MS
- *   with nobody on it. An upgrade over the hotspot alone is refused: it runs from
+ *   with nobody on it, and on nothing else: a scan, a join, a hold, the end of
+ *   the radio borrowed for them, and Tasmota's WiFi going off all leave it up,
+ *   with its phones. An upgrade over the hotspot alone is refused: it runs from
  *   the safeboot, which has no hotspot to come back on, and the device would be
  *   left with no way to reach it.
  * - The radio has one owner at a time, which sets its channel. From the one that
@@ -154,6 +156,12 @@ static void StaCtrlClearSecret(void) {
   memset(StaCtrl.password, 0, sizeof(StaCtrl.password));
 }
 
+// The radio's mode with the station on: the hotspot's access point stays beside
+// it, and the phones on it
+static WiFiMode_t StaCtrlStationMode(void) {
+  return StaCtrl.hotspot ? WIFI_AP_STA : WIFI_STA;
+}
+
 // Takes the radio from Tasmota: its WiFi off, as `Wifi 0` leaves it, and the
 // radio in station mode, with no network.
 static void StaCtrlTakeRadio(void) {
@@ -162,7 +170,7 @@ static void StaCtrlTakeRadio(void) {
     Settings->flag4.network_wifi = 0;
     WifiDisable();                         // does nothing when it was not connected
   }
-  WifiSetMode(WIFI_STA);                   // does nothing when already in station mode
+  WifiSetMode(StaCtrlStationMode());       // does nothing when already in that mode
   WiFi.disconnect();                       // stops a connection attempt in flight
   StaCtrl.borrowed = true;
 }
@@ -196,7 +204,7 @@ static void StaCtrlKeepRadio(void) {
   }
   if (StaCtrl.borrowed && TimeReached(StaCtrl.linger_until)) {
     StaCtrl.borrowed = false;
-    WifiSetMode(WIFI_OFF);
+    if (!StaCtrl.hotspot) { WifiSetMode(WIFI_OFF); }  // the hotspot keeps the radio, and its phones
   }
 }
 
@@ -669,9 +677,9 @@ void CmndStaHold(void) {
     StaCtrl.hold = XdrvMailbox.payload;
     if (STA_CTRL_IDLE == StaCtrl.state && !Settings->flag4.network_wifi) {
       if (StaCtrl.hold) {
-        WifiSetMode(WIFI_STA);
+        WifiSetMode(StaCtrlStationMode());
         WiFi.disconnect();
-      } else if (!StaCtrl.borrowed) {
+      } else if (!StaCtrl.borrowed && !StaCtrl.hotspot) {
         WifiSetMode(WIFI_OFF);
       }
     }
