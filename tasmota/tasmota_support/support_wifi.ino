@@ -1706,6 +1706,11 @@ void WifiDisable(void) {
     // dangling pbufs after WiFi.disconnect() destroys the netif.
     XdrvXsnsCall(FUNC_NETWORK_DOWN);
     WifiShutdown();
+#ifdef USE_WIFI_STATION_CONTROL
+    if (StaCtrlHotspotUp()) {
+      WifiSetMode(WIFI_AP);  // Preserve the station driver's hotspot and the phones on it: only the station goes
+    } else
+#endif  // USE_WIFI_STATION_CONTROL
     WifiSetMode(WIFI_OFF);
 #ifdef USE_WEBSERVER
     // Reopen the listening socket with a clean accept backlog.
