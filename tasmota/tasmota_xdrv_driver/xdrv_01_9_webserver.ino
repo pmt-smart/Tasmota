@@ -3006,7 +3006,15 @@ void HandleBackupConfiguration(void) {
 \*********************************************************************************************/
 
 void HandleResetConfiguration(void) {
+#ifdef USE_WIFI_MANAGER_RESET_AUTH
+  // The WiFi Manager is open to anyone in range of its access point, and a reset
+  // erases the whole configuration: with a web password set, the reset asks for
+  // it there too, as the console and the other configuration pages do. The WiFi
+  // configuration page stays open, which is what the WiFi Manager is for.
+  if (!HttpCheckPriviledgedAccess()) { return; }
+#else
   if (!HttpCheckPriviledgedAccess(!WifiIsInManagerMode())) { return; }
+#endif  // USE_WIFI_MANAGER_RESET_AUTH
 
   AddLog(LOG_LEVEL_DEBUG, PSTR(D_LOG_HTTP D_RESET_CONFIGURATION));
 
