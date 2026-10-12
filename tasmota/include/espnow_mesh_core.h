@@ -66,7 +66,8 @@
  * destination answers every attempt it hears, as soon as it hears it, and delivers the frame to
  * its application with a flag when the number was delivered before, so that the application
  * executes a number once. A frame its application has no room for is not taken at all: no answer goes, and no window moves, so that
- * the sender's next attempt finds it as it was. Nothing is sent that is not either confirmed or reported.
+ * the sender's next attempt finds it as it was; and so it is while the application has said it is not ready (SetDeliverEnabled), as at
+ * the start, before it has anything to take the frames with. Nothing is sent that is not either confirmed or reported.
  *
  * Replay: a node keeps, for each origin, the highest epoch and counter accepted and a window
  * of 32 counters behind it, one bit each. A counter already seen, one behind the window and
@@ -569,7 +570,7 @@ class Node {
     // A frame for this node alone that the application has no room for is not taken: no window moves, nothing is kept and no answer goes,
     // so that the sender, which sends it again in 100 ms, is told it arrived only when the application has it
     bool toApplication = forMe && f.type() != kBeat && f.type() != kAck;
-    if (toApplication && f.dest == cfg_.id && inboxCount_ >= kInboxSize) { stats_.inboxFull++; return kFull; }
+    if (toApplication && f.dest == cfg_.id && (inboxCount_ >= kInboxSize || deliverOff_)) { stats_.inboxFull++; return kFull; }
     if (ahead) {
       uint32_t shift = f.counter - o->highest;
       if (shift >= kReplayWindow) { o->seen = 0; o->covered = 0; }
@@ -805,6 +806,12 @@ class Node {
     if (unicast && pingTarget != 0 && (ok || !again)) OnPingResult(pingTarget, pingAsker, ok, now);
   }
 
+  // Whether the frames for the application are taken. They are by default. While they are not, a frame for this node alone is refused
+  // as one the inbox has no room for is: no answer goes and no window moves, so that the sender, which is not answered, sends it again;
+  // and a frame for everyone is passed on and not delivered here. For an application that is not there yet to take what it is given
+  void SetDeliverEnabled(bool on) { deliverOff_ = !on; }
+  bool DeliverEnabled() const { return !deliverOff_; }
+
   bool PopDelivery(Delivery *d) {
     if (inboxCount_ == 0) return false;
     *d = inbox_[inboxHead_];
@@ -902,6 +909,7 @@ class Node {
   SyncAsk asks_[kSyncSize];
   Delivery inbox_[kInboxSize];
   unsigned inboxHead_, inboxCount_;
+  bool deliverOff_;                            // the application has said it is not ready: nothing is handed to it
   Outcome outcomes_[kOutcomeSize];
   unsigned outcomeHead_, outcomeCount_;
   Stats stats_;
@@ -1219,9 +1227,9 @@ class Node {
     slot->udpTarget = next;
   }
 
-  // Whether the frame is in the application's hands: false when its inbox is full
+  // Whether the frame is in the application's hands: false when its inbox is full, or the application is not taking frames
   bool Deliver(const Frame &f, const uint8_t src[6], int8_t rssi, bool retry, uint8_t behind) {
-    if (inboxCount_ >= kInboxSize) { stats_.inboxFull++; return false; }
+    if (inboxCount_ >= kInboxSize || deliverOff_) { stats_.inboxFull++; return false; }
     Delivery &d = inbox_[(inboxHead_ + inboxCount_) % kInboxSize];
     inboxCount_++;
     d.origin = f.origin;
