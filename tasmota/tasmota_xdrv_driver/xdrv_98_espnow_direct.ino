@@ -200,7 +200,7 @@
 // The ESP-NOW mesh (xdrv_98_1_espnow_mesh.ino) rides on the radio of this driver when it is up: it hears the frames that are its own before this
 // driver looks at them, is told what became of the frame it was sending, and is told when ESP-NOW is started and stopped here
 bool EspNowMeshHearsFrame(const uint8_t* mac, int8_t rssi, const uint8_t* data, int len);
-bool EspNowMeshSendResult(bool ok);
+bool EspNowMeshSendResult(const uint8_t* mac, bool ok);
 void EspNowMeshDirectRadio(bool up);
 #endif
 
@@ -589,7 +589,7 @@ static void EspNowDirectHello(uint32_t session, uint32_t counter, const uint8_t*
 void EspNowDirectSendCb(const esp_now_send_info_t* info, esp_now_send_status_t status);
 void EspNowDirectSendCb(const esp_now_send_info_t* info, esp_now_send_status_t status) {
 #ifdef USE_ESPNOW_MESH
-  if (EspNowMeshSendResult(ESP_NOW_SEND_SUCCESS == status)) { return; }
+  if (EspNowMeshSendResult(info->des_addr, ESP_NOW_SEND_SUCCESS == status)) { return; }
 #endif
   if (ESP_NOW_SEND_SUCCESS == status) { return; }
 
@@ -760,6 +760,9 @@ static bool EspNowDirectRadioReady(void) {
 // the stack noted before this start is behind it.
 static bool EspNowDirectRadioStart(void) {
   EspNowDirect.radio_lost = false;
+#ifdef USE_ESPNOW_MESH
+  EspNowMeshDirectRadio(false);            // the mesh lets go of the radio, and of any send it has under way, before it is taken apart
+#endif
   esp_now_deinit();
 
   esp_err_t error = esp_now_init();
@@ -788,13 +791,13 @@ static bool EspNowDirectRadioStart(void) {
 
 static void EspNowDirectRadioStop(void) {
   if (!EspNowDirect.radio) { return; }
+#ifdef USE_ESPNOW_MESH
+  EspNowMeshDirectRadio(false);            // before the radio is taken apart, as at its start
+#endif
   esp_now_unregister_recv_cb();
   esp_now_unregister_send_cb();
   esp_now_deinit();
   EspNowDirect.radio = false;
-#ifdef USE_ESPNOW_MESH
-  EspNowMeshDirectRadio(false);
-#endif
 }
 
 // Follows the radio as the station comes and goes. Deliberately keyed off the

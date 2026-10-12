@@ -38,9 +38,19 @@
  * frames that are its own (the first byte of a mesh frame is not one of its types), tells it what became of
  * the frame it was sending, and tells it when ESP-NOW starts and stops, which are the hooks at the top of
  * xdrv_98. With the direct link not running the mesh starts ESP-NOW itself, and gives it up for the direct
- * link's when that starts. A frame the direct link sends while the mesh waits for the radio's word on its
- * own can have that word taken for the mesh's: a send is then counted as it was not, and the core handles
- * a send that is not acknowledged as it handles a lost frame.
+ * link's when that starts. The direct link tells the mesh before it deinitialises ESP-NOW, and the mesh stops using the radio and
+ * waits for a send it has under way to end: the radio has a lock, which the task holds while it sends, and the main loop while it
+ * takes ESP-NOW apart, and nothing is sent while the WiFi stack is stopped. The radio's word on a frame comes with the address the
+ * frame went to, which tells the mesh's frame from the direct link's when both send at once (two frames to the same address cannot be
+ * told apart); a send the mesh stopped waiting for after 20 ms has its late word counted, and not taken for another's. A send
+ * that is not acknowledged is handled by the core as it handles a lost frame.
+ *
+ * The radio's channel is the direct link's while its radio is up (EspNowChannel, or the station's): EspNowMeshChannel is the
+ * channel when the mesh has ESP-NOW to itself, and the two never move the radio against each other.
+ *
+ * ESP-NOW holds 20 peers. The mesh registers the broadcast address and each neighbour a unicast goes to; when the table is full the
+ * neighbour that has gone unused longest is given up to make room for the new one. The broadcast address, the peers of the direct
+ * link and a neighbour sent to in the last 3 s are never given up, and when no peer can go the frame does not either (PeerFull).
  *
  * Born off, like the direct link: EspNowMeshEnable 1 starts it, and it stays on across restarts
  * once the device has a number (EspNowMeshId), the key of the network (EspNowMeshGroupKey) and
@@ -87,7 +97,10 @@
  *   EspNowMeshSend <dest>,<type>,<ack 0|1>,<text or 0xHEX> - a frame; dest 255 is everyone; type 0 command, 2 state, 3 event; answers
  *                                {"Queued":1,"Counter":<ticket>}, or "busy" when the queue to the task is full, or "not running"
  *   EspNowMeshReady [0|1]      - whether the application is ready to take frames, as above
- *   EspNowMeshStatus           - the state of the task and the counters
+ *   EspNowMeshStatus           - the state of the task, and the counters that say how the frames fared
+ *   EspNowMeshStats [0|1]      - every counter, in two pages: 0 the frames and what the driver counts of its own (the queues, the
+ *                                radio's refusals, the late word of the radio, the peers given up), 1 the supervision, the sync, the
+ *                                lists in pieces and the network. All count from the start of the node
  *   EspNowMeshNeighbors [<first>] - the neighbours the heartbeats have given, six at a time
  *
  * And, in Berry, without the trip through the command handler:
@@ -121,6 +134,8 @@
 #define ESPNOW_MESH_TASK_STACK         6144
 #define ESPNOW_MESH_TASK_PRIORITY      5
 #define ESPNOW_MESH_SEND_WAIT_MS       20          // for the radio to say what became of a frame
+#define ESPNOW_MESH_LATE_WORD_MS       1000        // after which a word of the radio's that comes is no late word of a send that gave up
+#define ESPNOW_MESH_PEER_KEEP_MS       3000        // a peer sent to within this is not the one to give up when the radio's table is full
 #define ESPNOW_MESH_BEAT_MS            5000
 #define ESPNOW_MESH_SNAPSHOT_MS        500
 #define ESPNOW_MESH_SENDS_PER_TURN     4
@@ -269,6 +284,10 @@ static struct {
   volatile bool radio_lost = false;          // the WiFi stack stopped under ESP-NOW
   volatile bool awaiting = false;            // the task waits for the radio to say what became of a send
   volatile bool send_ok = false;
+  uint8_t send_to[6] = {0};                  // the address of the frame the task waits for the radio's word on
+  volatile bool late_pending = false;        // a send gave up waiting, and its word may still come
+  uint8_t late_to[6] = {0};
+  uint32_t late_at = 0;
   volatile bool config_dirty = false;
   uint32_t epoch_ahead = 0;                  // an epoch saved by a start that failed after it: no frame went under it, and the next start takes it
   volatile bool app_ready = true;            // the application has its rules registered: until it says so the frames for it are not taken
@@ -285,6 +304,7 @@ static struct {
   QueueHandle_t note = nullptr;              // the outcomes and the notices
   SemaphoreHandle_t send_done = nullptr;
   SemaphoreHandle_t lock = nullptr;          // the shared copy and the snapshot
+  SemaphoreHandle_t radio_lock = nullptr;    // the radio, between the task that sends and the main loop that takes ESP-NOW apart; made once, never freed
   TaskHandle_t task = nullptr;
 } EspNowMeshDriver;
 
@@ -294,6 +314,14 @@ static struct {
   volatile uint32_t evt_full = 0;            // turns of the task that found the queue to the main loop full: what the core had for the application waited in its inbox
   volatile uint32_t note_lost = 0;           // outcomes and notices the queue to the main loop had no room for: 0 unless the main loop stops
   volatile uint32_t refused = 0;             // sends the core refused
+  volatile uint32_t send_failed = 0;         // unicast sends ESP-NOW did not take
+  volatile uint32_t bcast_failed = 0;        // broadcasts it did not take, or whose address it would not register
+  volatile uint32_t peer_failed = 0;         // the address of a neighbour it would not register
+  volatile uint32_t peer_full = 0;           // one for which its table was full and none of its peers could be given up
+  volatile uint32_t peer_evicted = 0;        // peers given up to make room
+  volatile uint32_t wait_expired = 0;        // the wait for the radio's word on a frame ran out
+  volatile uint32_t late_word = 0;           // and the word came later
+  volatile uint32_t not_acked = 0;           // unicast sends the radio said the neighbour did not acknowledge
 } EspNowMeshCount;
 
 // What the task keeps of the frames it sent with an answer asked, for the outcome to say which send it is: the number a frame has on
@@ -472,14 +500,27 @@ static void EspNowMeshEnqueue(const uint8_t* mac, int8_t rssi, const uint8_t* da
   if (task) { xTaskNotifyGive(task); }
 }
 
-// The radio's word on the frame the task is sending. True when it was the task's to hear
-bool EspNowMeshSendResult(bool ok);
-bool EspNowMeshSendResult(bool ok) {
-  if (!EspNowMeshDriver.awaiting) { return false; }
-  EspNowMeshDriver.send_ok = ok;
-  EspNowMeshDriver.awaiting = false;
-  if (EspNowMeshDriver.send_done) { xSemaphoreGive(EspNowMeshDriver.send_done); }
-  return true;
+// The radio's word on a frame it was given, from the WiFi task, with the address the frame went to. True when the word was the task's to
+// hear: the one for the frame it is sending, or the late one for a frame it gave up waiting for, which no other sender is to take as its
+// own. The address is what tells the mesh's frame from the direct link's when both send at once; two frames to the same address cannot
+// be told apart, and are taken in the order the task sent them
+bool EspNowMeshSendResult(const uint8_t* mac, bool ok);
+bool EspNowMeshSendResult(const uint8_t* mac, bool ok) {
+  if (EspNowMeshDriver.awaiting && !memcmp(mac, EspNowMeshDriver.send_to, 6)) {
+    EspNowMeshDriver.send_ok = ok;
+    EspNowMeshDriver.awaiting = false;
+    if (EspNowMeshDriver.send_done) { xSemaphoreGive(EspNowMeshDriver.send_done); }
+    return true;
+  }
+  // A send the task stopped waiting for is answered late, within a second or so: that word is counted, and it is not the next send's
+  if (EspNowMeshDriver.late_pending && !memcmp(mac, EspNowMeshDriver.late_to, 6)) {
+    EspNowMeshDriver.late_pending = false;
+    if ((millis() - EspNowMeshDriver.late_at) < ESPNOW_MESH_LATE_WORD_MS) {
+      EspNowMeshCount.late_word++;
+      return true;
+    }
+  }
+  return false;
 }
 
 // The direct link's receive callback, first: true when the frame is the mesh's, whose first byte no direct frame has
@@ -500,38 +541,123 @@ void EspNowMeshRecvCb(const esp_now_recv_info_t* info, const uint8_t* data, int 
 
 void EspNowMeshSendCb(const esp_now_send_info_t* info, esp_now_send_status_t status);
 void EspNowMeshSendCb(const esp_now_send_info_t* info, esp_now_send_status_t status) {
-  (void)info;
-  EspNowMeshSendResult(ESP_NOW_SEND_SUCCESS == status);
+  EspNowMeshSendResult(info->des_addr, ESP_NOW_SEND_SUCCESS == status);
 }
 
 static bool EspNowMeshRadioReady(void) {
   return (WiFi.getMode() & WIFI_MODE_STA);
 }
 
+// The radio is the task's while it sends, and the main loop's while it takes ESP-NOW apart or puts peers in it: the one that has the
+// lock is the only one that touches the radio's peer table, sends, starts it or stops it. Held for the few milliseconds of a send
+static bool EspNowMeshRadioTake(uint32_t ms) {
+  return (nullptr == EspNowMeshDriver.radio_lock) || (pdTRUE == xSemaphoreTake(EspNowMeshDriver.radio_lock, pdMS_TO_TICKS(ms)));
+}
+
+static void EspNowMeshRadioGive(void) {
+  if (EspNowMeshDriver.radio_lock) { xSemaphoreGive(EspNowMeshDriver.radio_lock); }
+}
+
+// The peers the mesh has added to ESP-NOW, each with when a frame last went to it. The radio holds 20 at most, one of them the broadcast
+// address and one the direct link's, and neither of those is in this table: only a peer that is in it is given up. Under the radio's lock
+typedef struct {
+  uint8_t mac[6];
+  uint32_t used_at;
+  bool used;
+} EspNowMeshPeer_t;
+static EspNowMeshPeer_t EspNowMeshPeers[ESP_NOW_MAX_TOTAL_PEER_NUM];
+
+static int32_t EspNowMeshPeerFind(const uint8_t* mac) {
+  for (int32_t i = 0; i < ESP_NOW_MAX_TOTAL_PEER_NUM; i++) {
+    if (EspNowMeshPeers[i].used && !memcmp(EspNowMeshPeers[i].mac, mac, 6)) { return i; }
+  }
+  return -1;
+}
+
+// What it is worth to give a peer up, the largest going first, and 0 for one that is never to go. Today it is the time since a frame last
+// went to the peer, and a peer sent to within the last few seconds is never given up
+static uint32_t EspNowMeshPeerCost(const EspNowMeshPeer_t& peer, uint32_t now);
+static uint32_t EspNowMeshPeerCost(const EspNowMeshPeer_t& peer, uint32_t now) {
+  uint32_t idle = now - peer.used_at;
+  return (idle < ESPNOW_MESH_PEER_KEEP_MS) ? 0 : idle;
+}
+
+static int32_t EspNowMeshPeerVictim(uint32_t now) {
+  int32_t victim = -1;
+  uint32_t most = 0;
+  for (int32_t i = 0; i < ESP_NOW_MAX_TOTAL_PEER_NUM; i++) {
+    if (!EspNowMeshPeers[i].used) { continue; }
+    uint32_t cost = EspNowMeshPeerCost(EspNowMeshPeers[i], now);
+    if (cost > most) { most = cost; victim = i; }
+  }
+  return victim;
+}
+
+// The address of a neighbour is added when the first frame goes to it. When the table of the radio is full the peer that has gone unused
+// longest makes room for it, and when there is none that can go, the frame does not either. True when `to` is a peer now
+static bool EspNowMeshAddPeer(const uint8_t* to, uint32_t now);
+static bool EspNowMeshAddPeer(const uint8_t* to, uint32_t now) {
+  esp_now_peer_info_t peer = {};
+  memcpy(peer.peer_addr, to, 6);
+  peer.channel = 0;                          // the channel the radio is on, wherever it is
+  peer.ifidx = WIFI_IF_STA;
+  peer.encrypt = false;                      // the frames of the mesh are sealed by the mesh
+  esp_err_t error = esp_now_add_peer(&peer);
+  if (ESP_ERR_ESPNOW_FULL == error) {
+    int32_t victim = EspNowMeshPeerVictim(now);
+    if (victim < 0) {
+      EspNowMeshCount.peer_full++;
+      return false;
+    }
+    esp_now_del_peer(EspNowMeshPeers[victim].mac);
+    EspNowMeshPeers[victim].used = false;
+    EspNowMeshCount.peer_evicted++;
+    error = esp_now_add_peer(&peer);
+  }
+  if ((ESP_OK != error) && (ESP_ERR_ESPNOW_EXIST != error)) { return false; }
+  if (memcmp(to, EspNowMeshBroadcast, 6) && (ESP_ERR_ESPNOW_EXIST != error)) {
+    int32_t slot = EspNowMeshPeerFind(to);
+    for (int32_t i = 0; (slot < 0) && (i < ESP_NOW_MAX_TOTAL_PEER_NUM); i++) { if (!EspNowMeshPeers[i].used) { slot = i; } }
+    if (slot >= 0) {
+      memcpy(EspNowMeshPeers[slot].mac, to, 6);
+      EspNowMeshPeers[slot].used_at = now;
+      EspNowMeshPeers[slot].used = true;
+    }
+  }
+  return true;
+}
+
 // The broadcast address, with no key, on whatever channel the radio is on. The addresses of the neighbours are added when
 // the first frame goes to them
 static void EspNowMeshAddBroadcast(void) {
-  if (esp_now_is_peer_exist(EspNowMeshBroadcast)) { return; }
-  esp_now_peer_info_t peer = {};
-  memcpy(peer.peer_addr, EspNowMeshBroadcast, 6);
-  peer.channel = 0;
-  peer.ifidx = WIFI_IF_STA;
-  peer.encrypt = false;
-  esp_now_add_peer(&peer);
+  if (!EspNowMeshRadioTake(100)) { return; }
+  if (!esp_now_is_peer_exist(EspNowMeshBroadcast)) { EspNowMeshAddPeer(EspNowMeshBroadcast, millis()); }
+  EspNowMeshRadioGive();
 }
 
-// The direct link's driver started or stopped ESP-NOW. Its start leaves no peer behind, and the mesh's addresses are added again as
-// the frames go to them
+// The direct link's driver is about to stop or start ESP-NOW, or has: it deinitialises it, and starts it with no peer in it, so the mesh's
+// addresses are added again as the frames go to them. The mesh stops using the radio first, before the direct link touches it, and waits
+// for a send that is under way to end: a deinitialisation that comes in the middle of one is a fault, or a frame that is lost
 void EspNowMeshDirectRadio(bool up);
 void EspNowMeshDirectRadio(bool up) {
-  EspNowMeshDriver.direct_radio = up;
   if (up) {
+    EspNowMeshDriver.direct_radio = true;
     EspNowMeshDriver.own_radio = false;            // what the mesh had started was deinitialised by the direct link's start
     EspNowMeshDriver.radio_lost = false;
+    if (EspNowMeshRadioTake(100)) {
+      memset(EspNowMeshPeers, 0, sizeof(EspNowMeshPeers));
+      EspNowMeshRadioGive();
+    }
     if (EspNowMeshDriver.running || EspNowMeshSettings.enabled) { EspNowMeshAddBroadcast(); }
     EspNowMeshDriver.radio = true;
-  } else if (!EspNowMeshDriver.own_radio) {
+  } else {
+    EspNowMeshDriver.direct_radio = false;
     EspNowMeshDriver.radio = false;                // the mesh starts its own at the next second
+    EspNowMeshDriver.own_radio = false;            // and what it had started is the direct link's to deinitialise now
+    if (EspNowMeshRadioTake(2 * ESPNOW_MESH_SEND_WAIT_MS)) {         // the task is out of a send that was under way
+      memset(EspNowMeshPeers, 0, sizeof(EspNowMeshPeers));
+      EspNowMeshRadioGive();
+    }
   }
 }
 
@@ -560,7 +686,10 @@ static bool EspNowMeshRadioStart(void) {
 static void EspNowMeshRadioStop(void) {
   if (!EspNowMeshDriver.radio) { return; }
   EspNowMeshDriver.radio = false;
-  vTaskDelay(pdMS_TO_TICKS(2 * ESPNOW_MESH_SEND_WAIT_MS));   // the task is out of a send that was under way
+  if (EspNowMeshRadioTake(2 * ESPNOW_MESH_SEND_WAIT_MS)) {      // the task is out of a send that was under way, and starts none
+    memset(EspNowMeshPeers, 0, sizeof(EspNowMeshPeers));
+    EspNowMeshRadioGive();
+  }
   if (!EspNowMeshDriver.own_radio) { return; }     // the direct link's radio stays as it is
   EspNowMeshDriver.own_radio = false;
   // esp_now_deinit() faults when the WiFi stack is not there
@@ -572,9 +701,10 @@ static void EspNowMeshRadioStop(void) {
 }
 
 // The radio goes to the configured channel when the station is not associated. With the station associated, the access
-// point's channel is the channel
+// point's channel is the channel. With the direct link's radio up the channel is the direct link's (EspNowChannel, or the station's): it
+// moves the radio and starts ESP-NOW again when it changes, and a second channel that moved it back would be a fight every second
 static void EspNowMeshApplyChannel(void) {
-  if (!EspNowMeshSettings.channel) { return; }
+  if (!EspNowMeshSettings.channel || EspNowMeshDriver.direct_radio) { return; }
   wifi_ap_record_t ap;
   if (ESP_OK == esp_wifi_sta_get_ap_info(&ap)) { return; }
   // The station keeps trying a saved network, or a scan runs: the radio is not moved under them
@@ -589,33 +719,54 @@ static void EspNowMeshApplyChannel(void) {
   }
 }
 
-// One frame, to one address, and the radio's word on it. A unicast the other side did not acknowledge says so; a broadcast never
-// does, and counts as sent
-static bool EspNowMeshRadioSend(const uint8_t* to, const uint8_t* frame, size_t len) {
-  if (!EspNowMeshDriver.radio) { return false; }
+// With the radio's lock: the peer, the send and the wait for the radio's word, none of which the main loop takes apart under it
+static bool EspNowMeshRadioSendLocked(const uint8_t* to, const uint8_t* frame, size_t len);
+static bool EspNowMeshRadioSendLocked(const uint8_t* to, const uint8_t* frame, size_t len) {
+  uint32_t now = millis();
+  bool broadcast = !memcmp(to, EspNowMeshBroadcast, 6);
   if (!esp_now_is_peer_exist(to)) {
-    esp_now_peer_info_t peer = {};
-    memcpy(peer.peer_addr, to, 6);
-    peer.channel = 0;
-    peer.ifidx = WIFI_IF_STA;
-    peer.encrypt = false;
-    if (ESP_OK != esp_now_add_peer(&peer)) { return false; }
+    if (!EspNowMeshAddPeer(to, now)) {
+      if (broadcast) { EspNowMeshCount.bcast_failed++; } else { EspNowMeshCount.peer_failed++; }
+      return false;
+    }
+  } else if (!broadcast) {
+    int32_t slot = EspNowMeshPeerFind(to);       // a peer of the direct link's is not in the table, and is never given up
+    if (slot >= 0) { EspNowMeshPeers[slot].used_at = now; }
   }
   // A word from an earlier send that came late is not this one's: the semaphore is emptied before the send is armed
   xSemaphoreTake(EspNowMeshDriver.send_done, 0);
   EspNowMeshDriver.send_ok = false;
+  memcpy(EspNowMeshDriver.send_to, to, 6);
   EspNowMeshDriver.awaiting = true;
   if (ESP_OK != esp_now_send(to, frame, len)) {
     EspNowMeshDriver.awaiting = false;
     xSemaphoreTake(EspNowMeshDriver.send_done, 0);
+    if (broadcast) { EspNowMeshCount.bcast_failed++; } else { EspNowMeshCount.send_failed++; }
     return false;
   }
   if (pdTRUE != xSemaphoreTake(EspNowMeshDriver.send_done, pdMS_TO_TICKS(ESPNOW_MESH_SEND_WAIT_MS))) {
     EspNowMeshDriver.awaiting = false;       // no word: not acknowledged
     xSemaphoreTake(EspNowMeshDriver.send_done, 0);
+    EspNowMeshCount.wait_expired++;
+    memcpy(EspNowMeshDriver.late_to, to, 6);
+    EspNowMeshDriver.late_at = millis();
+    EspNowMeshDriver.late_pending = true;    // the word may still come: it is this send's
     return false;
   }
+  if (!EspNowMeshDriver.send_ok && !broadcast) { EspNowMeshCount.not_acked++; }
   return EspNowMeshDriver.send_ok;
+}
+
+// One frame, to one address, and the radio's word on it. A unicast the other side did not acknowledge says so; a broadcast never
+// does, and counts as sent. Nothing goes while the radio is not there: the direct link has it apart, or the WiFi stack stopped under it
+static bool EspNowMeshRadioSend(const uint8_t* to, const uint8_t* frame, size_t len) {
+  if (!EspNowMeshDriver.radio || EspNowMeshDriver.radio_lost) { return false; }
+  if (!EspNowMeshRadioTake(100)) { return false; }
+  bool ok = false;
+  // The radio is looked at again with the lock: what took it apart has it first, and puts nothing back before it gives it up
+  if (EspNowMeshDriver.radio && !EspNowMeshDriver.radio_lost) { ok = EspNowMeshRadioSendLocked(to, frame, len); }
+  EspNowMeshRadioGive();
+  return ok;
 }
 
 /*********************************************************************************************\
@@ -1049,6 +1200,15 @@ static bool EspNowMeshStartAttempt(void) {
   EspNowMeshCount.evt_full = 0;
   EspNowMeshCount.note_lost = 0;
   EspNowMeshCount.refused = 0;
+  EspNowMeshCount.send_failed = 0;
+  EspNowMeshCount.bcast_failed = 0;
+  EspNowMeshCount.peer_failed = 0;
+  EspNowMeshCount.peer_full = 0;
+  EspNowMeshCount.peer_evicted = 0;
+  EspNowMeshCount.wait_expired = 0;
+  EspNowMeshCount.late_word = 0;
+  EspNowMeshCount.not_acked = 0;
+  EspNowMeshDriver.late_pending = false;
   EspNowMeshDriver.dropped = 0;
 
   if (!EspNowMeshDriver.crypto->Begin(EspNowMeshSettings.secret)) {
@@ -1482,18 +1642,70 @@ void CmndEspNowMeshStatus(void) {
   uint8_t channel = 0;
   wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
   esp_wifi_get_channel(&channel, &second);
-  Response_P(PSTR("{\"EspNowMeshStatus\":{\"Running\":%u,\"Id\":%u,\"Epoch\":%u,\"Mac\":\"%s\",\"Channel\":%u,\"Group\":%u,\"GroupVersion\":%u,\"Network\":%u,\"Radio\":%u,\"Dropped\":%u,\"Heap\":%u"),
+  esp_now_peer_num_t peers = {0, 0};
+  esp_now_get_peer_num(&peers);
+  Response_P(PSTR("{\"EspNowMeshStatus\":{\"Running\":%u,\"Id\":%u,\"Epoch\":%u,\"Mac\":\"%s\",\"Channel\":%u,\"Group\":%u,\"GroupVersion\":%u,\"Network\":%u,\"Radio\":%u,\"Ready\":%u,\"Dropped\":%u,\"Peers\":%d,\"Heap\":%u"),
     EspNowMeshDriver.running, EspNowMeshSettings.id, EspNowMeshSettings.epoch, mac, channel, EspNowMeshSettings.has_group, EspNowMeshSettings.group_version,
-    EspNowMeshSettings.network, EspNowMeshDriver.radio, EspNowMeshDriver.dropped, ESP_getFreeHeap());
+    EspNowMeshSettings.network, EspNowMeshDriver.radio, EspNowMeshDriver.app_ready, EspNowMeshDriver.dropped, peers.total_num, ESP_getFreeHeap());
   if (snap) {
     const EspNowMesh::Stats& s = snap->stats;
     ResponseAppend_P(PSTR(",\"Neighbors\":%u,\"Queued\":%u,\"Waiting\":%u,\"Noisy\":%u,\"Loss\":%u,\"NetUp\":%u,\"Stack\":%u,\"Silent\":%u,"
-                          "\"Heard\":%u,\"Bad\":%u,\"Repeated\":%u,\"Delivered\":%u,\"SentOwn\":%u,\"SentRelay\":%u,\"Suppressed\":%u,"
-                          "\"AcksSent\":%u,\"AcksHeard\":%u,\"Resent\":%u,\"GaveUp\":%u,\"HopFailed\":%u,\"SyncDone\":%u,\"Beats\":%u,\"Rescued\":%u,\"CipherBad\":%u,\"UdpSent\":%u,\"UdpHeard\":%u"),
+                          "\"Heard\":%u,\"Bad\":%u,\"Repeated\":%u,\"Replayed\":%u,\"Stale\":%u,\"Unsynced\":%u,\"Covered\":%u,\"Delivered\":%u,\"InboxFull\":%u,"
+                          "\"SentOwn\":%u,\"SentRelay\":%u,\"Suppressed\":%u,\"QueueFull\":%u,\"NoRoute\":%u,\"NoKey\":%u,"
+                          "\"AcksSent\":%u,\"AcksHeard\":%u,\"Resent\":%u,\"GaveUp\":%u,\"HopFailed\":%u,\"SyncDone\":%u,\"SyncShed\":%u,\"Beats\":%u,\"Rescued\":%u,\"CipherBad\":%u,\"UdpSent\":%u,\"UdpHeard\":%u"),
       snap->neighbors, snap->queued, snap->waiting, snap->noisy, snap->loss, snap->net_up, snap->stack_free, snap->silent_count,
-      s.heard, s.bad, s.repeated, s.delivered, s.sentOwn, s.sentRelay, s.suppressed,
-      s.acksSent, s.acksHeard, s.resent, s.gaveUp, s.hopFailed, s.syncDone, s.beatsHeard, s.rescued, s.cipherBad, s.udpSent, s.udpHeard);
+      s.heard, s.bad, s.repeated, s.replayed, s.stale, s.unsynced, s.covered, s.delivered, s.inboxFull,
+      s.sentOwn, s.sentRelay, s.suppressed, s.queueFull, s.noRoute, s.noKey,
+      s.acksSent, s.acksHeard, s.resent, s.gaveUp, s.hopFailed, s.syncDone, s.syncShed, s.beatsHeard, s.rescued, s.cipherBad, s.udpSent, s.udpHeard);
     xSemaphoreGive(EspNowMeshDriver.lock);
+  }
+  ResponseAppend_P(PSTR("}}"));
+}
+
+// Every counter, which does not fit a response with the state, in two pages: the frames and the driver's own (page 0), and the supervision,
+// the sync, the lists in pieces and the network (page 1). The core's counters are those of the snapshot, up to half a second old, and
+// count from the start of the node, as the driver's do
+void CmndEspNowMeshStats(void) {
+  uint32_t page = XdrvMailbox.data_len ? atoi(XdrvMailbox.data) : 0;
+  if (page > 1) { ResponseCmndChar_P(PSTR("page 0 or 1")); return; }
+  const EspNowMeshSnapshot_t* snap = nullptr;
+  if (EspNowMeshDriver.running && EspNowMeshDriver.snapshot && (pdTRUE == xSemaphoreTake(EspNowMeshDriver.lock, pdMS_TO_TICKS(50)))) {
+    snap = EspNowMeshDriver.snapshot;
+  }
+  Response_P(PSTR("{\"%s\":{\"Page\":%u,\"Running\":%u"), XdrvMailbox.command, page, EspNowMeshDriver.running);
+  if (snap) {
+    const EspNowMesh::Stats& s = snap->stats;
+    if (0 == page) {
+      ResponseAppend_P(PSTR(",\"Heard\":%u,\"Bad\":%u,\"Repeated\":%u,\"Replayed\":%u,\"Stale\":%u,\"Unsynced\":%u,\"Covered\":%u,\"Delivered\":%u,\"InboxFull\":%u,"
+                            "\"SentOwn\":%u,\"SentRelay\":%u,\"Suppressed\":%u,\"QueueFull\":%u,\"NoRoute\":%u,\"NoKey\":%u,\"CipherBad\":%u,"
+                            "\"AcksSent\":%u,\"AcksHeard\":%u,\"Resent\":%u,\"GaveUp\":%u,\"HopFailed\":%u"),
+        s.heard, s.bad, s.repeated, s.replayed, s.stale, s.unsynced, s.covered, s.delivered, s.inboxFull,
+        s.sentOwn, s.sentRelay, s.suppressed, s.queueFull, s.noRoute, s.noKey, s.cipherBad,
+        s.acksSent, s.acksHeard, s.resent, s.gaveUp, s.hopFailed);
+    } else {
+      ResponseAppend_P(PSTR(",\"SyncAsked\":%u,\"SyncDone\":%u,\"SyncBad\":%u,\"SyncShed\":%u,\"StartAsks\":%u,"
+                            "\"BeatsSent\":%u,\"BeatsHeard\":%u,\"Pings\":%u,\"Probes\":%u,\"Rescued\":%u,\"VerdictsSent\":%u,\"VerdictsHeard\":%u,\"NoiseSent\":%u,\"KeptAsOnlyWay\":%u,"
+                            "\"PartsSent\":%u,\"PiecesSent\":%u,\"PiecesNew\":%u,\"PiecesRepeated\":%u,\"NaksSent\":%u,\"BulkDone\":%u,\"BulkLost\":%u,"
+                            "\"UdpSent\":%u,\"UdpHeard\":%u"),
+        s.syncAsked, s.syncDone, s.syncBad, s.syncShed, s.startAsks,
+        s.beatsSent, s.beatsHeard, s.pings, s.probes, s.rescued, s.verdictsSent, s.verdictsHeard, s.noiseSent, s.keptAsOnlyWay,
+        s.partsSent, s.piecesSent, s.piecesNew, s.piecesRepeated, s.naksSent, s.bulkDone, s.bulkLost,
+        s.udpSent, s.udpHeard);
+    }
+    xSemaphoreGive(EspNowMeshDriver.lock);
+  }
+  if (0 == page) {
+    // What happens around the core, that the core cannot count: the queues of the driver, the radio's refusals, the late word, the peers
+    ResponseAppend_P(PSTR(",\"Dropped\":%u,\"CmdBusy\":%u,\"EvtFull\":%u,\"NoteLost\":%u,\"Refused\":%u,"
+                          "\"SendFailed\":%u,\"BcastFailed\":%u,\"NotAcked\":%u,\"WaitExpired\":%u,\"LateWord\":%u,"
+                          "\"PeerFailed\":%u,\"PeerFull\":%u,\"PeerEvicted\":%u"),
+      EspNowMeshDriver.dropped, EspNowMeshCount.cmd_busy, EspNowMeshCount.evt_full, EspNowMeshCount.note_lost, EspNowMeshCount.refused,
+      EspNowMeshCount.send_failed, EspNowMeshCount.bcast_failed, EspNowMeshCount.not_acked, EspNowMeshCount.wait_expired, EspNowMeshCount.late_word,
+      EspNowMeshCount.peer_failed, EspNowMeshCount.peer_full, EspNowMeshCount.peer_evicted);
+    nvs_stats_t nvs;
+    if (ESP_OK == nvs_get_stats(nullptr, &nvs)) {
+      ResponseAppend_P(PSTR(",\"NvsUsed\":%u,\"NvsTotal\":%u"), (uint32_t)nvs.used_entries, (uint32_t)nvs.total_entries);
+    }
   }
   ResponseAppend_P(PSTR("}}"));
 }
@@ -1642,10 +1854,10 @@ static void EspNowMeshBerryCheck(void) {
 
 const char kEspNowMeshCommands[] PROGMEM = "|"
   "EspNowMeshEnable|EspNowMeshId|EspNowMeshChannel|EspNowMeshGroupKey|EspNowMeshNode|EspNowMeshPublic|EspNowMeshNetwork|"
-  "EspNowMeshInfo|EspNowMeshSend|EspNowMeshStatus|EspNowMeshNeighbors|EspNowMeshReady";
+  "EspNowMeshInfo|EspNowMeshSend|EspNowMeshStatus|EspNowMeshNeighbors|EspNowMeshReady|EspNowMeshStats";
 void (* const kEspNowMeshCommand[])(void) PROGMEM = {
   &CmndEspNowMeshEnable, &CmndEspNowMeshId, &CmndEspNowMeshChannel, &CmndEspNowMeshGroupKey, &CmndEspNowMeshNode, &CmndEspNowMeshPublic,
-  &CmndEspNowMeshNetwork, &CmndEspNowMeshInfo, &CmndEspNowMeshSend, &CmndEspNowMeshStatus, &CmndEspNowMeshNeighbors, &CmndEspNowMeshReady };
+  &CmndEspNowMeshNetwork, &CmndEspNowMeshInfo, &CmndEspNowMeshSend, &CmndEspNowMeshStatus, &CmndEspNowMeshNeighbors, &CmndEspNowMeshReady, &CmndEspNowMeshStats };
 
 /*********************************************************************************************\
  * Interface
@@ -1657,6 +1869,7 @@ bool Xdrv100(uint32_t function) {
   switch (function) {
     case FUNC_PRE_INIT:
       EspNowMeshSettingsLoad();
+      EspNowMeshDriver.radio_lock = xSemaphoreCreateMutex();
       break;
     case FUNC_INIT:
       WiFi.onEvent(EspNowMeshWifiEvent);
