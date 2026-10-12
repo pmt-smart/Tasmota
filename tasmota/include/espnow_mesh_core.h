@@ -65,7 +65,8 @@
  * once more after 100 ms more; without an answer 100 ms after that, it reports the failure. The
  * destination answers every attempt it hears, as soon as it hears it, and delivers the frame to
  * its application with a flag when the number was delivered before, so that the application
- * executes a number once. Nothing is sent that is not either confirmed or reported.
+ * executes a number once. A frame its application has no room for is not taken at all: no answer goes, and no window moves, so that
+ * the sender's next attempt finds it as it was. Nothing is sent that is not either confirmed or reported.
  *
  * Replay: a node keeps, for each origin, the highest epoch and counter accepted and a window
  * of 32 counters behind it, one bit each. A counter already seen, one behind the window and
@@ -74,7 +75,9 @@
  * carries the origin's epoch and counter and a proof of the nonce. An epoch above the kept
  * one makes the origin unsynchronised again, because a start of the origin is the moment a
  * recorded frame of one of its earlier epochs could be played back. A frame that repeats a
- * number with a higher attempt is a retransmission: it is repeated, and delivered as one. A frame that comes after
+ * number with a higher attempt is a retransmission: it is repeated, and delivered as one. The numbers an origin had used when it told where it
+ * was are covered: a first attempt of one of them is a frame sent before, or a recording, and is not taken, while a later attempt is, as new.
+ * A frame that comes after
  * newer ones of the same origin, inside the window, is delivered with how many numbers behind it is, for the application
  * to order what it keeps by: a command resent after a newer one, or one held and let go, is not the newest word.
  *
@@ -86,9 +89,13 @@
  * without the neighbour's software; failing that it asks two other neighbours that hear it to do
  * the same, and only when none of them has an answer within a longer wait is the neighbour
  * declared silent, to everyone, in a frame that is flooded. A silent node heard again is back.
+ * A node that has just started asks everyone where they are, once, after a wait that its number and a draw set, so that a network whose nodes
+ * start together does not have them all ask at once; the answers to the asks a node hears go out at a limited rate, and what is still
+ * unknown after that is asked of the origins one by one, less often each time.
  * A node that has heard two copies of a frame it was waiting to repeat still repeats it when it
  * is the only way to one of its neighbours, which the neighbours' lists tell. A neighbour that
- * does not list this node among the ones it hears is not a way to anywhere. The heartbeats that
+ * does not list this node among the ones it hears is not a way to anywhere, which is concluded only from its second heartbeat since it
+ * was made known here, for the first of them can list no one. The heartbeats that
  * fail to arrive from strong neighbours, the unicasts the radio does not get acknowledged and the
  * frames nobody answers are counted, and a minute of too many of them, twice running, is a noisy
  * channel, said to everyone.
@@ -155,7 +162,14 @@ constexpr uint32_t kAnswerWaitMs = 100;      // between an attempt and the next,
 constexpr uint8_t kMaxAttempt = 2;           // the attempt that is the last: 0, 1 and 2
 constexpr unsigned kHopTries = 3;            // times a routed hop is handed to the radio
 constexpr uint32_t kSyncWaitMs = 2000;       // an exchange that has had no answer by then is given up
-constexpr uint32_t kSyncAskEveryMs = 1000;   // the least between two asks to the same origin
+constexpr uint32_t kSyncAskEveryMs = 1000;   // the time after the first ask to an origin that is not known, which doubles at each ask after it, up to 16 times as much
+constexpr uint8_t kFloodAskAfter = 2;        // the asks to an origin that go the way back, before they are flooded
+constexpr unsigned kStartSlots = 32;         // the numbers that ask at different times when a node starts: a number above this goes round
+constexpr uint16_t kStartSlotMs = 250;       // how much later than the number before it a number asks, at start
+constexpr uint16_t kStartJitterMs = 250;     // a draw added to that, so that two nodes of the same slot part
+constexpr uint32_t kStartGiveUpMs = 10000;   // an ask at start that has found no room or no key by then is given up
+constexpr uint8_t kAnswersPerSecond = 8;     // the answers to asks that a node sends in a second, at the most; 255 sets no limit
+constexpr uint32_t kAnswerHoldMs = 1500;     // an answer that the limit would hold for longer than this is not sent: the exchange it answers has ended
 constexpr uint32_t kBeatJitterMs = 500;      // added to the time between two heartbeats, so that nodes that started together part
 constexpr uint32_t kSuspectAfterMs = 15000;  // a neighbour not heard for this long is suspected
 constexpr uint32_t kSuspectJitterMs = 2000;  // added to it, a different time for each neighbour of each node
@@ -335,7 +349,7 @@ struct Stats {
   uint32_t partsSent, piecesSent, piecesNew, piecesRepeated, naksSent, bulkDone, bulkLost;
   uint32_t noKey, cipherBad;
   uint32_t udpSent, udpHeard;
-  uint32_t covered;
+  uint32_t covered, syncShed, startAsks;
 };
 
 // How a neighbour stands: heard lately, not heard and being tried, or declared silent by this node
@@ -392,6 +406,10 @@ struct Config {
   bool udpRelay;                               // this node repeats on the network what it repeats on the radio, for the nodes that have no radio
   uint32_t beatEveryMs;                        // the time between heartbeats; 0: no heartbeats, and no supervision
   uint8_t noiseLimit;                          // the percent lost that makes a minute a noisy one; 0 for the default
+  bool noStartSync;                            // this node does not ask the network where its nodes are when it starts: it is told as it hears them
+  uint16_t startSlotMs;                        // 0 for the default
+  uint16_t startJitterMs;                      // 0 for the default
+  uint8_t answersPerSecond;                    // 0 for the default; 255 for no limit
 };
 
 class Node {
@@ -402,6 +420,9 @@ class Node {
     if (cfg_.weakDbm == 0) cfg_.weakDbm = -70;
     if (cfg_.suppressAt == 0) cfg_.suppressAt = 2;
     if (cfg_.noiseLimit == 0) cfg_.noiseLimit = kNoiseLimit;
+    if (cfg_.startSlotMs == 0) cfg_.startSlotMs = kStartSlotMs;
+    if (cfg_.startJitterMs == 0) cfg_.startJitterMs = kStartJitterMs;
+    if (cfg_.answersPerSecond == 0) cfg_.answersPerSecond = kAnswersPerSecond;
   }
 
   // The application hands over a frame for `dest` (kToAll for everyone), to be flooded. Returns its counter, or 0.
@@ -518,10 +539,10 @@ class Node {
       g.len = (size_t)pn;
     }
     if (f.type() == kSync) {
-      Learn(o, src, reach, udp, forMe && g.len >= 1 && g.payload[0] == kSyncAsk && NodeOf(src) == f.origin);
+      Learn(o, src, reach, udp, forMe && g.len >= 1 && g.payload[0] == kSyncAsk);
       Remember(f.origin, f.epoch, f.counter, f.attempt(), src);
       // an origin that asks from an epoch above the one kept has started again: it is asked in its turn, before its first data frame
-      if (f.epoch > o->epoch && o->synced) o->synced = false;
+      if (f.epoch > o->epoch && o->synced) { o->synced = false; o->asked = false; o->asks = 0; }
       return OnSync(g, data, n, rssi, now, forMe, NodeOf(src));
     }
     bool known = false;                        // this number has been delivered before
@@ -531,7 +552,7 @@ class Node {
     // from it when this node has none, because the sync exchange goes that way
     if (!o->synced) { if (!o->routed) Learn(o, src, reach, udp); stats_.unsynced++; return kNeedsSync; }
     if (f.epoch < o->epoch) { stats_.stale++; return kStale; }
-    if (f.epoch > o->epoch) { o->synced = false; if (!o->routed) Learn(o, src, reach, udp); stats_.unsynced++; return kNeedsSync; }
+    if (f.epoch > o->epoch) { o->synced = false; o->asked = false; o->asks = 0; if (!o->routed) Learn(o, src, reach, udp); stats_.unsynced++; return kNeedsSync; }
     // where the number stands against the window, which is not moved before the frame is taken
     bool ahead = f.counter > o->highest;
     uint32_t back = 0;
@@ -603,6 +624,8 @@ class Node {
       return;
     }
     o->synced = true;
+    o->asked = false;
+    o->asks = 0;
     o->epoch = epoch;
     o->highest = counter;
     o->seen = 0;
@@ -611,8 +634,9 @@ class Node {
   }
 
   // Asks `target` (or everyone, kToAll) where it is: its epoch and counter, with a proof, which is the
-  // way an origin becomes known. Returns false if there was no room for another exchange
-  bool RequestSync(uint8_t target, uint32_t now) {
+  // way an origin becomes known. It goes the way back to `target` when this node has one, and by flooding when it has not, or when
+  // `flood` says the way back has failed. Returns false if there was no room for another exchange
+  bool RequestSync(uint8_t target, uint32_t now, bool flood = false) {
     SyncAsk *a = nullptr;
     for (unsigned i = 0; i < kSyncSize; i++) if (asks_[i].used && asks_[i].target == target) a = &asks_[i];
     for (unsigned i = 0; a == nullptr && i < kSyncSize; i++) if (!asks_[i].used) a = &asks_[i];
@@ -625,7 +649,7 @@ class Node {
     p[0] = kSyncAsk;
     Put32(p + 1, a->nonce);
     Origin *t = target != kToAll ? FindOrigin(target, false) : nullptr;
-    uint32_t sent = t != nullptr && t->routed ? SendRouted(kSync, target, p, sizeof(p), now) : Send(kSync, target, p, sizeof(p), false, now);
+    uint32_t sent = !flood && t != nullptr && t->routed ? SendRouted(kSync, target, p, sizeof(p), now) : Send(kSync, target, p, sizeof(p), false, now);
     if (sent == 0) { a->used = false; return false; }
     stats_.syncAsked++;
     return true;
@@ -678,13 +702,23 @@ class Node {
       stats_.resent++;
     }
     for (unsigned i = 0; i < kSyncSize; i++) if (asks_[i].used && (int32_t)(now - asks_[i].until) >= 0) asks_[i].used = false;
-    bool everyone = false;
+    // The asks to single origins wait for the ask at start: it asks them all at once, and what is left unanswered is for them to do after it
+    bool everyone = !cfg_.noStartSync && !startDone_;
+    if (everyone) StartSync(now);
     for (unsigned i = 0; i < kSyncSize; i++) if (asks_[i].used && asks_[i].target == kToAll) everyone = true;
     for (unsigned i = 0; i < kMaxOrigins && !everyone; i++) {
       Origin &o = origins_[i];
-      if (!o.used || o.synced || !o.routed) continue;
-      if (o.asked && (int32_t)(now - o.askedAt) < (int32_t)kSyncAskEveryMs) continue;
-      if (RequestSync(o.id, now)) { o.asked = true; o.askedAt = now; }
+      if (!o.used || o.synced) continue;
+      // asked again after 2 s, then 4, 8 and 16 (and every 16): the first two asks go the way back, and from the third on they are flooded, for
+      // a node on the way back that has no way on would drop them all
+      uint32_t every = kSyncAskEveryMs << (o.asks < 4 ? o.asks : 4);
+      if (o.asked && (int32_t)(now - o.askedAt) < (int32_t)every) continue;
+      if (RequestSync(o.id, now, o.asks >= kFloodAskAfter)) {
+        // the time to the next is stretched by a draw, so that the asks of nodes that began together do not come in waves
+        o.asked = true;
+        o.askedAt = now + (cfg_.random != nullptr ? cfg_.random(cfg_.context) % (every / 2 + 1) : 0);
+        if (o.asks < 255) o.asks++;
+      }
     }
     if (cfg_.beatEveryMs != 0) Supervise(now);
     for (unsigned i = 0; i < kBulkInSize; i++) {
@@ -845,8 +879,8 @@ class Node {
  private:
   // `covered`: a bit for each of the 32 numbers up to `highest` that the origin had used when it said where it was, to the sync
   // that made it known: what is heard with one of them, as a first attempt, is a frame sent before, or a copy of one, and is not taken.
-  // `beats`: the heartbeats of the origin heard since then, up to 255
-  struct Origin { bool used; bool synced; bool routed; bool viaUdp; bool asked; uint8_t id; uint8_t routeHops; uint8_t beats; uint8_t via[6]; uint32_t epoch; uint32_t highest; uint32_t seen; uint32_t covered; uint32_t askedAt; };
+  // `beats`: the heartbeats of the origin heard since then, up to 255. `asks`: the asks to it since it was last known, up to 255
+  struct Origin { bool used; bool synced; bool routed; bool viaUdp; bool asked; uint8_t id; uint8_t routeHops; uint8_t beats; uint8_t asks; uint8_t via[6]; uint32_t epoch; uint32_t highest; uint32_t seen; uint32_t covered; uint32_t askedAt; };
   struct Seen { bool used; bool hasFrom; uint8_t origin; uint8_t attempt; uint32_t epoch; uint32_t counter; uint8_t from[6]; };
   // `from` are the neighbours a flooded frame waiting to be repeated was heard from, for the first two copies;
   // `pingTarget` and `pingAsker` mark a ping: whom it tries, and for whom (0: for this node)
@@ -874,6 +908,9 @@ class Node {
   struct BulkIn { bool used; bool done; uint8_t origin; uint8_t total; uint8_t naks; uint16_t id; uint32_t have; uint32_t lastAt; };
   BulkIn bulkIn_[kBulkInSize];
   bool udpUp_;
+  bool startArmed_, startDone_;                // the ask at start: its time is set, and it has gone or been given up
+  uint32_t startAt_;
+  uint32_t answerAt_;                          // the time the next answer to an ask may go
   Neighbor nbrs_[kMaxNeighbors];
   Mute mutes_[kMaxOrigins];
   Notice notices_[kNoticeSize];
@@ -901,10 +938,10 @@ class Node {
   // The neighbour a frame of this origin was heard from is the way back to it, unless that neighbour does not hear this node. A way is
   // replaced only by one as near, by the hops the frame had left when it was heard: the ways kept lead nearer the origin at every hop,
   // so that a frame sent along them cannot go round or run out. A way that fails is demoted, and the next frame heard gives another
-  // `direct`: the frame is an ask that came from its origin itself, and the answer goes back to it that way whatever its heartbeat lists:
-  // the origin that has not yet had this node's answer to its own ask does not list this node, and would never be answered
-  void Learn(Origin *o, const uint8_t src[6], uint8_t hops, bool udp, bool direct = false) {
-    if (!direct && !udp && OneWay(src)) return;
+  // `ask`: the frame is an ask for this node, and the answer goes back the way it came whatever the heartbeat of the neighbour it came from
+  // lists: a neighbour that has not yet had this node's answer to its own ask does not list this node, and the node would never answer
+  void Learn(Origin *o, const uint8_t src[6], uint8_t hops, bool udp, bool ask = false) {
+    if (!ask && !udp && OneWay(src)) return;
     if (o->routed && hops < o->routeHops) return;
     o->routed = true;
     o->viaUdp = udp;
@@ -1243,16 +1280,26 @@ class Node {
   // The sync exchange. It has no replay window of its own: a frame of it is a copy or it is handled, and an answer
   // counts only for the exchange this node started, with its nonce
   Verdict OnSync(const Frame &f, const uint8_t *data, size_t n, int8_t rssi, uint32_t now, bool forMe, uint8_t from) {
+    uint32_t wait = 0;
     if (forMe && f.len >= 5 && f.payload[0] == kSyncAsk && f.origin != cfg_.id) {
-      uint8_t a[21];
-      a[0] = kSyncAnswer;
-      memcpy(a + 1, f.payload + 1, 4);
-      Put32(a + 5, cfg_.epoch);
-      Put32(a + 9, counter_);
-      memset(a + 13, 0, 8);
-      if (cfg_.proof != nullptr) cfg_.proof(cfg_.proofContext, f.origin, Get32(f.payload + 1), cfg_.epoch, counter_, a + 13);
-      // every node that hears a flooded ask answers it: a few milliseconds apart, so that the answers do not meet on the way back
-      SendRouted(kSync, f.origin, a, cfg_.proof != nullptr ? 21 : 13, now, cfg_.random != nullptr ? cfg_.random(cfg_.context) % 16 : 0);
+      if (!AnswerSlot(now, &wait)) {
+        stats_.syncShed++;
+      } else {
+        uint8_t a[21];
+        a[0] = kSyncAnswer;
+        memcpy(a + 1, f.payload + 1, 4);
+        Put32(a + 5, cfg_.epoch);
+        Put32(a + 9, counter_);
+        memset(a + 13, 0, 8);
+        if (cfg_.proof != nullptr) cfg_.proof(cfg_.proofContext, f.origin, Get32(f.payload + 1), cfg_.epoch, counter_, a + 13);
+        // every node that hears a flooded ask answers it: a few milliseconds apart, and no faster than the limit lets, so that the answers
+        // do not meet on the way back
+        size_t an = cfg_.proof != nullptr ? 21 : 13;
+        uint32_t spread = wait + (cfg_.random != nullptr ? cfg_.random(cfg_.context) % 16 : 0);
+        // with no way back to the asker, which a neighbour that does not list this node yet may have kept this node from learning, the
+        // answer is flooded to it
+        if (SendRouted(kSync, f.origin, a, an, now, spread) == 0) Queue(kSync, f.origin, a, an, false, kMaxHops, now);
+      }
     } else if (forMe && f.dest == cfg_.id && f.len >= 13 && f.payload[0] == kSyncAnswer) {
       uint32_t nonce = Get32(f.payload + 1);
       for (unsigned i = 0; i < kSyncSize; i++) {
@@ -1279,6 +1326,42 @@ class Node {
     }
     Pass(f, data, n, rssi, now, from);
     return kAccepted;
+  }
+
+  // --- the start ---------------------------------------------------------------------------------
+
+  // When a node starts it asks everyone, once, where they are. A network whose nodes start together, after the power has been out, would have
+  // them all ask in the same moments, and every node answers every ask: the answers would meet on the air and most be lost. So each node waits
+  // first, a time that depends on the place its number has among kStartSlots, and a draw. An ask that cannot go (no room, no key yet) is
+  // tried again until kStartGiveUpMs
+  void StartSync(uint32_t now) {
+    if (!startArmed_) {
+      startArmed_ = true;
+      uint32_t slot = (uint32_t)(cfg_.id > 0 ? cfg_.id - 1 : 0) % kStartSlots;
+      uint32_t draw = cfg_.random != nullptr ? cfg_.random(cfg_.context) % cfg_.startJitterMs : 0;
+      startAt_ = now + slot * cfg_.startSlotMs + draw;
+      return;
+    }
+    if ((int32_t)(now - startAt_) < 0) return;
+    if (RequestSync(kToAll, now)) {
+      startDone_ = true;
+      stats_.startAsks++;
+    } else if ((int32_t)(now - startAt_) >= (int32_t)kStartGiveUpMs) {
+      startDone_ = true;                       // no room, or no key: not for want of trying
+    }
+  }
+
+  // When the next answer to an ask may go. A node sends at most `answersPerSecond` of them in a second, one after another: more than that
+  // are held, and one that would be held for longer than kAnswerHoldMs is not sent, for the asker has stopped waiting for it
+  bool AnswerSlot(uint32_t now, uint32_t *wait) {
+    if (cfg_.answersPerSecond == 255) { *wait = 0; return true; }
+    // a time in the past, or one so far ahead that it can only be a wrapped past one, is no line at all
+    uint32_t ahead = answerAt_ - now;
+    uint32_t at = ahead <= kAnswerHoldMs + 1000 ? answerAt_ : now;
+    if (at - now > kAnswerHoldMs) return false;
+    answerAt_ = at + 1000 / cfg_.answersPerSecond;
+    *wait = at - now;
+    return true;
   }
 
   // --- the bulk transfer -------------------------------------------------------------------------
