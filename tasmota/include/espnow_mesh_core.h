@@ -140,14 +140,14 @@ constexpr uint8_t kToAll = 255;
 constexpr uint8_t kMaxHops = 3;
 constexpr unsigned kReplayWindow = 32;
 
-constexpr unsigned kMaxOrigins = 16;         // the origins a node keeps a window and a way back for
+constexpr unsigned kMaxOrigins = 48;         // the origins a node keeps a window and a way back for: a network of up to 32 nodes, with room beyond
 constexpr unsigned kSeenSize = 64;           // the numbers a node remembers hearing
 constexpr unsigned kTxQueue = 16;            // the frames waiting to be sent
 constexpr unsigned kInboxSize = 8;           // the frames waiting for the application
 constexpr unsigned kPendingSize = 8;         // the frames waiting for an answer
 constexpr unsigned kOutcomeSize = 8;         // the answers, or the lack of them, waiting for the application
 constexpr unsigned kSyncSize = 4;            // the sync exchanges in progress
-constexpr unsigned kMaxNeighbors = 16;       // the nodes heard directly that a node keeps
+constexpr unsigned kMaxNeighbors = 48;       // the nodes heard directly that a node keeps
 constexpr unsigned kMaxInfo = 32;            // the bytes of the application's own in a heartbeat
 constexpr unsigned kNoticeSize = 8;          // the things the supervision tells the application, waiting to be read
 
