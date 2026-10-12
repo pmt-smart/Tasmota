@@ -12,6 +12,8 @@ var persist_module = module("persist")
 
 class Persist
   static var _filename = '_persist.json'
+  static var _tmpname = '_persist.tmp'      # a save writes here, and moves it over the file only when it is whole
+  static var _badname = '_persist.bad'      # a file that load() could not use, put aside so that the next save does not cover it
   var _p
   var _dirty
 
@@ -65,10 +67,17 @@ class Persist
     import path
     var f           # file object
     var val         # values loaded from json
+    var name = self._filename
 
-    if path.exists(self._filename)
+    # A save that was cut off after it took the old file away and before it put the new one in its place leaves the new one, whole
+    # when it was closed, in the temp file: that is the file
+    if !path.exists(name) && path.exists(self._tmpname)
+      name = self._tmpname
+    end
+
+    if path.exists(name)
       try
-        f = open(self._filename, "r")
+        f = open(name, "r")
         val = json.load(f.read())
         f.close()
       except .. as e, m
@@ -77,8 +86,16 @@ class Persist
       end
       if isinstance(val, map)
         self._p = val     # success
+        if name != self._filename
+          # the cut-off save is finished (rename, unlike open() and the others, wants the '/' in front of a name)
+          path.rename('/' + name, '/' + self._filename)
+        end
       else
-        print("BRY: failed to load _persist.json")
+        # What the file holds is no map, or no JSON: it is put aside, as _persist.bad, so that the next save, which would cover it
+        # with a persist that starts from nothing, does not destroy it
+        path.remove(self._badname)
+        path.rename('/' + name, '/' + self._badname)
+        print("BRY: failed to load _persist.json, kept as _persist.bad")
       end
       self._dirty = false
     else
@@ -90,21 +107,26 @@ class Persist
 
   def save(force_save)
     if self._dirty || force_save   # do not save if not dirty
+      import path
       var f       # file object
+      # The file is never opened for writing: the new one is written whole in the temp file and closed, and only then takes the old
+      # one's place. A write that fails, or a power cut while it goes, leaves the file that was there, the last whole one, and the
+      # map in memory is still dirty, so the next save writes it all again. The empty map that used to be written when a save failed
+      # is gone with the file it destroyed
       try
-        f = open(self._filename, "w")
+        f = open(self._tmpname, "w")
         self.json_fdump(f)
         f.close()
+        f = nil
       except .. as e, m
         if (f != nil) f.close() end
         f = nil
-        try
-          f = open(self._filename, "w")
-          f.write('{}')   # fallback write empty map
-        except ..
-        end
-        if f != nil f.close() end
+        path.remove(self._tmpname)
         raise e, m
+      end
+      path.remove(self._filename)
+      if !path.rename('/' + self._tmpname, '/' + self._filename)
+        raise "io_error", "persist: could not move the new file over _persist.json"
       end
       self._dirty = false
     end
