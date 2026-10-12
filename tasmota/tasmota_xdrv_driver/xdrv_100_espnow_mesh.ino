@@ -44,7 +44,10 @@
  *
  * Born off, like the direct link: EspNowMeshEnable 1 starts it, and it stays on across restarts
  * once the device has a number (EspNowMeshId), the key of the network (EspNowMeshGroupKey) and
- * the nodes it talks to (EspNowMeshNode, with their public keys). The device makes its own
+ * the nodes it talks to (EspNowMeshNode, with their public keys). The number, and the bits of
+ * EspNowMeshNetwork that say no radio or relay, take effect at the next start; the other bit, the key
+ * and the nodes at once. The key is a command argument, which Tasmota can log: set it over the web
+ * API of a device on the LAN, as scripts/mesh-bench.mjs does, and not with the log level up. The device makes its own
  * identity, an X25519 key pair, the first time, and keeps it in its own NVS namespace; its public
  * key is what the other devices are given (EspNowMeshPublic).
  *
@@ -206,6 +209,9 @@ typedef struct {
 static struct {
   bool running = false;                      // the task runs
   volatile bool stop = false;                // asked to end
+  volatile bool accepting = false;           // the callbacks may put frames in the queue
+  bool retry_wait = false;                   // a start that failed is not tried again before retry_at
+  uint32_t retry_at = 0;
   volatile bool exited = false;
   volatile bool radio = false;               // ESP-NOW is up, whose it is
   volatile bool direct_radio = false;        // the direct link's driver started it, and its callbacks are the ones in place
@@ -252,8 +258,15 @@ static void EspNowMeshWipe(void* buffer, size_t len) {
   while (len--) { *p++ = 0; }
 }
 
+// Exactly `len` bytes of hex digits, and nothing in `out` unless it is so
 static bool EspNowMeshHex(const char* text, uint8_t* out, size_t len) {
-  return (strlen(text) == 2 * len) && (HexToBytes(text, out, len) == (int32_t)len);
+  if (strlen(text) != 2 * len) { return false; }
+  for (size_t i = 0; i < 2 * len; i++) { if (!isxdigit((unsigned char)text[i])) { return false; } }
+  uint8_t decoded[64];
+  if ((len > sizeof(decoded)) || (HexToBytes(text, decoded, len) != (int32_t)len)) { return false; }
+  memcpy(out, decoded, len);
+  EspNowMeshWipe(decoded, sizeof(decoded));
+  return true;
 }
 
 /*********************************************************************************************\
@@ -283,7 +296,7 @@ static uint8_t EspNowMeshNodeOf(void* context, const uint8_t mac[6]) {
 // A frame of the mesh, from the WiFi task, into the task's queue
 static void EspNowMeshEnqueue(const uint8_t* mac, int8_t rssi, const uint8_t* data, int len) {
   if ((len < (int)(EspNowMesh::kHeaderLen + EspNowMesh::kTagLen)) || (len > (int)EspNowMesh::kMaxFrame)) { return; }
-  if (nullptr == EspNowMeshDriver.rx) { return; }
+  if (!EspNowMeshDriver.accepting || (nullptr == EspNowMeshDriver.rx)) { return; }
 
   EspNowMeshRx_t item;
   item.len = len;
@@ -294,7 +307,8 @@ static void EspNowMeshEnqueue(const uint8_t* mac, int8_t rssi, const uint8_t* da
     EspNowMeshDriver.dropped++;
     return;
   }
-  if (EspNowMeshDriver.task) { xTaskNotifyGive(EspNowMeshDriver.task); }
+  TaskHandle_t task = EspNowMeshDriver.task;
+  if (task) { xTaskNotifyGive(task); }
 }
 
 // The radio's word on the frame the task is sending. True when it was the task's to hear
@@ -387,10 +401,13 @@ static void EspNowMeshRadioStop(void) {
   EspNowMeshDriver.radio = false;
   vTaskDelay(pdMS_TO_TICKS(2 * ESPNOW_MESH_SEND_WAIT_MS));   // the task is out of a send that was under way
   if (!EspNowMeshDriver.own_radio) { return; }     // the direct link's radio stays as it is
-  esp_now_unregister_recv_cb();
-  esp_now_unregister_send_cb();
-  esp_now_deinit();
   EspNowMeshDriver.own_radio = false;
+  // esp_now_deinit() faults when the WiFi stack is not there
+  if (EspNowMeshRadioReady()) {
+    esp_now_unregister_recv_cb();
+    esp_now_unregister_send_cb();
+    esp_now_deinit();
+  }
 }
 
 // The radio goes to the configured channel when the station is not associated. With the station associated, the access
@@ -399,6 +416,9 @@ static void EspNowMeshApplyChannel(void) {
   if (!EspNowMeshSettings.channel) { return; }
   wifi_ap_record_t ap;
   if (ESP_OK == esp_wifi_sta_get_ap_info(&ap)) { return; }
+  // The station keeps trying a saved network, or a scan runs: the radio is not moved under them
+  if (Settings->flag4.network_wifi && (strlen(SettingsText(SET_STASSID1)) || strlen(SettingsText(SET_STASSID2)))) { return; }
+  if (WIFI_SCAN_RUNNING == WiFi.scanComplete()) { return; }
   uint8_t channel = 0;
   wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
   esp_wifi_get_channel(&channel, &second);
@@ -420,14 +440,18 @@ static bool EspNowMeshRadioSend(const uint8_t* to, const uint8_t* frame, size_t 
     peer.encrypt = false;
     if (ESP_OK != esp_now_add_peer(&peer)) { return false; }
   }
+  // A word from an earlier send that came late is not this one's: the semaphore is emptied before the send is armed
+  xSemaphoreTake(EspNowMeshDriver.send_done, 0);
   EspNowMeshDriver.send_ok = false;
   EspNowMeshDriver.awaiting = true;
   if (ESP_OK != esp_now_send(to, frame, len)) {
     EspNowMeshDriver.awaiting = false;
+    xSemaphoreTake(EspNowMeshDriver.send_done, 0);
     return false;
   }
   if (pdTRUE != xSemaphoreTake(EspNowMeshDriver.send_done, pdMS_TO_TICKS(ESPNOW_MESH_SEND_WAIT_MS))) {
     EspNowMeshDriver.awaiting = false;       // no word: not acknowledged
+    xSemaphoreTake(EspNowMeshDriver.send_done, 0);
     return false;
   }
   return EspNowMeshDriver.send_ok;
@@ -481,6 +505,8 @@ static void EspNowMeshUdpPoll(EspNowMesh::Node* node) {
   for (uint32_t turns = 0; turns < 4; turns++) {
     int size = EspNowMeshUdp->parsePacket();
     if (size <= 0) { return; }
+    // What does not fit is thrown away whole: the rest of a datagram left unread keeps the socket from giving the next one
+    if (size > (int)EspNowMesh::kMaxFrame) { EspNowMeshUdp->flush(); continue; }
     int len = EspNowMeshUdp->read(buffer, sizeof(buffer));
     IPAddress from = EspNowMeshUdp->remoteIP();
     if ((len < (int)(EspNowMesh::kHeaderLen + EspNowMesh::kTagLen)) || (len > (int)EspNowMesh::kMaxFrame)) { continue; }
@@ -510,13 +536,19 @@ static void EspNowMeshApplyShared(EspNowMesh::Node* node, EspNowMeshShared_t* sh
   xSemaphoreGive(EspNowMeshDriver.lock);
 
   if (fresh.has_group) { EspNowMeshDriver.crypto->SetGroupKey(fresh.group_key, fresh.group_version); }
+  // The keys of the nodes that left, or whose key changed, go first: a node that moved to another slot would otherwise have its
+  // new key made and then forgotten
   for (uint32_t i = 0; i < ESPNOW_MESH_NODES; i++) {
     const EspNowMeshNode_t& old_entry = EspNowMeshTable[i];
     const EspNowMeshNode_t& entry = fresh.node[i];
     if (old_entry.id && ((old_entry.id != entry.id) || memcmp(old_entry.pub, entry.pub, sizeof(entry.pub)))) {
       EspNowMeshDriver.crypto->ForgetPeer(old_entry.id);
     }
-    if (entry.id && ((old_entry.id != entry.id) || memcmp(old_entry.pub, entry.pub, sizeof(entry.pub)))) {
+  }
+  for (uint32_t i = 0; i < ESPNOW_MESH_NODES; i++) {
+    const EspNowMeshNode_t& old_entry = EspNowMeshTable[i];
+    const EspNowMeshNode_t& entry = fresh.node[i];
+    if (entry.id && ((old_entry.id != entry.id) || memcmp(old_entry.pub, entry.pub, sizeof(entry.pub)) || !EspNowMeshDriver.crypto->HasPeer(entry.id))) {
       if (!EspNowMeshDriver.crypto->SetPeer(entry.id, entry.pub)) {
         AddLog(LOG_LEVEL_INFO, PSTR("EMH: The public key of node %u gives no key"), entry.id);
       }
@@ -528,6 +560,7 @@ static void EspNowMeshApplyShared(EspNowMesh::Node* node, EspNowMeshShared_t* sh
   } else {
     EspNowMeshUdpStop();
   }
+  EspNowMeshWipe(&fresh, sizeof(fresh));      // it held the key of the network
 }
 
 static void EspNowMeshPutEvent(const EspNowMeshEvent_t* event);
@@ -730,6 +763,7 @@ static void EspNowMeshFree(void) {
   if (EspNowMeshDriver.event) { vQueueDelete(EspNowMeshDriver.event); EspNowMeshDriver.event = nullptr; }
   if (EspNowMeshDriver.send_done) { vSemaphoreDelete(EspNowMeshDriver.send_done); EspNowMeshDriver.send_done = nullptr; }
   if (EspNowMeshDriver.lock) { vSemaphoreDelete(EspNowMeshDriver.lock); EspNowMeshDriver.lock = nullptr; }
+  if (EspNowMeshDriver.crypto) { EspNowMeshWipe(EspNowMeshDriver.crypto, sizeof(EspNowMesh::Crypto)); }
   delete EspNowMeshDriver.node;
   delete EspNowMeshDriver.crypto;
   delete EspNowMeshDriver.snapshot;
@@ -747,17 +781,17 @@ static const char* EspNowMeshWhyNot(void) {
   return nullptr;
 }
 
-static bool EspNowMeshStart(void) {
-  if (EspNowMeshDriver.running) { return true; }
-  if (EspNowMeshWhyNot()) { return false; }
-
+// The work of a start. Nothing is written to the flash until the whole of it has worked, and a start that fails is not tried
+// again for ten seconds (EspNowMeshStart): a failing one, with the heap short, would otherwise write the flash and the log once a second
+static bool EspNowMeshStartAttempt(void) {
   if (!EspNowMeshSettings.has_secret) {
     esp_fill_random(EspNowMeshSettings.secret, sizeof(EspNowMeshSettings.secret));
     EspNowMeshSettings.has_secret = 1;
     AddLog(LOG_LEVEL_INFO, PSTR("EMH: This device has an identity now: EspNowMeshPublic gives its public key"));
   }
-  EspNowMeshSettings.epoch++;
-  EspNowMeshSettingsSave();
+  // The epoch of a device that has none is drawn at random, so that a device that was erased does not repeat the numbers of the
+  // frames it sent before, with the key of the network it still has; and it rises with every start after that
+  uint32_t epoch = EspNowMeshSettings.epoch ? (EspNowMeshSettings.epoch + 1) : ((esp_random() >> 2) | 1);
 
   EspNowMeshDriver.node = new (std::nothrow) EspNowMesh::Node;
   EspNowMeshDriver.crypto = new (std::nothrow) EspNowMesh::Crypto;
@@ -788,7 +822,7 @@ static bool EspNowMeshStart(void) {
   EspNowMesh::Config config;
   memset(&config, 0, sizeof(config));
   config.id = EspNowMeshSettings.id;
-  config.epoch = EspNowMeshSettings.epoch;
+  config.epoch = epoch;
   config.random = EspNowMeshRandom;
   config.tag = EspNowMesh::Crypto::Tag;
   config.tagContext = EspNowMeshDriver.crypto;
@@ -813,27 +847,56 @@ static bool EspNowMeshStart(void) {
     EspNowMeshFree();
     return false;
   }
+  EspNowMeshDriver.accepting = true;
   if (pdPASS != xTaskCreatePinnedToCore(EspNowMeshTask, "espnowmesh", ESPNOW_MESH_TASK_STACK, nullptr, ESPNOW_MESH_TASK_PRIORITY, &EspNowMeshDriver.task, 0)) {
     AddLog(LOG_LEVEL_ERROR, PSTR("EMH: The task did not start"));
+    EspNowMeshDriver.accepting = false;
     EspNowMeshRadioStop();
     EspNowMeshFree();
     return false;
   }
+  // It works: now the epoch, and the identity if it is new, are written
+  EspNowMeshSettings.epoch = epoch;
+  EspNowMeshSettingsSave();
   EspNowMeshDriver.running = true;
-  AddLog(LOG_LEVEL_INFO, PSTR("EMH: Started as node %u, epoch %u, %u bytes of heap free"), EspNowMeshSettings.id, EspNowMeshSettings.epoch, ESP_getFreeHeap());
+  AddLog(LOG_LEVEL_INFO, PSTR("EMH: Started as node %u, epoch %u, %u bytes of heap free"), EspNowMeshSettings.id, epoch, ESP_getFreeHeap());
   return true;
 }
 
-static void EspNowMeshStop(void) {
-  if (!EspNowMeshDriver.running) { return; }
-  EspNowMeshDriver.stop = true;
-  if (EspNowMeshDriver.task) { xTaskNotifyGive(EspNowMeshDriver.task); }
-  for (uint32_t i = 0; (i < 100) && !EspNowMeshDriver.exited; i++) { vTaskDelay(pdMS_TO_TICKS(5)); }
+static bool EspNowMeshStart(void) {
+  if (EspNowMeshDriver.running) { return true; }
+  if (EspNowMeshWhyNot()) { return false; }
+  if (EspNowMeshStartAttempt()) { return true; }
+  EspNowMeshDriver.retry_wait = true;
+  EspNowMeshDriver.retry_at = millis() + 10000;
+  return false;
+}
+
+// The task is gone: what it used is given back
+static void EspNowMeshReap(void) {
   EspNowMeshDriver.task = nullptr;
   EspNowMeshRadioStop();
   EspNowMeshFree();
   EspNowMeshDriver.running = false;
   AddLog(LOG_LEVEL_INFO, PSTR("EMH: Stopped"));
+}
+
+static void EspNowMeshStop(void) {
+  if (!EspNowMeshDriver.running) { return; }
+  // The callbacks stop putting frames in the queue first, and one that was under way is given the time to finish; then the task is
+  // asked to end. What it used is given back only when it has: if it has not within two seconds it ends by itself and the next
+  // second finds it gone
+  EspNowMeshDriver.accepting = false;
+  vTaskDelay(pdMS_TO_TICKS(10));
+  EspNowMeshDriver.stop = true;
+  TaskHandle_t task = EspNowMeshDriver.task;
+  if (task) { xTaskNotifyGive(task); }
+  for (uint32_t i = 0; (i < 400) && !EspNowMeshDriver.exited; i++) { vTaskDelay(pdMS_TO_TICKS(5)); }
+  if (EspNowMeshDriver.exited) {
+    EspNowMeshReap();
+  } else {
+    AddLog(LOG_LEVEL_ERROR, PSTR("EMH: The task has not ended yet, it is given back when it has"));
+  }
 }
 
 void EspNowMeshWifiEvent(arduino_event_t *event);
@@ -844,8 +907,11 @@ void EspNowMeshWifiEvent(arduino_event_t *event) {
 }
 
 static void EspNowMeshEverySecond(void) {
+  if (EspNowMeshDriver.running && EspNowMeshDriver.exited) { EspNowMeshReap(); }       // a task that was slow to end
   if (!EspNowMeshSettings.enabled) { return; }
   if (!EspNowMeshDriver.running) {
+    if (EspNowMeshDriver.retry_wait && ((int32_t)(millis() - EspNowMeshDriver.retry_at) < 0)) { return; }
+    EspNowMeshDriver.retry_wait = false;
     EspNowMeshStart();
     return;
   }
@@ -961,6 +1027,7 @@ void CmndEspNowMeshGroupKey(void) {
       return;
     }
     EspNowMeshWipe(text, sizeof(text));
+    memset(XdrvMailbox.data, '*', XdrvMailbox.data_len);       // the key is not left in the command's own buffer
     EspNowMeshSettings.group_version = version;
     EspNowMeshSettings.has_group = 1;
     EspNowMeshSettingsSave();
@@ -1031,7 +1098,9 @@ void CmndEspNowMeshNode(void) {
 void CmndEspNowMeshPublic(void) {
   static const uint8_t base[32] = {9};
   if (!EspNowMeshSettings.has_secret) {
-    // The identity is made here the first time it is asked for, and not only when the mesh starts, so that a device can be told to the others first
+    // The identity is made here the first time it is asked for, and not only when the mesh starts, so that a device can be told to the others first.
+    // The hardware's random numbers are strong only with the radio on
+    if (!EspNowMeshRadioReady()) { ResponseCmndChar_P(PSTR("WiFi is not up")); return; }
     esp_fill_random(EspNowMeshSettings.secret, sizeof(EspNowMeshSettings.secret));
     EspNowMeshSettings.has_secret = 1;
     EspNowMeshSettingsSave();
@@ -1083,9 +1152,13 @@ void CmndEspNowMeshSend(void) {
   EspNowMeshCmd_t cmd;
   memset(&cmd, 0, sizeof(cmd));
   cmd.op = ESPNOW_MESH_CMD_SEND;
-  cmd.dest = atoi(fields[0]);
-  cmd.type = atoi(fields[1]) & 7;
-  cmd.flags = atoi(fields[2]) ? 1 : 0;
+  long dest = strtol(fields[0], nullptr, 10);
+  long type = strtol(fields[1], nullptr, 10);
+  long ack = strtol(fields[2], nullptr, 10);
+  if ((dest < 0) || (dest > 255) || (type < 0) || (type > 7) || (ack < 0) || (ack > 1)) { ResponseCmndChar_P(PSTR("dest 0..255, type 0..7, ack 0|1")); return; }
+  cmd.dest = dest;
+  cmd.type = type;
+  cmd.flags = ack;
   if (EspNowMesh::kBeat == cmd.type) { ResponseCmndChar_P(PSTR("the heartbeat is the mesh's")); return; }
   if (('0' == fields[3][0]) && (('x' == fields[3][1]) || ('X' == fields[3][1]))) {
     int32_t len = HexToBytes(fields[3] + 2, cmd.data, sizeof(cmd.data));
