@@ -677,6 +677,10 @@ static bool EspNowMeshRadioStart(void) {
   }
   esp_now_register_recv_cb(EspNowMeshRecvCb);
   esp_now_register_send_cb(EspNowMeshSendCb);
+  if (EspNowMeshRadioTake(100)) {                  // a table that was just made has no peer in it
+    memset(EspNowMeshPeers, 0, sizeof(EspNowMeshPeers));
+    EspNowMeshRadioGive();
+  }
   EspNowMeshAddBroadcast();
   EspNowMeshDriver.own_radio = true;
   EspNowMeshDriver.radio = true;
@@ -686,11 +690,19 @@ static bool EspNowMeshRadioStart(void) {
 static void EspNowMeshRadioStop(void) {
   if (!EspNowMeshDriver.radio) { return; }
   EspNowMeshDriver.radio = false;
+  bool own = EspNowMeshDriver.own_radio;
   if (EspNowMeshRadioTake(2 * ESPNOW_MESH_SEND_WAIT_MS)) {      // the task is out of a send that was under way, and starts none
+    // The direct link's radio stays as it is, and the neighbours the mesh put in its table go: they would be in it for good, with nothing
+    // to say they are the mesh's to give up
+    if (!own && !EspNowMeshDriver.radio_lost && EspNowMeshRadioReady()) {
+      for (int32_t i = 0; i < ESP_NOW_MAX_TOTAL_PEER_NUM; i++) {
+        if (EspNowMeshPeers[i].used) { esp_now_del_peer(EspNowMeshPeers[i].mac); }
+      }
+    }
     memset(EspNowMeshPeers, 0, sizeof(EspNowMeshPeers));
     EspNowMeshRadioGive();
   }
-  if (!EspNowMeshDriver.own_radio) { return; }     // the direct link's radio stays as it is
+  if (!own) { return; }
   EspNowMeshDriver.own_radio = false;
   // esp_now_deinit() faults when the WiFi stack is not there
   if (EspNowMeshRadioReady()) {
@@ -1257,6 +1269,9 @@ static bool EspNowMeshStartAttempt(void) {
   EspNowMeshDriver.epoch_ahead = 0;               // the epoch is in use now: the next start takes another
   EspNowMeshDriver.running = true;
   AddLog(LOG_LEVEL_INFO, PSTR("EMH: Started as node %u, epoch %u, %u bytes of heap free"), EspNowMeshSettings.id, epoch, ESP_getFreeHeap());
+  if (!EspNowMeshDriver.app_ready) {
+    AddLog(LOG_LEVEL_INFO, PSTR("EMH: The frames for the application wait until it says it is ready: espnow_mesh_ready() in a script, or EspNowMeshReady 1"));
+  }
   return true;
 }
 
