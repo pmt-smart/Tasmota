@@ -1131,7 +1131,9 @@ class Node {
         if (cfg_.proof != nullptr) {
           uint8_t want[8];
           cfg_.proof(cfg_.proofContext, f.origin, nonce, epoch, counter, want);
-          ok = f.len >= 21 && memcmp(want, f.payload + 13, 8) == 0;
+          uint8_t diff = f.len >= 21 ? 0 : 1;
+          for (unsigned k = 0; k < 8 && f.len >= 21; k++) diff |= want[k] ^ f.payload[13 + k];
+          ok = diff == 0;
         }
         if (ok) {
           SetSynced(f.origin, epoch, counter);
