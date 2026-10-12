@@ -197,7 +197,7 @@
 #endif
 
 #ifdef USE_ESPNOW_MESH
-// The ESP-NOW mesh (xdrv_100) rides on the radio of this driver when it is up: it hears the frames that are its own before this
+// The ESP-NOW mesh (xdrv_98_1_espnow_mesh.ino) rides on the radio of this driver when it is up: it hears the frames that are its own before this
 // driver looks at them, is told what became of the frame it was sending, and is told when ESP-NOW is started and stopped here
 bool EspNowMeshHearsFrame(const uint8_t* mac, int8_t rssi, const uint8_t* data, int len);
 bool EspNowMeshSendResult(bool ok);

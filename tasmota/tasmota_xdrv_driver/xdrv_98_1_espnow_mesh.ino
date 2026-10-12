@@ -1,5 +1,5 @@
 /*
-  xdrv_100_espnow_mesh.ino - ESP-NOW mesh: the radio task and the commands around the mesh core
+  xdrv_98_1_espnow_mesh.ino - ESP-NOW mesh: the radio task and the commands around the mesh core
 
   Copyright (C) 2026  Casa Inteligente
 
@@ -72,6 +72,10 @@
  *   EspNowMeshSend <dest>,<type>,<ack 0|1>,<text or 0xHEX> - a frame; dest 255 is everyone; type 0 command, 2 state, 3 event
  *   EspNowMeshStatus           - the state of the task and the counters
  *   EspNowMeshNeighbors [<first>] - the neighbours the heartbeats have given, six at a time
+ *
+ * And, in Berry, without the trip through the command handler:
+ *   espnow_mesh_send(dest, type, ack, data) - true when the frame was handed to the task; data is bytes or a string
+ *   espnow_mesh_info(data)                  - the bytes (up to 32) every heartbeat carries
 \*********************************************************************************************/
 
 #define XDRV_100                       100
@@ -1228,6 +1232,85 @@ void CmndEspNowMeshNeighbors(void) {
   ResponseAppend_P(PSTR("]}}"));
 }
 
+#ifdef USE_BERRY
+// Going through the command handler costs a full dispatch on the main loop, about 8 ms even for a command that does nothing
+// (xdrv_98), and a script that sends often should not pay it. So Berry gets entry points of its own:
+//
+//   espnow_mesh_send(dest, type, ack, data)  -> true when the frame was handed to the task; data is bytes or a string
+//   espnow_mesh_info(data)                   -> true; the bytes (up to 32) every heartbeat carries
+//
+// What arrives, and what became of what was sent, comes to the rules, as the log and the header say.
+int EspNowMeshBerrySend(struct bvm *vm);
+int EspNowMeshBerrySend(struct bvm *vm) {
+  int32_t argc = be_top(vm);
+  if ((argc >= 4) && be_isint(vm, 1) && be_isint(vm, 2)) {
+    int dest = be_toint(vm, 1);
+    int type = be_toint(vm, 2);
+    bool ack = be_tobool(vm, 3);
+    const void* data = nullptr;
+    size_t len = 0;
+    if (be_isbytes(vm, 4)) {
+      data = be_tobytes(vm, 4, &len);
+    } else if (be_isstring(vm, 4)) {
+      data = be_tostring(vm, 4);
+      len = strlen((const char*)data);
+    }
+    bool queued = false;
+    if (data && (dest >= 0) && (dest <= 255) && (type >= 0) && (type <= 7) && (EspNowMesh::kBeat != type) && (len <= EspNowMesh::kMaxPayload)) {
+      EspNowMeshCmd_t cmd;
+      memset(&cmd, 0, sizeof(cmd));
+      cmd.op = ESPNOW_MESH_CMD_SEND;
+      cmd.dest = dest;
+      cmd.type = type;
+      cmd.flags = ack ? 1 : 0;
+      cmd.len = len;
+      if (len) { memcpy(cmd.data, data, len); }
+      queued = EspNowMeshQueueCommand(&cmd);
+    }
+    be_pushbool(vm, queued);
+    be_return(vm);
+  }
+  be_raise(vm, kTypeError, nullptr);
+}
+
+int EspNowMeshBerryInfo(struct bvm *vm);
+int EspNowMeshBerryInfo(struct bvm *vm) {
+  int32_t argc = be_top(vm);
+  if (argc >= 1) {
+    const void* data = nullptr;
+    size_t len = 0;
+    if (be_isbytes(vm, 1)) {
+      data = be_tobytes(vm, 1, &len);
+    } else if (be_isstring(vm, 1)) {
+      data = be_tostring(vm, 1);
+      len = strlen((const char*)data);
+    }
+    bool queued = false;
+    if (data && (len <= EspNowMesh::kMaxInfo)) {
+      EspNowMeshCmd_t cmd;
+      memset(&cmd, 0, sizeof(cmd));
+      cmd.op = ESPNOW_MESH_CMD_INFO;
+      cmd.len = len;
+      if (len) { memcpy(cmd.data, data, len); }
+      queued = EspNowMeshQueueCommand(&cmd);
+    }
+    be_pushbool(vm, queued);
+    be_return(vm);
+  }
+  be_raise(vm, kTypeError, nullptr);
+}
+
+static void EspNowMeshBerryRegister(void) {
+  if (nullptr == berry.vm) { return; }
+  be_pushntvfunction(berry.vm, EspNowMeshBerrySend);
+  be_setglobal(berry.vm, "espnow_mesh_send");
+  be_pop(berry.vm, 1);
+  be_pushntvfunction(berry.vm, EspNowMeshBerryInfo);
+  be_setglobal(berry.vm, "espnow_mesh_info");
+  be_pop(berry.vm, 1);
+}
+#endif  // USE_BERRY
+
 const char kEspNowMeshCommands[] PROGMEM = "|"
   "EspNowMeshEnable|EspNowMeshId|EspNowMeshChannel|EspNowMeshGroupKey|EspNowMeshNode|EspNowMeshPublic|EspNowMeshNetwork|"
   "EspNowMeshInfo|EspNowMeshSend|EspNowMeshStatus|EspNowMeshNeighbors";
@@ -1248,6 +1331,9 @@ bool Xdrv100(uint32_t function) {
       break;
     case FUNC_INIT:
       WiFi.onEvent(EspNowMeshWifiEvent);
+#ifdef USE_BERRY
+      EspNowMeshBerryRegister();
+#endif
       break;
     case FUNC_LOOP:
       EspNowMeshDrainEvents();
