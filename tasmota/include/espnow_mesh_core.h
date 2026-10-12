@@ -90,6 +90,14 @@
  * fail to arrive from strong neighbours, the unicasts the radio does not get acknowledged and the
  * frames nobody answers are counted, and a minute of too many of them, twice running, is a noisy
  * channel, said to everyone.
+ *
+ * Messages longer than a frame: one that does not fit goes in two, each with a number of its own, the
+ * second carrying the number of the first ahead of the rest, and the destination's application gets
+ * the two, the second marked with the first's number, to join. A list that is longer still goes as a
+ * bulk transfer, in pieces of 200 bytes along the way back to the node that asked for it, each piece
+ * naming the transfer, its own place and the count; the destination keeps what it has had, asks
+ * after 300 ms for what is missing, up to three times, and says when it has all. The sender, which
+ * holds the data, sends again the pieces asked for.
 \*********************************************************************************************/
 
 #include <stdint.h>
@@ -145,6 +153,16 @@ constexpr uint8_t kSubPing = 2;              // nothing; to a neighbour, for the
 constexpr uint8_t kSubAlive = 3;             // node(1); to the neighbour that asked: that node answered
 constexpr uint8_t kSubVerdict = 4;           // node(1) silent(1); to all, repeated: a node is silent, or is back
 constexpr uint8_t kSubNoise = 5;             // noisy(1); to all, repeated: the channel at the sender is noisy, or calm again
+
+// The bulk transfer's frames, the first byte of their payload
+constexpr uint8_t kBulkSubPiece = 0;         // id(2) index(1) total(1) data
+constexpr uint8_t kBulkSubNak = 1;           // id(2) missing(4): a bit for each piece not had; to the sender
+constexpr uint8_t kBulkSubDone = 2;          // id(2); to the sender: all the pieces have come
+constexpr size_t kBulkPieceMax = 200;        // the data in a piece
+constexpr unsigned kBulkMaxPieces = 32;      // the pieces in a transfer
+constexpr unsigned kBulkInSize = 4;          // the transfers a node receives at a time
+constexpr uint32_t kBulkNakAfterMs = 300;    // without a piece for this long, the missing ones are asked for
+constexpr uint8_t kBulkMaxNaks = 3;          // and given up after as many asks
 
 // What the user of this file computes: the tag of `len` bytes, with the key it holds
 typedef void (*TagFunction)(const uint8_t *data, size_t len, uint8_t tag[kTagLen], void *context);
@@ -256,9 +274,10 @@ struct Delivery {
   Type type;
   bool ackRequested;
   bool retry;                                  // a number already delivered, heard again with a higher attempt
-  uint8_t part;
+  uint8_t part;                                // 0 a whole message, 1 the first part of two, 2 the second
   uint8_t attempt;
   uint8_t dest;
+  uint32_t joins;                              // of a second part, the number of the first, which is not in the payload
   uint32_t epoch;
   uint32_t counter;
   int8_t rssi;
@@ -280,6 +299,7 @@ struct Stats {
   uint32_t sentOwn, sentRelay, suppressed, queueFull;
   uint32_t acksSent, acksHeard, resent, gaveUp, noRoute, hopFailed, syncAsked, syncDone, syncBad;
   uint32_t beatsSent, beatsHeard, pings, probes, rescued, verdictsSent, verdictsHeard, noiseSent, keptAsOnlyWay;
+  uint32_t partsSent, piecesSent, piecesNew, piecesRepeated, naksSent, bulkDone, bulkLost;
 };
 
 // How a neighbour stands: heard lately, not heard and being tried, or declared silent by this node
@@ -305,11 +325,12 @@ struct Neighbor {
 };
 
 // What the supervision has to tell the application
-enum NoticeKind : uint8_t { kNoticeSilent = 1, kNoticeBack = 2, kNoticeNoisy = 3, kNoticeCalm = 4 };
+enum NoticeKind : uint8_t { kNoticeSilent = 1, kNoticeBack = 2, kNoticeNoisy = 3, kNoticeCalm = 4, kNoticeBulkDone = 5, kNoticeBulkLost = 6 };
 struct Notice {
   uint8_t node;                                // the node it is about; for the noise, the node whose channel it is
   uint8_t kind;                                // a NoticeKind
   uint8_t by;                                  // the node that said so, this node's own number when it found out itself
+  uint32_t value;                              // of a bulk transfer, its id; the node it is about is the one that sent it
 };
 
 struct Config {
@@ -366,12 +387,52 @@ class Node {
     return f.counter;
   }
 
+  // A message longer than a frame, in two: the first part full, the second with the number of the first ahead of the rest,
+  // each part its own frame with its own number, and each confirmed on its own when an answer is asked for. Nothing is sent
+  // and false comes back when the message does not fit in two, or the queue has no room for both. `counters` get the numbers
+  bool SendParts(Type type, uint8_t dest, const uint8_t *payload, size_t len, bool ackRequested, uint32_t now, uint32_t counters[2]) {
+    if (type == kBeat || len <= kMaxPayload || len > 2 * kMaxPayload - 4) return false;
+    unsigned room = 0, waiting = 0;
+    for (unsigned i = 0; i < kTxQueue; i++) room += !txq_[i].used;
+    for (unsigned i = 0; i < kPendingSize; i++) waiting += !pending_[i].used;
+    if (room < 2 || (ackRequested && dest != kToAll && waiting < 2)) { stats_.queueFull++; return false; }
+    uint8_t second[kMaxPayload];
+    size_t rest = len - kMaxPayload;
+    counters[0] = Queue(type, dest, payload, kMaxPayload, ackRequested, kMaxHops, now, 1);
+    Put32(second, counters[0]);
+    memcpy(second + 4, payload + kMaxPayload, rest);
+    counters[1] = Queue(type, dest, second, rest + 4, ackRequested, kMaxHops, now, 2);
+    stats_.partsSent += 2;
+    return counters[0] != 0 && counters[1] != 0;
+  }
+
+  // The pieces a transfer of `len` bytes comes to
+  static unsigned BulkPieces(size_t len) { return (unsigned)((len + kBulkPieceMax - 1) / kBulkPieceMax); }
+
+  // One piece of a bulk transfer, `index` of `total`, of the transfer `id`, along the way back to `dest` when this node has
+  // one and flooded when it has not. Returns the counter, or 0 when there was no room or the piece does not fit
+  uint32_t SendBulkPiece(uint8_t dest, uint16_t id, uint8_t index, uint8_t total, const uint8_t *data, size_t len, uint32_t now) {
+    if (total == 0 || total > kBulkMaxPieces || index >= total || len > kBulkPieceMax) return 0;
+    uint8_t p[kBulkPieceMax + 5];
+    p[0] = kBulkSubPiece;
+    p[1] = (uint8_t)id;
+    p[2] = (uint8_t)(id >> 8);
+    p[3] = index;
+    p[4] = total;
+    if (len > 0) memcpy(p + 5, data, len);
+    uint32_t counter = SendAlong(kBulk, dest, p, len + 5, now);
+    if (counter != 0) stats_.piecesSent++;
+    return counter;
+  }
+
   // The radio heard `n` bytes from the neighbour `src`, with the signal `rssi`
   Verdict OnReceive(const uint8_t *data, size_t n, const uint8_t src[6], int8_t rssi, uint32_t now) {
     Frame f;
     if (!Decode(data, n, &f)) { stats_.bad++; return kBad; }
     if (cfg_.tag != nullptr && !TagMatches(cfg_.tag, cfg_.tagContext, data, n)) { stats_.bad++; return kBad; }
     if (f.origin == cfg_.id || f.origin == 0 || f.origin == kToAll) return kIgnored;
+    // how near its origin a frame was heard: the hops it has left, which a heartbeat, sent with none, does not say, being heard from the origin itself
+    uint8_t reach = f.type() == kBeat ? kMaxHops : f.hops;
     // a routed frame is for the neighbour it names, and the others, if they heard it, leave it alone
     if (f.routed() && f.next != cfg_.id) return kIgnored;
     stats_.heard++;
@@ -381,14 +442,14 @@ class Node {
       CountCopy(f.origin, f.epoch, f.counter, f.attempt(), NodeOf(src), now);
       // a copy from a neighbour that hears this node is a way back to the origin when the one kept is none
       Origin *known_origin = FindOrigin(f.origin, false);
-      if (known_origin != nullptr && known_origin->synced && (!known_origin->routed || OneWay(known_origin->via)) && !OneWay(src)) Learn(known_origin, src);
+      if (known_origin != nullptr && known_origin->synced && (!known_origin->routed || OneWay(known_origin->via))) Learn(known_origin, src, reach);
       return kRepeated;
     }
     Origin *o = FindOrigin(f.origin, true);
     if (o == nullptr) { stats_.unsynced++; return kNeedsSync; }
     bool forMe = f.dest == cfg_.id || f.dest == kToAll;
     if (f.type() == kSync) {
-      Learn(o, src);
+      Learn(o, src, reach);
       Remember(f.origin, f.epoch, f.counter, f.attempt(), src);
       // an origin that asks from an epoch above the one kept has started again: it is asked in its turn, before its first data frame
       if (f.epoch > o->epoch && o->synced) o->synced = false;
@@ -398,9 +459,9 @@ class Node {
     // a frame refused for want of a sync, or for its epoch, is not remembered: it is not one this node has handled, and the
     // sender's next attempt, or this very frame heard again, is taken once the origin is known. The way back is learned
     // from it when this node has none, because the sync exchange goes that way
-    if (!o->synced) { if (!o->routed) Learn(o, src); stats_.unsynced++; return kNeedsSync; }
+    if (!o->synced) { if (!o->routed) Learn(o, src, reach); stats_.unsynced++; return kNeedsSync; }
     if (f.epoch < o->epoch) { stats_.stale++; return kStale; }
-    if (f.epoch > o->epoch) { o->synced = false; if (!o->routed) Learn(o, src); stats_.unsynced++; return kNeedsSync; }
+    if (f.epoch > o->epoch) { o->synced = false; if (!o->routed) Learn(o, src, reach); stats_.unsynced++; return kNeedsSync; }
     if (f.counter > o->highest) {
       uint32_t shift = f.counter - o->highest;
       o->seen = shift >= kReplayWindow ? 0 : o->seen << shift;
@@ -413,7 +474,7 @@ class Node {
     }
     if (known && !(f.attempt() > 0)) { stats_.replayed++; return kReplayed; }
     // the first copy of a number came by the best way: it is the way back to its origin
-    Learn(o, src);
+    Learn(o, src, reach);
     Remember(f.origin, f.epoch, f.counter, f.attempt(), src);
     // a frame that got through the gate is proof of its origin, and of the neighbour that sent it, just now
     uint8_t sender = NodeOf(src);
@@ -425,7 +486,8 @@ class Node {
     } else if (forMe && f.type() == kAck) {
       HandleAck(f);
     } else if (forMe) {
-      Deliver(f, src, rssi, known);
+      // a piece of a bulk transfer is the application's once, whatever the number of times it comes
+      if (f.type() != kBulk || TrackPiece(f, now)) Deliver(f, src, rssi, known);
       // answered at once, before the application has done anything with it, and every attempt
       if (f.ackRequested() && f.dest == cfg_.id) SendAck(f, now);
     }
@@ -518,6 +580,24 @@ class Node {
       if (RequestSync(o.id, now)) { o.asked = true; o.askedAt = now; }
     }
     if (cfg_.beatEveryMs != 0) Supervise(now);
+    for (unsigned i = 0; i < kBulkInSize; i++) {
+      BulkIn &b = bulkIn_[i];
+      if (!b.used || b.done || (int32_t)(now - b.lastAt) < (int32_t)kBulkNakAfterMs) continue;
+      if (b.naks >= kBulkMaxNaks) {
+        Post(kNoticeBulkLost, b.origin, cfg_.id, b.id);
+        stats_.bulkLost++;
+        b.used = false;
+        continue;
+      }
+      uint8_t p[7];
+      p[0] = kBulkSubNak;
+      p[1] = (uint8_t)b.id;
+      p[2] = (uint8_t)(b.id >> 8);
+      Put32(p + 3, Missing(b));
+      if (SendAlong(kBulk, b.origin, p, sizeof(p), now) != 0) stats_.naksSent++;
+      b.naks++;
+      b.lastAt = now;
+    }
   }
 
   // The radio is free: the frame to send next, to whom (broadcast, all ones, for a flooded frame), and whether there
@@ -569,7 +649,10 @@ class Node {
         TxItem *slot = FreeSlot();
         if (slot != nullptr) { *slot = inflight_; slot->due = now + 1; again = true; }
       }
-      if (!again) stats_.hopFailed++;
+      if (!again) {
+        stats_.hopFailed++;
+        if (pingTarget == 0) DemoteRoute(inflight_.data[3], inflight_.to);
+      }
     }
     inflightValid_ = false;
     busy_ = false;
@@ -645,7 +728,7 @@ class Node {
   unsigned waiting() const { unsigned n = 0; for (unsigned i = 0; i < kPendingSize; i++) n += pending_[i].used; return n; }
 
  private:
-  struct Origin { bool used; bool synced; bool routed; bool asked; uint8_t id; uint8_t via[6]; uint32_t epoch; uint32_t highest; uint32_t seen; uint32_t askedAt; };
+  struct Origin { bool used; bool synced; bool routed; bool asked; uint8_t id; uint8_t routeHops; uint8_t via[6]; uint32_t epoch; uint32_t highest; uint32_t seen; uint32_t askedAt; };
   struct Seen { bool used; bool hasFrom; uint8_t origin; uint8_t attempt; uint32_t epoch; uint32_t counter; uint8_t from[6]; };
   // `from` are the neighbours a flooded frame waiting to be repeated was heard from, for the first two copies;
   // `pingTarget` and `pingAsker` mark a ping: whom it tries, and for whom (0: for this node)
@@ -670,6 +753,8 @@ class Node {
   Outcome outcomes_[kOutcomeSize];
   unsigned outcomeHead_, outcomeCount_;
   Stats stats_;
+  struct BulkIn { bool used; bool done; uint8_t origin; uint8_t total; uint8_t naks; uint16_t id; uint32_t have; uint32_t lastAt; };
+  BulkIn bulkIn_[kBulkInSize];
   Neighbor nbrs_[kMaxNeighbors];
   Mute mutes_[kMaxOrigins];
   Notice notices_[kNoticeSize];
@@ -694,11 +779,22 @@ class Node {
     return false;
   }
 
-  // The neighbour a frame of this origin was first heard from is the way back to it, unless that neighbour is one that does not hear this node
-  void Learn(Origin *o, const uint8_t src[6]) {
+  // The neighbour a frame of this origin was heard from is the way back to it, unless that neighbour does not hear this node. A way is
+  // replaced only by one as near, by the hops the frame had left when it was heard: the ways kept lead nearer the origin at every hop,
+  // so that a frame sent along them cannot go round or run out. A way that fails is demoted, and the next frame heard gives another
+  void Learn(Origin *o, const uint8_t src[6], uint8_t hops) {
     if (OneWay(src)) return;
+    if (o->routed && hops < o->routeHops) return;
     o->routed = true;
+    o->routeHops = hops;
     memcpy(o->via, src, 6);
+  }
+
+  // A hop to `mac` for a frame to `dest` failed for good: the way to `dest` through it is kept, for there may be no other yet, but it
+  // counts as the farthest, and the next frame heard from `dest`, by whatever neighbour, takes its place
+  void DemoteRoute(uint8_t dest, const uint8_t mac[6]) {
+    Origin *d = FindOrigin(dest, false);
+    if (d != nullptr && d->routed && memcmp(d->via, mac, 6) == 0) d->routeHops = 0;
   }
 
   Origin *FindOrigin(uint8_t id, bool create) {
@@ -725,9 +821,9 @@ class Node {
   }
 
   // The header of a frame of this node's, with the next number
-  Frame Header(Type type, uint8_t dest, uint8_t next, uint8_t hops, bool ackRequested) {
+  Frame Header(Type type, uint8_t dest, uint8_t next, uint8_t hops, bool ackRequested, uint8_t part = 0) {
     Frame f;
-    f.kind = PackKind(type, ackRequested, 0, 0);
+    f.kind = PackKind(type, ackRequested, part, 0);
     f.origin = cfg_.id;
     f.dest = dest;
     f.next = next;
@@ -755,7 +851,7 @@ class Node {
 
   // A frame of this node's, to be flooded with `hops` repetitions left. A frame that asks for an answer and is for
   // one node is kept, sent again if none comes, and reported either way
-  uint32_t Queue(Type type, uint8_t dest, const uint8_t *payload, size_t len, bool ackRequested, uint8_t hops, uint32_t now) {
+  uint32_t Queue(Type type, uint8_t dest, const uint8_t *payload, size_t len, bool ackRequested, uint8_t hops, uint32_t now, uint8_t part = 0) {
     if (len > kMaxPayload) return 0;
     bool wait = ackRequested && dest != kToAll;
     Pending *keep = nullptr;
@@ -765,7 +861,7 @@ class Node {
     }
     TxItem *slot = FreeSlot();
     if (slot == nullptr) { stats_.queueFull++; return 0; }
-    Frame f = Header(type, dest, 0, hops, ackRequested);
+    Frame f = Header(type, dest, 0, hops, ackRequested, part);
     f.payload = payload;
     f.len = len;
     BuildOwn(slot, f, now);
@@ -907,8 +1003,11 @@ class Node {
     d.counter = f.counter;
     d.rssi = rssi;
     memcpy(d.from, src, 6);
-    d.len = (uint8_t)f.len;
-    memcpy(d.payload, f.payload, f.len);
+    // the second part of a message leads with the number of the first, which is not the application's data
+    bool second = f.part() == 2 && f.len >= 4;
+    d.joins = second ? Get32(f.payload) : 0;
+    d.len = (uint8_t)(f.len - (second ? 4 : 0));
+    memcpy(d.payload, f.payload + (second ? 4 : 0), d.len);
     stats_.delivered++;
   }
 
@@ -983,15 +1082,94 @@ class Node {
     return kAccepted;
   }
 
+  // --- the bulk transfer -------------------------------------------------------------------------
+
+  bool HasRoute(uint8_t dest) {
+    Origin *d = FindOrigin(dest, false);
+    return d != nullptr && d->routed && NodeOf(d->via) != 0;
+  }
+
+  // A frame for `dest` along the way back when there is one, and flooded when there is not
+  uint32_t SendAlong(Type type, uint8_t dest, const uint8_t *payload, size_t len, uint32_t now) {
+    if (HasRoute(dest)) return SendRouted(type, dest, payload, len, now);
+    return Queue(type, dest, payload, len, false, kMaxHops, now);
+  }
+
+  // The pieces of a transfer not had yet, a bit each
+  static uint32_t Missing(const BulkIn &b) {
+    uint32_t all = b.total >= 32 ? 0xffffffffu : ((uint32_t)1 << b.total) - 1;
+    return all & ~b.have;
+  }
+
+  void SendDone(const BulkIn &b, uint32_t now) {
+    uint8_t p[3] = {kBulkSubDone, (uint8_t)b.id, (uint8_t)(b.id >> 8)};
+    SendAlong(kBulk, b.origin, p, sizeof(p), now);
+  }
+
+  // The slot a new transfer takes: a free one, else the oldest that is complete, else the oldest of all
+  BulkIn *SpareBulk() {
+    BulkIn *best = nullptr;
+    int bestRank = 3;
+    for (unsigned i = 0; i < kBulkInSize; i++) {
+      BulkIn &c = bulkIn_[i];
+      int rank = !c.used ? 0 : c.done ? 1 : 2;
+      if (rank < bestRank || (rank == bestRank && (int32_t)(c.lastAt - best->lastAt) < 0)) { best = &c; bestRank = rank; }
+    }
+    return best;
+  }
+
+  // A frame of a bulk transfer addressed to this node: a piece is remembered, and when it is the last one the sender is told;
+  // returns whether the application is to have it (a piece it has had is not given again; what is not a piece is its own)
+  bool TrackPiece(const Frame &f, uint32_t now) {
+    if (f.len < 5 || f.payload[0] != kBulkSubPiece) return true;
+    uint16_t id = (uint16_t)(f.payload[1] | f.payload[2] << 8);
+    uint8_t index = f.payload[3], total = f.payload[4];
+    if (total == 0 || total > kBulkMaxPieces || index >= total) return false;
+    BulkIn *b = nullptr;
+    for (unsigned i = 0; i < kBulkInSize; i++) if (bulkIn_[i].used && bulkIn_[i].origin == f.origin && bulkIn_[i].id == id) b = &bulkIn_[i];
+    if (b == nullptr) {
+      b = SpareBulk();
+      memset(b, 0, sizeof(*b));
+      b->used = true;
+      b->origin = f.origin;
+      b->id = id;
+      b->total = total;
+    } else if (b->total != total) {
+      // the same id, a transfer of another size: a new one
+      b->total = total;
+      b->have = 0;
+      b->done = false;
+      b->naks = 0;
+    }
+    bool fresh = (b->have & ((uint32_t)1 << index)) == 0;
+    b->have |= (uint32_t)1 << index;
+    b->lastAt = now;
+    stats_.piecesNew += fresh;
+    if (!fresh) {
+      stats_.piecesRepeated++;
+      // a piece of a transfer that is complete: the sender did not hear that it is
+      if (b->done) SendDone(*b, now);
+      return false;
+    }
+    if (Missing(*b) == 0 && !b->done) {
+      b->done = true;
+      SendDone(*b, now);
+      Post(kNoticeBulkDone, b->origin, cfg_.id, b->id);
+      stats_.bulkDone++;
+    }
+    return true;
+  }
+
   // --- the supervision ---------------------------------------------------------------------------
 
-  void Post(NoticeKind kind, uint8_t node, uint8_t by) {
+  void Post(NoticeKind kind, uint8_t node, uint8_t by, uint32_t value = 0) {
     if (noticeCount_ >= kNoticeSize) return;
     Notice &n = notices_[(noticeHead_ + noticeCount_) % kNoticeSize];
     noticeCount_++;
     n.node = node;
     n.kind = kind;
     n.by = by;
+    n.value = value;
   }
 
   Neighbor *FindNeighbor(uint8_t id, bool create) {
