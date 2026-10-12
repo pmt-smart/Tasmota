@@ -57,12 +57,21 @@
  * did not take does not go on, says so in the log and is tried again in ten seconds, and a command that changes the record and
  * finds the flash did not take it answers "flash write failed" and leaves the record as it was.
  *
+ * The frames for the application are not taken until it says it is ready: with Berry running, until a script calls espnow_mesh_ready()
+ * (or espnow_mesh_info()), which it does once its rules are registered; EspNowMeshReady 1 says it for the device whose rules are not a
+ * script's. Until then a frame for this device alone is refused as when the inbox has no room, with no answer, and its sender sends it
+ * again; a frame for everyone is repeated and not delivered here. What the core has for the application waits in its inbox while the
+ * queue to the main loop is full, and is never dropped after it was answered; the outcomes and the notices have a queue of their own,
+ * so that a burst of frames cannot push one out.
+ *
  * Reported to the rule engine, and in the log:
  *   {"EspNowMesh":{"From":3,"Type":0,"Dest":1,"Counter":12,"Epoch":7,"Rssi":-61,"Flags":0,"Part":0,"Joins":0,"Behind":0,"Data":"68656c6c6f"}}
  *       a frame for this device, Data in hex; Flags 1 asks for an answer, 2 marks a repeat of one already given;
  *       Behind is how many numbers of its origin the frame was behind the newest heard, for the application to order by
- *   {"EspNowMesh":{"Outcome":{"Counter":12,"Dest":3,"Ok":1,"Attempts":1}}}
- *       what became of a frame sent with an answer asked for
+ *   {"EspNowMesh":{"Outcome":{"Counter":5,"Frame":12,"Dest":3,"Ok":1,"Attempts":1}}}
+ *       what became of a frame sent with an answer asked for. Counter is the ticket the send was given (what espnow_mesh_send returned,
+ *       or EspNowMeshSend answered), Frame the number the frame had on the air, which the receiver reports as its Counter. A send the
+ *       core refused (no room, no key, too long) has an outcome with Ok 0, no attempts and Frame 0
  *   {"EspNowMesh":{"Notice":{"Kind":"Silent","Node":3,"By":2,"Value":0}}}
  *       Silent, Back, Noisy, Calm, BulkDone, BulkLost
  *
@@ -75,13 +84,18 @@
  *   EspNowMeshPublic           - this device's public key
  *   EspNowMeshNetwork <bits>   - 1 also by the network (UDP), 2 no radio in use, 4 repeat on the network for the nodes with none
  *   EspNowMeshInfo <hex>       - up to 32 bytes that every heartbeat carries
- *   EspNowMeshSend <dest>,<type>,<ack 0|1>,<text or 0xHEX> - a frame; dest 255 is everyone; type 0 command, 2 state, 3 event
+ *   EspNowMeshSend <dest>,<type>,<ack 0|1>,<text or 0xHEX> - a frame; dest 255 is everyone; type 0 command, 2 state, 3 event; answers
+ *                                {"Queued":1,"Counter":<ticket>}, or "busy" when the queue to the task is full, or "not running"
+ *   EspNowMeshReady [0|1]      - whether the application is ready to take frames, as above
  *   EspNowMeshStatus           - the state of the task and the counters
  *   EspNowMeshNeighbors [<first>] - the neighbours the heartbeats have given, six at a time
  *
  * And, in Berry, without the trip through the command handler:
- *   espnow_mesh_send(dest, type, ack, data) - true when the frame was handed to the task; data is bytes or a string
- *   espnow_mesh_info(data)                  - the bytes (up to 32) every heartbeat carries
+ *   espnow_mesh_send(dest, type, ack, data) - the ticket of the send, an integer above 0, or false when it was not taken; data is bytes
+ *                                             or a string, up to espnow_mesh_max_payload(dest)
+ *   espnow_mesh_max_payload(dest)           - the most bytes a payload to dest can be
+ *   espnow_mesh_info(data)                  - true when the task took the bytes (up to 32) every heartbeat carries; says the application is ready
+ *   espnow_mesh_ready([ready])              - true; says the application is ready, or with false that it is not
 \*********************************************************************************************/
 
 #define XDRV_100                       100
@@ -101,7 +115,9 @@
 #define ESPNOW_MESH_UDP_PORT           47474
 #define ESPNOW_MESH_RX_DEPTH           8
 #define ESPNOW_MESH_CMD_DEPTH          4
-#define ESPNOW_MESH_EVENT_DEPTH        8
+#define ESPNOW_MESH_EVENT_DEPTH        8           // frames for the application on their way to the main loop: the inbox of the core keeps 8 more
+#define ESPNOW_MESH_NOTE_DEPTH         16          // outcomes and notices on their way to the main loop: the core keeps 8 of each
+#define ESPNOW_MESH_SENT_DEPTH         16          // the frames sent with an answer asked, whose ticket is kept until their outcome comes
 #define ESPNOW_MESH_TASK_STACK         6144
 #define ESPNOW_MESH_TASK_PRIORITY      5
 #define ESPNOW_MESH_SEND_WAIT_MS       20          // for the radio to say what became of a frame
@@ -164,29 +180,41 @@ typedef struct {
   uint8_t dest;
   uint8_t flags;
   uint8_t len;
+  uint32_t ticket;                           // what the caller is given for a send, and its outcome carries
   uint8_t data[EspNowMesh::kMaxPayload];
 } EspNowMeshCmd_t;
 
-// What the core has to tell the main loop
-#define ESPNOW_MESH_EVT_DELIVERY       1
-#define ESPNOW_MESH_EVT_OUTCOME        2
-#define ESPNOW_MESH_EVT_NOTICE         3
+// What the core has to tell the main loop: the frames for this device, one to an item of the queue that carries them
 typedef struct {
-  uint8_t kind;
-  uint8_t origin;                            // a delivery's origin; a notice's node
-  uint8_t type;                              // a delivery's type; a notice's kind
-  uint8_t flags;                             // a delivery's: 1 answer asked, 2 repeat; an outcome's: ok
+  uint8_t origin;
+  uint8_t type;
+  uint8_t flags;                             // 1 answer asked, 2 repeat
   uint8_t part;
-  uint8_t attempt;                           // a delivery's attempt; an outcome's attempts
-  uint8_t behind;                            // a delivery's: how many numbers of its origin it was behind the newest heard
-  uint8_t dest;                              // a delivery's, an outcome's; a notice's: by
+  uint8_t attempt;
+  uint8_t behind;                            // how many numbers of its origin the frame was behind the newest heard
+  uint8_t dest;
   int8_t rssi;
-  uint32_t counter;                          // an outcome's frame; a notice's value
+  uint32_t counter;
   uint32_t epoch;
   uint32_t joins;
   uint8_t len;
   uint8_t data[EspNowMesh::kMaxPayload];
 } EspNowMeshEvent_t;
+
+// And the rest of it, which is small and has a queue of its own: a delivery that waits for the main loop must never push out the word
+// that a node went silent, or that a frame was not answered
+#define ESPNOW_MESH_NOTE_OUTCOME       1
+#define ESPNOW_MESH_NOTE_NOTICE        2
+typedef struct {
+  uint8_t kind;
+  uint8_t node;                              // a notice's node
+  uint8_t type;                              // a notice's kind
+  uint8_t ok;                                // an outcome's: answered
+  uint8_t attempts;                          // an outcome's
+  uint8_t dest;                              // an outcome's frame's destination; a notice's: by
+  uint32_t counter;                          // an outcome's: the ticket the send gave; a notice's value
+  uint32_t frame;                            // an outcome's: the number the frame had on the air, 0 for one that was never sent
+} EspNowMeshNote_t;
 
 typedef struct {
   uint8_t id;
@@ -243,6 +271,8 @@ static struct {
   volatile bool send_ok = false;
   volatile bool config_dirty = false;
   uint32_t epoch_ahead = 0;                  // an epoch saved by a start that failed after it: no frame went under it, and the next start takes it
+  volatile bool app_ready = true;            // the application has its rules registered: until it says so the frames for it are not taken
+  uint32_t ticket = 0;                       // the last a send was given, by the main loop alone
   volatile uint32_t dropped = 0;             // frames the callback had no room for
   uint8_t applied_channel = 0;
   EspNowMesh::Node* node = nullptr;
@@ -251,11 +281,30 @@ static struct {
   EspNowMeshShared_t* shared = nullptr;
   QueueHandle_t rx = nullptr;
   QueueHandle_t cmd = nullptr;
-  QueueHandle_t event = nullptr;
+  QueueHandle_t event = nullptr;             // the frames for the application
+  QueueHandle_t note = nullptr;              // the outcomes and the notices
   SemaphoreHandle_t send_done = nullptr;
   SemaphoreHandle_t lock = nullptr;          // the shared copy and the snapshot
   TaskHandle_t task = nullptr;
 } EspNowMeshDriver;
+
+// What the driver counts of its own, for the status: the core counts the frames, this counts what happens around it
+static struct {
+  volatile uint32_t cmd_busy = 0;            // commands refused because the queue to the task was full
+  volatile uint32_t evt_full = 0;            // turns of the task that found the queue to the main loop full: what the core had for the application waited in its inbox
+  volatile uint32_t note_lost = 0;           // outcomes and notices the queue to the main loop had no room for: 0 unless the main loop stops
+  volatile uint32_t refused = 0;             // sends the core refused
+} EspNowMeshCount;
+
+// What the task keeps of the frames it sent with an answer asked, for the outcome to say which send it is: the number a frame has on
+// the air is the core's, and the caller was given a ticket before the frame had one. The task's alone
+typedef struct {
+  uint32_t frame;                            // 0: free
+  uint32_t ticket;
+  uint8_t dest;
+} EspNowMeshSent_t;
+static EspNowMeshSent_t EspNowMeshSent[ESPNOW_MESH_SENT_DEPTH];
+static uint8_t EspNowMeshSentNext = 0;
 
 static const uint8_t EspNowMeshBroadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF};
 
@@ -679,24 +728,69 @@ static void EspNowMeshApplyShared(EspNowMesh::Node* node, EspNowMeshShared_t* sh
   delete fresh;
 }
 
-static void EspNowMeshPutEvent(const EspNowMeshEvent_t* event);
-static void EspNowMeshPutEvent(const EspNowMeshEvent_t* event) {
-  if (pdTRUE != xQueueSend(EspNowMeshDriver.event, event, 0)) {
-    EspNowMeshEvent_t dropped;
-    xQueueReceive(EspNowMeshDriver.event, &dropped, 0);        // make room, keep the newest
-    xQueueSend(EspNowMeshDriver.event, event, 0);
+// The ticket a frame sent with an answer asked was given, and the entry is free again; 0 for a frame that is not one of these
+static uint32_t EspNowMeshTicketOf(uint32_t frame, uint8_t dest) {
+  for (uint32_t i = 0; i < ESPNOW_MESH_SENT_DEPTH; i++) {
+    EspNowMeshSent_t& sent = EspNowMeshSent[i];
+    if (sent.frame && (sent.frame == frame) && (sent.dest == dest)) {
+      sent.frame = 0;
+      return sent.ticket;
+    }
   }
+  return 0;
+}
+
+static void EspNowMeshTicketKeep(uint32_t frame, uint32_t ticket, uint8_t dest) {
+  EspNowMeshSent_t& sent = EspNowMeshSent[EspNowMeshSentNext];       // a ring: what has waited longest goes first, and the core holds 8
+  sent.frame = frame;
+  sent.ticket = ticket;
+  sent.dest = dest;
+  EspNowMeshSentNext = (EspNowMeshSentNext + 1) % ESPNOW_MESH_SENT_DEPTH;
+}
+
+static bool EspNowMeshPutNote(const EspNowMeshNote_t* note);
+static bool EspNowMeshPutNote(const EspNowMeshNote_t* note) {
+  if (pdTRUE == xQueueSend(EspNowMeshDriver.note, note, 0)) { return true; }
+  EspNowMeshCount.note_lost++;
+  return false;
 }
 
 // What the core has to tell the main loop: the frames for this device, what became of the ones that asked for an answer, and
-// what the supervision found
+// what the supervision found.
+//
+// Each is taken out of the core only while the queue that carries it has room, and what the queue has no room for stays in the core: a
+// frame for this device alone that the inbox has no room for is then not answered, and its sender sends it again, where one taken out
+// and dropped here would have been answered and lost. The word that a node is silent, or that a frame was not answered, has a queue
+// of its own and is never pushed out by frames
 static void EspNowMeshDrain(EspNowMesh::Node* node);
 static void EspNowMeshDrain(EspNowMesh::Node* node) {
+  EspNowMesh::Outcome o;
+  while ((uxQueueSpacesAvailable(EspNowMeshDriver.note) > 0) && node->PopOutcome(&o)) {
+    EspNowMeshNote_t note;
+    memset(&note, 0, sizeof(note));
+    note.kind = ESPNOW_MESH_NOTE_OUTCOME;
+    note.counter = EspNowMeshTicketOf(o.counter, o.dest);
+    note.frame = o.counter;
+    note.dest = o.dest;
+    note.ok = o.ok ? 1 : 0;
+    note.attempts = o.attempts;
+    EspNowMeshPutNote(&note);
+  }
+  EspNowMesh::Notice n;
+  while ((uxQueueSpacesAvailable(EspNowMeshDriver.note) > 0) && node->PopNotice(&n)) {
+    EspNowMeshNote_t note;
+    memset(&note, 0, sizeof(note));
+    note.kind = ESPNOW_MESH_NOTE_NOTICE;
+    note.node = n.node;
+    note.type = n.kind;
+    note.dest = n.by;
+    note.counter = n.value;
+    EspNowMeshPutNote(&note);
+  }
   EspNowMesh::Delivery d;
-  while (node->PopDelivery(&d)) {
+  while ((uxQueueSpacesAvailable(EspNowMeshDriver.event) > 0) && node->PopDelivery(&d)) {
     EspNowMeshEvent_t e;
     memset(&e, 0, sizeof(e));
-    e.kind = ESPNOW_MESH_EVT_DELIVERY;
     e.origin = d.origin;
     e.type = d.type;
     e.flags = (d.ackRequested ? 1 : 0) | (d.retry ? 2 : 0);
@@ -710,40 +804,33 @@ static void EspNowMeshDrain(EspNowMesh::Node* node) {
     e.joins = d.joins;
     e.len = d.len;
     memcpy(e.data, d.payload, d.len);
-    EspNowMeshPutEvent(&e);
+    xQueueSend(EspNowMeshDriver.event, &e, 0);                // there was room: it was looked at
   }
-  EspNowMesh::Outcome o;
-  while (node->PopOutcome(&o)) {
-    EspNowMeshEvent_t e;
-    memset(&e, 0, sizeof(e));
-    e.kind = ESPNOW_MESH_EVT_OUTCOME;
-    e.counter = o.counter;
-    e.dest = o.dest;
-    e.flags = o.ok ? 1 : 0;
-    e.attempt = o.attempts;
-    EspNowMeshPutEvent(&e);
-  }
-  EspNowMesh::Notice n;
-  while (node->PopNotice(&n)) {
-    EspNowMeshEvent_t e;
-    memset(&e, 0, sizeof(e));
-    e.kind = ESPNOW_MESH_EVT_NOTICE;
-    e.origin = n.node;
-    e.type = n.kind;
-    e.dest = n.by;
-    e.counter = n.value;
-    EspNowMeshPutEvent(&e);
-  }
+  if (0 == uxQueueSpacesAvailable(EspNowMeshDriver.event)) { EspNowMeshCount.evt_full++; }
 }
 
 static void EspNowMeshDoCommand(EspNowMesh::Node* node, const EspNowMeshCmd_t* cmd);
 static void EspNowMeshDoCommand(EspNowMesh::Node* node, const EspNowMeshCmd_t* cmd) {
   switch (cmd->op) {
-    case ESPNOW_MESH_CMD_SEND:
-      if (!node->Send((EspNowMesh::Type)cmd->type, cmd->dest, cmd->data, cmd->len, cmd->flags & 1, millis())) {
+    case ESPNOW_MESH_CMD_SEND: {
+      uint32_t frame = node->Send((EspNowMesh::Type)cmd->type, cmd->dest, cmd->data, cmd->len, cmd->flags & 1, millis());
+      if (0 == frame) {
+        // The core has no room (8 frames waiting for an answer, 16 to send), no key for the destination, or the frame is too long. The
+        // caller was given a ticket when the send was queued and is told here that nothing was sent, as it is told of a frame that went
+        // and was not answered: an outcome that is not ok, with no attempts
+        EspNowMeshCount.refused++;
         AddLog(LOG_LEVEL_INFO, PSTR("EMH: A frame of %u bytes for %u was refused: no room, no key or too long"), cmd->len, cmd->dest);
+        EspNowMeshNote_t note;
+        memset(&note, 0, sizeof(note));
+        note.kind = ESPNOW_MESH_NOTE_OUTCOME;
+        note.counter = cmd->ticket;
+        note.dest = cmd->dest;
+        EspNowMeshPutNote(&note);
+      } else if ((cmd->flags & 1) && (EspNowMesh::kToAll != cmd->dest)) {
+        EspNowMeshTicketKeep(frame, cmd->ticket, cmd->dest);   // the outcome of this frame is this ticket's
       }
       break;
+    }
     case ESPNOW_MESH_CMD_INFO:
       node->SetBeatInfo(cmd->data, cmd->len);
       break;
@@ -813,10 +900,18 @@ static void EspNowMeshTask(void* argument) {
   (void)argument;
   EspNowMesh::Node* node = EspNowMeshDriver.node;
   uint32_t snapshot_at = 0;
+  // The frames for the application are taken only while it says it is ready: one that is answered before the rules that would take it are
+  // registered is lost, and its sender is told it arrived
+  bool ready = EspNowMeshDriver.app_ready;
+  node->SetDeliverEnabled(ready);
   EspNowMeshApplyShared(node, EspNowMeshDriver.shared);
 
   while (!EspNowMeshDriver.stop) {
     if (EspNowMeshDriver.config_dirty) { EspNowMeshApplyShared(node, EspNowMeshDriver.shared); }
+    if (ready != EspNowMeshDriver.app_ready) {
+      ready = EspNowMeshDriver.app_ready;
+      node->SetDeliverEnabled(ready);
+    }
 
     EspNowMeshCmd_t cmd;
     while (pdTRUE == xQueueReceive(EspNowMeshDriver.cmd, &cmd, 0)) { EspNowMeshDoCommand(node, &cmd); }
@@ -877,6 +972,7 @@ static void EspNowMeshFree(void) {
   if (EspNowMeshDriver.rx) { vQueueDelete(EspNowMeshDriver.rx); EspNowMeshDriver.rx = nullptr; }
   if (EspNowMeshDriver.cmd) { vQueueDelete(EspNowMeshDriver.cmd); EspNowMeshDriver.cmd = nullptr; }
   if (EspNowMeshDriver.event) { vQueueDelete(EspNowMeshDriver.event); EspNowMeshDriver.event = nullptr; }
+  if (EspNowMeshDriver.note) { vQueueDelete(EspNowMeshDriver.note); EspNowMeshDriver.note = nullptr; }
   if (EspNowMeshDriver.send_done) { vSemaphoreDelete(EspNowMeshDriver.send_done); EspNowMeshDriver.send_done = nullptr; }
   if (EspNowMeshDriver.lock) { vSemaphoreDelete(EspNowMeshDriver.lock); EspNowMeshDriver.lock = nullptr; }
   if (EspNowMeshDriver.crypto) { EspNowMeshWipe(EspNowMeshDriver.crypto, sizeof(EspNowMesh::Crypto)); }
@@ -935,10 +1031,11 @@ static bool EspNowMeshStartAttempt(void) {
   EspNowMeshDriver.rx = xQueueCreate(ESPNOW_MESH_RX_DEPTH, sizeof(EspNowMeshRx_t));
   EspNowMeshDriver.cmd = xQueueCreate(ESPNOW_MESH_CMD_DEPTH, sizeof(EspNowMeshCmd_t));
   EspNowMeshDriver.event = xQueueCreate(ESPNOW_MESH_EVENT_DEPTH, sizeof(EspNowMeshEvent_t));
+  EspNowMeshDriver.note = xQueueCreate(ESPNOW_MESH_NOTE_DEPTH, sizeof(EspNowMeshNote_t));
   EspNowMeshDriver.send_done = xSemaphoreCreateBinary();
   EspNowMeshDriver.lock = xSemaphoreCreateMutex();
   if (!EspNowMeshDriver.node || !EspNowMeshDriver.crypto || !EspNowMeshDriver.snapshot || !EspNowMeshDriver.shared ||
-      !EspNowMeshDriver.rx || !EspNowMeshDriver.cmd || !EspNowMeshDriver.event || !EspNowMeshDriver.send_done || !EspNowMeshDriver.lock) {
+      !EspNowMeshDriver.rx || !EspNowMeshDriver.cmd || !EspNowMeshDriver.event || !EspNowMeshDriver.note || !EspNowMeshDriver.send_done || !EspNowMeshDriver.lock) {
     AddLog(LOG_LEVEL_ERROR, PSTR("EMH: Not enough memory, %u bytes free"), ESP_getFreeHeap());
     EspNowMeshFree();
     return false;
@@ -946,6 +1043,13 @@ static bool EspNowMeshStartAttempt(void) {
   memset(EspNowMeshDriver.snapshot, 0, sizeof(EspNowMeshSnapshot_t));
   memset(EspNowMeshDriver.shared, 0, sizeof(EspNowMeshShared_t));
   memset(EspNowMeshTable, 0, sizeof(EspNowMeshTable));
+  memset(EspNowMeshSent, 0, sizeof(EspNowMeshSent));
+  EspNowMeshSentNext = 0;
+  EspNowMeshCount.cmd_busy = 0;                    // the counters of the run, as the core's are
+  EspNowMeshCount.evt_full = 0;
+  EspNowMeshCount.note_lost = 0;
+  EspNowMeshCount.refused = 0;
+  EspNowMeshDriver.dropped = 0;
 
   if (!EspNowMeshDriver.crypto->Begin(EspNowMeshSettings.secret)) {
     AddLog(LOG_LEVEL_ERROR, PSTR("EMH: The identity gives no public key"));
@@ -1039,7 +1143,14 @@ void EspNowMeshWifiEvent(arduino_event_t *event) {
   }
 }
 
+#ifdef USE_BERRY
+static void EspNowMeshBerryCheck(void);
+#endif
+
 static void EspNowMeshEverySecond(void) {
+#ifdef USE_BERRY
+  EspNowMeshBerryCheck();
+#endif
   if (EspNowMeshDriver.running && EspNowMeshDriver.exited) { EspNowMeshReap(); }       // a task that was slow to end
   if (!EspNowMeshSettings.enabled) { return; }
   if (!EspNowMeshDriver.running) {
@@ -1078,30 +1189,26 @@ static const char* EspNowMeshNoticeName(uint8_t kind) {
 }
 
 static void EspNowMeshDrainEvents(void) {
-  if (nullptr == EspNowMeshDriver.event) { return; }
+  if ((nullptr == EspNowMeshDriver.event) || (nullptr == EspNowMeshDriver.note)) { return; }
+  EspNowMeshNote_t note;
+  while (pdTRUE == xQueueReceive(EspNowMeshDriver.note, &note, 0)) {
+    if (ESPNOW_MESH_NOTE_OUTCOME == note.kind) {
+      AddLog(LOG_LEVEL_INFO, PSTR("EMH: Send %u (frame %u) for %u %s after %u attempts"), note.counter, note.frame, note.dest, note.ok ? PSTR("was answered") : PSTR("was not answered"), note.attempts);
+      Response_P(PSTR("{\"EspNowMesh\":{\"Outcome\":{\"Counter\":%u,\"Frame\":%u,\"Dest\":%u,\"Ok\":%u,\"Attempts\":%u}}}"), note.counter, note.frame, note.dest, note.ok, note.attempts);
+    } else {
+      AddLog(LOG_LEVEL_INFO, PSTR("EMH: %s, node %u, said by %u"), EspNowMeshNoticeName(note.type), note.node, note.dest);
+      Response_P(PSTR("{\"EspNowMesh\":{\"Notice\":{\"Kind\":\"%s\",\"Node\":%u,\"By\":%u,\"Value\":%u}}}"), EspNowMeshNoticeName(note.type), note.node, note.dest, note.counter);
+    }
+    XdrvRulesProcess(0);
+  }
   EspNowMeshEvent_t e;
   while (pdTRUE == xQueueReceive(EspNowMeshDriver.event, &e, 0)) {
-    switch (e.kind) {
-      case ESPNOW_MESH_EVT_DELIVERY: {
-        char hex[2 * EspNowMesh::kMaxPayload + 1];
-        ToHex_P(e.data, e.len, hex, sizeof(hex));
-        AddLog(LOG_LEVEL_INFO, PSTR("EMH: From %u type %u dest %u counter %u rssi %d%s: %d bytes"), e.origin, e.type, e.dest, e.counter, e.rssi, (e.flags & 2) ? PSTR(" repeat") : PSTR(""), e.len);
-        Response_P(PSTR("{\"EspNowMesh\":{\"From\":%u,\"Type\":%u,\"Dest\":%u,\"Counter\":%u,\"Epoch\":%u,\"Rssi\":%d,\"Flags\":%u,\"Part\":%u,\"Joins\":%u,\"Behind\":%u,\"Data\":\"%s\"}}"),
-          e.origin, e.type, e.dest, e.counter, e.epoch, e.rssi, e.flags, e.part, e.joins, e.behind, hex);
-        XdrvRulesProcess(0);
-        break;
-      }
-      case ESPNOW_MESH_EVT_OUTCOME:
-        AddLog(LOG_LEVEL_INFO, PSTR("EMH: Frame %u for %u %s after %u attempts"), e.counter, e.dest, e.flags ? PSTR("was answered") : PSTR("was not answered"), e.attempt);
-        Response_P(PSTR("{\"EspNowMesh\":{\"Outcome\":{\"Counter\":%u,\"Dest\":%u,\"Ok\":%u,\"Attempts\":%u}}}"), e.counter, e.dest, e.flags, e.attempt);
-        XdrvRulesProcess(0);
-        break;
-      case ESPNOW_MESH_EVT_NOTICE:
-        AddLog(LOG_LEVEL_INFO, PSTR("EMH: %s, node %u, said by %u"), EspNowMeshNoticeName(e.type), e.origin, e.dest);
-        Response_P(PSTR("{\"EspNowMesh\":{\"Notice\":{\"Kind\":\"%s\",\"Node\":%u,\"By\":%u,\"Value\":%u}}}"), EspNowMeshNoticeName(e.type), e.origin, e.dest, e.counter);
-        XdrvRulesProcess(0);
-        break;
-    }
+    char hex[2 * EspNowMesh::kMaxPayload + 1];
+    ToHex_P(e.data, e.len, hex, sizeof(hex));
+    AddLog(LOG_LEVEL_INFO, PSTR("EMH: From %u type %u dest %u counter %u rssi %d%s: %d bytes"), e.origin, e.type, e.dest, e.counter, e.rssi, (e.flags & 2) ? PSTR(" repeat") : PSTR(""), e.len);
+    Response_P(PSTR("{\"EspNowMesh\":{\"From\":%u,\"Type\":%u,\"Dest\":%u,\"Counter\":%u,\"Epoch\":%u,\"Rssi\":%d,\"Flags\":%u,\"Part\":%u,\"Joins\":%u,\"Behind\":%u,\"Data\":\"%s\"}}"),
+      e.origin, e.type, e.dest, e.counter, e.epoch, e.rssi, e.flags, e.part, e.joins, e.behind, hex);
+    XdrvRulesProcess(0);
   }
 }
 
@@ -1258,10 +1365,53 @@ void CmndEspNowMeshNetwork(void) {
   ResponseCmndNumber(EspNowMeshSettings.network);
 }
 
-static bool EspNowMeshQueueCommand(const EspNowMeshCmd_t* cmd);
-static bool EspNowMeshQueueCommand(const EspNowMeshCmd_t* cmd) {
-  if (!EspNowMeshDriver.running || (nullptr == EspNowMeshDriver.cmd)) { return false; }
-  return (pdTRUE == xQueueSend(EspNowMeshDriver.cmd, cmd, 0));
+// What the main loop gets for handing the task a command: it has it, the task is not running, or its queue is full. A send is given
+// its ticket here, one that the call of a script gets back and the outcome of the frame carries, so that a script can tell which of its
+// sends an outcome is, and a send the core refuses has an outcome too
+#define ESPNOW_MESH_QUEUED             1
+#define ESPNOW_MESH_NOT_RUNNING        0
+#define ESPNOW_MESH_BUSY               -1
+static int32_t EspNowMeshQueueCommand(EspNowMeshCmd_t* cmd);
+static int32_t EspNowMeshQueueCommand(EspNowMeshCmd_t* cmd) {
+  if (!EspNowMeshDriver.running || (nullptr == EspNowMeshDriver.cmd)) { return ESPNOW_MESH_NOT_RUNNING; }
+  uint32_t ticket = EspNowMeshDriver.ticket + 1;
+  if (!ticket) { ticket = 1; }
+  if (ESPNOW_MESH_CMD_SEND == cmd->op) { cmd->ticket = ticket; }
+  if (pdTRUE != xQueueSend(EspNowMeshDriver.cmd, cmd, 0)) {
+    EspNowMeshCount.cmd_busy++;
+    return ESPNOW_MESH_BUSY;
+  }
+  if (ESPNOW_MESH_CMD_SEND == cmd->op) { EspNowMeshDriver.ticket = ticket; }
+  TaskHandle_t task = EspNowMeshDriver.task;
+  if (task) { xTaskNotifyGive(task); }       // the task is woken for it, and does not find it only at the end of its wait of a few ms
+  return ESPNOW_MESH_QUEUED;
+}
+
+static const char* EspNowMeshQueuedText(int32_t result) {
+  return (ESPNOW_MESH_QUEUED == result) ? PSTR("queued") : ((ESPNOW_MESH_BUSY == result) ? PSTR("busy") : PSTR("not running"));
+}
+
+// The most a payload to `dest` can be: the core's, which takes the seal of a frame for one node alone off what a frame can hold
+static size_t EspNowMeshMaxPayload(uint8_t dest);
+static size_t EspNowMeshMaxPayload(uint8_t dest) {
+  if (EspNowMeshDriver.node) { return EspNowMeshDriver.node->MaxPayloadFor(dest); }
+  return EspNowMesh::kMaxPayload - ((EspNowMesh::kToAll != dest) ? EspNowMesh::kPairTagLen : 0);
+}
+
+// The application says it is ready, which is that the rules that take the frames for it are registered; or that it is not. Until it is
+// the frames for it are refused by the core, as when the inbox has no room, and the senders send them again
+static void EspNowMeshSetReady(bool ready);
+static void EspNowMeshSetReady(bool ready) {
+  if (ready == EspNowMeshDriver.app_ready) { return; }
+  EspNowMeshDriver.app_ready = ready;
+  AddLog(LOG_LEVEL_INFO, ready ? PSTR("EMH: The application is ready: the frames for it are taken") : PSTR("EMH: The application is not ready: the frames for it are not taken"));
+  TaskHandle_t task = EspNowMeshDriver.task;
+  if (task) { xTaskNotifyGive(task); }
+}
+
+void CmndEspNowMeshReady(void) {
+  if (XdrvMailbox.data_len > 0) { EspNowMeshSetReady(atoi(XdrvMailbox.data) != 0); }
+  Response_P(PSTR("{\"%s\":{\"Ready\":%u}}"), XdrvMailbox.command, EspNowMeshDriver.app_ready);
 }
 
 void CmndEspNowMeshInfo(void) {
@@ -1271,7 +1421,7 @@ void CmndEspNowMeshInfo(void) {
   int32_t len = XdrvMailbox.data_len ? HexToBytes(XdrvMailbox.data, cmd.data, EspNowMesh::kMaxInfo) : 0;
   if (len < 0) { ResponseCmndError(); return; }
   cmd.len = len;
-  ResponseCmndChar_P(EspNowMeshQueueCommand(&cmd) ? PSTR("queued") : PSTR("not running"));
+  ResponseCmndChar_P(EspNowMeshQueuedText(EspNowMeshQueueCommand(&cmd)));
 }
 
 void CmndEspNowMeshSend(void) {
@@ -1299,11 +1449,20 @@ void CmndEspNowMeshSend(void) {
     cmd.len = len;
   } else {
     size_t len = strlen(fields[3]);
-    if (len > sizeof(cmd.data)) { ResponseCmndChar_P(PSTR("too long")); return; }
+    if (len > sizeof(cmd.data)) { Response_P(PSTR("{\"%s\":\"too long\",\"Max\":%u}"), XdrvMailbox.command, (uint32_t)EspNowMeshMaxPayload(cmd.dest)); return; }
     memcpy(cmd.data, fields[3], len);
     cmd.len = len;
   }
-  ResponseCmndChar_P(EspNowMeshQueueCommand(&cmd) ? PSTR("queued") : PSTR("not running"));
+  if (cmd.len > EspNowMeshMaxPayload(cmd.dest)) {
+    Response_P(PSTR("{\"%s\":\"too long\",\"Max\":%u}"), XdrvMailbox.command, (uint32_t)EspNowMeshMaxPayload(cmd.dest));
+    return;
+  }
+  int32_t queued = EspNowMeshQueueCommand(&cmd);
+  if (ESPNOW_MESH_QUEUED == queued) {
+    Response_P(PSTR("{\"%s\":{\"Queued\":1,\"Counter\":%u}}"), XdrvMailbox.command, cmd.ticket);
+  } else {
+    ResponseCmndChar_P(EspNowMeshQueuedText(queued));
+  }
 }
 
 static const char* EspNowMeshStateName(uint8_t state) {
@@ -1364,10 +1523,18 @@ void CmndEspNowMeshNeighbors(void) {
 // Going through the command handler costs a full dispatch on the main loop, about 8 ms even for a command that does nothing
 // (xdrv_98), and a script that sends often should not pay it. So Berry gets entry points of its own:
 //
-//   espnow_mesh_send(dest, type, ack, data)  -> true when the frame was handed to the task; data is bytes or a string
-//   espnow_mesh_info(data)                   -> true; the bytes (up to 32) every heartbeat carries
+//   espnow_mesh_send(dest, type, ack, data)  -> the ticket of the send, an integer above 0, or false when it was not taken (the task is not
+//                                               running, its queue is full, the destination or the type is out of range, or the data is more
+//                                               than espnow_mesh_max_payload(dest)); data is bytes or a string. The outcome of a frame sent
+//                                               with an answer asked carries the ticket as its Counter, and so does one the core refused, with
+//                                               Ok 0 and no attempts
+//   espnow_mesh_max_payload(dest)            -> the most bytes a payload to dest can be
+//   espnow_mesh_info(data)                   -> true when the task took it; the bytes (up to 32) every heartbeat carries. Also says the
+//                                               application is ready
+//   espnow_mesh_ready([ready])               -> true; says the application is ready (the default) or, with false, that it is not
 //
-// What arrives, and what became of what was sent, comes to the rules, as the log and the header say.
+// The frames for the application are not taken, and not answered, until it says it is ready: a script registers its rules and then
+// says so. What arrives, and what became of what was sent, comes to the rules, as the log and the header say.
 int EspNowMeshBerrySend(struct bvm *vm);
 int EspNowMeshBerrySend(struct bvm *vm) {
   int32_t argc = be_top(vm);
@@ -1383,8 +1550,8 @@ int EspNowMeshBerrySend(struct bvm *vm) {
       data = be_tostring(vm, 4);
       len = strlen((const char*)data);
     }
-    bool queued = false;
-    if (data && (dest >= 0) && (dest <= 255) && (type >= 0) && (type <= 7) && (EspNowMesh::kBeat != type) && (len <= EspNowMesh::kMaxPayload)) {
+    uint32_t ticket = 0;
+    if (data && (dest >= 0) && (dest <= 255) && (type >= 0) && (type <= 7) && (EspNowMesh::kBeat != type) && (len <= EspNowMeshMaxPayload(dest))) {
       EspNowMeshCmd_t cmd;
       memset(&cmd, 0, sizeof(cmd));
       cmd.op = ESPNOW_MESH_CMD_SEND;
@@ -1393,12 +1560,28 @@ int EspNowMeshBerrySend(struct bvm *vm) {
       cmd.flags = ack ? 1 : 0;
       cmd.len = len;
       if (len) { memcpy(cmd.data, data, len); }
-      queued = EspNowMeshQueueCommand(&cmd);
+      if (ESPNOW_MESH_QUEUED == EspNowMeshQueueCommand(&cmd)) { ticket = cmd.ticket; }
     }
-    be_pushbool(vm, queued);
+    if (ticket) { be_pushint(vm, (bint)ticket); } else { be_pushbool(vm, false); }
     be_return(vm);
   }
   be_raise(vm, kTypeError, nullptr);
+}
+
+int EspNowMeshBerryMaxPayload(struct bvm *vm);
+int EspNowMeshBerryMaxPayload(struct bvm *vm) {
+  if ((be_top(vm) >= 1) && be_isint(vm, 1) && (be_toint(vm, 1) >= 0) && (be_toint(vm, 1) <= 255)) {
+    be_pushint(vm, (bint)EspNowMeshMaxPayload(be_toint(vm, 1)));
+    be_return(vm);
+  }
+  be_raise(vm, kTypeError, nullptr);
+}
+
+int EspNowMeshBerryReady(struct bvm *vm);
+int EspNowMeshBerryReady(struct bvm *vm) {
+  EspNowMeshSetReady((be_top(vm) < 1) || be_tobool(vm, 1));
+  be_pushbool(vm, true);
+  be_return(vm);
 }
 
 int EspNowMeshBerryInfo(struct bvm *vm);
@@ -1420,7 +1603,8 @@ int EspNowMeshBerryInfo(struct bvm *vm) {
       cmd.op = ESPNOW_MESH_CMD_INFO;
       cmd.len = len;
       if (len) { memcpy(cmd.data, data, len); }
-      queued = EspNowMeshQueueCommand(&cmd);
+      queued = (ESPNOW_MESH_QUEUED == EspNowMeshQueueCommand(&cmd));
+      EspNowMeshSetReady(true);                // a script that tells the heartbeat what it carries has the rest of its rules in place
     }
     be_pushbool(vm, queued);
     be_return(vm);
@@ -1433,18 +1617,35 @@ static void EspNowMeshBerryRegister(void) {
   be_pushntvfunction(berry.vm, EspNowMeshBerrySend);
   be_setglobal(berry.vm, "espnow_mesh_send");
   be_pop(berry.vm, 1);
+  be_pushntvfunction(berry.vm, EspNowMeshBerryMaxPayload);
+  be_setglobal(berry.vm, "espnow_mesh_max_payload");
+  be_pop(berry.vm, 1);
   be_pushntvfunction(berry.vm, EspNowMeshBerryInfo);
   be_setglobal(berry.vm, "espnow_mesh_info");
   be_pop(berry.vm, 1);
+  be_pushntvfunction(berry.vm, EspNowMeshBerryReady);
+  be_setglobal(berry.vm, "espnow_mesh_ready");
+  be_pop(berry.vm, 1);
+}
+
+// The Berry machine is a new one after BrRestart, with none of what was registered in the old one: the entry points are put in it again,
+// and the application is not ready, for the rules it had are gone with the machine
+static void EspNowMeshBerryCheck(void) {
+  if (nullptr == berry.vm) { return; }
+  bool there = be_getglobal(berry.vm, "espnow_mesh_info");
+  be_pop(berry.vm, 1);
+  if (there) { return; }
+  EspNowMeshBerryRegister();
+  EspNowMeshSetReady(false);
 }
 #endif  // USE_BERRY
 
 const char kEspNowMeshCommands[] PROGMEM = "|"
   "EspNowMeshEnable|EspNowMeshId|EspNowMeshChannel|EspNowMeshGroupKey|EspNowMeshNode|EspNowMeshPublic|EspNowMeshNetwork|"
-  "EspNowMeshInfo|EspNowMeshSend|EspNowMeshStatus|EspNowMeshNeighbors";
+  "EspNowMeshInfo|EspNowMeshSend|EspNowMeshStatus|EspNowMeshNeighbors|EspNowMeshReady";
 void (* const kEspNowMeshCommand[])(void) PROGMEM = {
   &CmndEspNowMeshEnable, &CmndEspNowMeshId, &CmndEspNowMeshChannel, &CmndEspNowMeshGroupKey, &CmndEspNowMeshNode, &CmndEspNowMeshPublic,
-  &CmndEspNowMeshNetwork, &CmndEspNowMeshInfo, &CmndEspNowMeshSend, &CmndEspNowMeshStatus, &CmndEspNowMeshNeighbors };
+  &CmndEspNowMeshNetwork, &CmndEspNowMeshInfo, &CmndEspNowMeshSend, &CmndEspNowMeshStatus, &CmndEspNowMeshNeighbors, &CmndEspNowMeshReady };
 
 /*********************************************************************************************\
  * Interface
@@ -1461,6 +1662,9 @@ bool Xdrv100(uint32_t function) {
       WiFi.onEvent(EspNowMeshWifiEvent);
 #ifdef USE_BERRY
       EspNowMeshBerryRegister();
+      // With Berry running, the frames for the application wait until a script says it is ready. Without it, the rules of the device are
+      // all there is to take them, and are there
+      EspNowMeshDriver.app_ready = (nullptr == berry.vm);
 #endif
       break;
     case FUNC_LOOP:
