@@ -196,6 +196,14 @@
 #include <t_bearssl.h>
 #endif
 
+#ifdef USE_ESPNOW_MESH
+// The ESP-NOW mesh (xdrv_100) rides on the radio of this driver when it is up: it hears the frames that are its own before this
+// driver looks at them, is told what became of the frame it was sending, and is told when ESP-NOW is started and stopped here
+bool EspNowMeshHearsFrame(const uint8_t* mac, int8_t rssi, const uint8_t* data, int len);
+bool EspNowMeshSendResult(bool ok);
+void EspNowMeshDirectRadio(bool up);
+#endif
+
 #define ESPNOW_DIRECT_PROTOCOL         2                                                              // the wire protocol, in every HELLO and announcement
 #define ESPNOW_DIRECT_HEADER_SIZE      9                                                              // type + session_id + counter
 #define ESPNOW_DIRECT_TAG_SIZE         8
@@ -580,6 +588,9 @@ static void EspNowDirectHello(uint32_t session, uint32_t counter, const uint8_t*
 // preprocessor does not hoist a generated prototype above the ESP-NOW include.
 void EspNowDirectSendCb(const esp_now_send_info_t* info, esp_now_send_status_t status);
 void EspNowDirectSendCb(const esp_now_send_info_t* info, esp_now_send_status_t status) {
+#ifdef USE_ESPNOW_MESH
+  if (EspNowMeshSendResult(ESP_NOW_SEND_SUCCESS == status)) { return; }
+#endif
   if (ESP_NOW_SEND_SUCCESS == status) { return; }
 
   const uint8_t* mac = info->des_addr;
@@ -591,6 +602,9 @@ void EspNowDirectSendCb(const esp_now_send_info_t* info, esp_now_send_status_t s
 void EspNowDirectRecvCb(const esp_now_recv_info_t* info, const uint8_t* frame, int len);
 void EspNowDirectRecvCb(const esp_now_recv_info_t* info, const uint8_t* frame, int len) {
   if (len < 1) { return; }
+#ifdef USE_ESPNOW_MESH
+  if (EspNowMeshHearsFrame(info->src_addr, info->rx_ctrl->rssi, frame, len)) { return; }
+#endif
 #ifdef USE_ESPNOW_DIRECT_PAIRING
   // Pairing frames come from devices this side may never have met. Only the
   // kinds the pairing in progress waits for are taken, and only copied, with the
@@ -752,6 +766,9 @@ static bool EspNowDirectRadioStart(void) {
   if (ESP_OK != error) {
     AddLog(LOG_LEVEL_ERROR, PSTR("ENW: Init failed with error %d"), error);
     EspNowDirect.radio = false;
+#ifdef USE_ESPNOW_MESH
+    EspNowMeshDirectRadio(false);
+#endif
     return false;
   }
   if (nullptr == EspNowDirectRxQueue) {
@@ -760,6 +777,9 @@ static bool EspNowDirectRadioStart(void) {
   esp_now_register_recv_cb(EspNowDirectRecvCb);
   esp_now_register_send_cb(EspNowDirectSendCb);
   EspNowDirect.radio = true;
+#ifdef USE_ESPNOW_MESH
+  EspNowMeshDirectRadio(true);
+#endif
 #ifdef USE_ESPNOW_DIRECT_PAIRING
   EspNowDirectPairAddBroadcast();          // a pairing in progress keeps its broadcast entry
 #endif
@@ -772,6 +792,9 @@ static void EspNowDirectRadioStop(void) {
   esp_now_unregister_send_cb();
   esp_now_deinit();
   EspNowDirect.radio = false;
+#ifdef USE_ESPNOW_MESH
+  EspNowMeshDirectRadio(false);
+#endif
 }
 
 // Follows the radio as the station comes and goes. Deliberately keyed off the
@@ -923,6 +946,9 @@ static bool EspNowDirectRecover(void) {
   } else {
     EspNowDirect.radio = false;            // nothing to start again: what the stack held is gone
     EspNowDirect.radio_lost = false;
+#ifdef USE_ESPNOW_MESH
+    EspNowMeshDirectRadio(false);
+#endif
   }
   return true;
 }
