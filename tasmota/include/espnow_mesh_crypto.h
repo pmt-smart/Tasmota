@@ -54,6 +54,12 @@ constexpr unsigned kCryptoPeers = 16;        // the nodes a node keeps a pair ke
 
 class Crypto {
  public:
+  // Wipes key material in a way the compiler does not drop as a dead store
+  static void Wipe(void *buffer, size_t len) {
+    volatile uint8_t *p = (volatile uint8_t *)buffer;
+    while (len--) *p++ = 0;
+  }
+
   // The identity, from a 32-byte secret (X25519, clamped by the curve function itself). False if no public key comes of it
   bool Begin(const uint8_t secret[32]) {
     memset(this, 0, sizeof(*this));
@@ -71,7 +77,7 @@ class Crypto {
     Hkdf((const uint8_t *)salt, sizeof(salt) - 1, key, 32, (const uint8_t *)"enc", 3, groupEnc_, sizeof(groupEnc_));
     Hkdf((const uint8_t *)salt, sizeof(salt) - 1, key, 32, (const uint8_t *)"mac", 3, mac, sizeof(mac));
     br_hmac_key_init(&groupMac_, &br_sha256_vtable, mac, sizeof(mac));
-    memset(mac, 0, sizeof(mac));
+    Wipe(mac, sizeof(mac));
     groupVersion_ = version;
     hasGroup_ = true;
   }
@@ -98,10 +104,11 @@ class Crypto {
     memset(&fresh, 0, sizeof(fresh));
     Hkdf(salt, sizeof(salt), shared, sizeof(shared), (const uint8_t *)"pair enc", 8, fresh.enc, sizeof(fresh.enc));
     Hkdf(salt, sizeof(salt), shared, sizeof(shared), (const uint8_t *)"pair proof", 10, fresh.proof, sizeof(fresh.proof));
-    memset(shared, 0, sizeof(shared));
+    Wipe(shared, sizeof(shared));
     fresh.used = true;
     fresh.node = node;
     *p = fresh;
+    Wipe(&fresh, sizeof(fresh));
     return true;
   }
 
@@ -179,7 +186,7 @@ class Crypto {
     for (unsigned i = 0; i < 32; i++) scalar[i] = secret[31 - i];
     memcpy(out, point, 32);
     uint32_t ok = br_ec_c25519_m15.mul(out, 32, scalar, 32, BR_EC_curve25519);
-    memset(scalar, 0, sizeof(scalar));
+    Wipe(scalar, sizeof(scalar));
     uint8_t any = 0;
     for (unsigned i = 0; i < 32; i++) any |= out[i];
     return ok && any;
@@ -214,6 +221,7 @@ class Crypto {
     br_ccm_flip(&ctx);
     br_ccm_run(&ctx, 1, data, len);
     br_ccm_get_tag(&ctx, tag);
+    Wipe(&bc, sizeof(bc));
     return true;
   }
 
@@ -227,7 +235,9 @@ class Crypto {
     br_ccm_aad_inject(&ctx, aad, aadLen);
     br_ccm_flip(&ctx);
     br_ccm_run(&ctx, 0, data, len);
-    return br_ccm_check_tag(&ctx, tag) != 0;
+    bool ok = br_ccm_check_tag(&ctx, tag) != 0;
+    Wipe(&bc, sizeof(bc));
+    return ok;
   }
 
   // AES-128-CTR, in place, with a 9-byte nonce: the block counter starts at 0
@@ -238,6 +248,7 @@ class Crypto {
     memcpy(iv, nonce, 9);
     memset(iv + 9, 0, 3);
     br_aes_ct_ctr_run(&k, iv, 0, data, len);
+    Wipe(&k, sizeof(k));
   }
 
  private:

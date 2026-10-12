@@ -1553,9 +1553,23 @@ class Node {
     }
   }
 
+  // A time stamp that is never refreshed would look recent again after 24.8 days, when the signed difference of two times wraps:
+  // the ages kept are held below 12 days
+  static void KeepOld(uint32_t now, uint32_t &stamp) {
+    if (stamp != 0 && (int32_t)(now - stamp) > (int32_t)(1u << 30)) stamp = now - (1u << 30);
+  }
+
   // The heartbeat is due, the neighbours that have gone quiet are suspected and, in the end, declared silent, and
   // the noise of the last minute is judged
   void Supervise(uint32_t now) {
+    for (unsigned i = 0; i < kMaxNeighbors; i++) {
+      Neighbor &n = nbrs_[i];
+      if (!n.used) continue;
+      KeepOld(now, n.lastHeard);
+      KeepOld(now, n.radioAt);
+      KeepOld(now, n.udpAt);
+      KeepOld(now, n.beatAt);
+    }
     if (!beatArmed_) {
       beatArmed_ = true;
       nextBeat_ = now + (cfg_.random != nullptr ? cfg_.random(cfg_.context) % cfg_.beatEveryMs : 0);
