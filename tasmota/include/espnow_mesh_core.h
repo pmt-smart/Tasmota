@@ -107,6 +107,14 @@
  * is the data the seal authenticates, and the number of the message the nonce: so a node that repeats a
  * frame reads nothing of it, and a retransmission is the very same bytes as the attempt before. A frame
  * for this node that does not open is refused before it counts for anything.
+ *
+ * A second way: when the network the nodes share is up, the same frame can go on it, over UDP, to the
+ * address of the node it is for, or to the whole of it. The core does not touch the network: it says, for
+ * each frame it hands over, which ways to take, and hears a frame that came by either. It sends by both
+ * ways what must not be lost (events, the frames that tell the network who is who, the heartbeat), what
+ * is for a node the radio has not heard for a while or has never heard, and everything, by the network
+ * only, when this node has no radio in use. A way back learned from a frame that came by the network is
+ * a way by the network. The number of a frame drops the copy that comes by the second way.
 \*********************************************************************************************/
 
 #include <stdint.h>
@@ -121,6 +129,11 @@ constexpr size_t kHeaderLen = 14;
 constexpr size_t kTagLen = 8;
 constexpr size_t kMaxPayload = kMaxFrame - kHeaderLen - kTagLen;
 constexpr size_t kPairTagLen = 8;            // what the seal of a frame for one node adds to its payload
+
+// The ways a frame can take
+constexpr uint8_t kPathRadio = 1;
+constexpr uint8_t kPathUdp = 2;
+constexpr uint8_t kBeatNoRadio = 1;          // a flag of the heartbeat: the node has no radio in use
 constexpr uint8_t kToAll = 255;
 constexpr uint8_t kMaxHops = 3;
 constexpr unsigned kReplayWindow = 32;
@@ -157,7 +170,7 @@ constexpr uint8_t kSyncAsk = 1;              // nonce(4)
 constexpr uint8_t kSyncAnswer = 2;           // nonce(4) epoch(4) counter(4) proof(8)
 
 // The supervision's frames are all of the heartbeat type, and the first byte of the payload says which
-constexpr uint8_t kSubBeat = 0;              // infoLen(1) info n(1) then n of: node(1) signal(1); to all, not repeated
+constexpr uint8_t kSubBeat = 0;              // flags(1) infoLen(1) info n(1) then n of: node(1) signal(1); to all, not repeated
 constexpr uint8_t kSubProbe = 1;             // node(1); to a neighbour: try this node for me
 constexpr uint8_t kSubPing = 2;              // nothing; to a neighbour, for the radio's acknowledgement
 constexpr uint8_t kSubAlive = 3;             // node(1); to the neighbour that asked: that node answered
@@ -318,6 +331,7 @@ struct Stats {
   uint32_t beatsSent, beatsHeard, pings, probes, rescued, verdictsSent, verdictsHeard, noiseSent, keptAsOnlyWay;
   uint32_t partsSent, piecesSent, piecesNew, piecesRepeated, naksSent, bulkDone, bulkLost;
   uint32_t noKey, cipherBad;
+  uint32_t udpSent, udpHeard;
 };
 
 // How a neighbour stands: heard lately, not heard and being tried, or declared silent by this node
@@ -329,6 +343,7 @@ struct Neighbor {
   uint8_t id;
   uint8_t state;                               // a Liveness
   uint8_t listsMe;                             // 0 not known, 1 its heartbeat lists this node among the ones it hears, 2 it does not
+  bool noRadio;                                // its heartbeat says it has no radio in use: it hears and says everything by the network
   uint8_t mac[6];
   int8_t rssi;                                 // the signal it is heard at, smoothed; 0 before the first
   int8_t theirRssi;                            // the signal it says it hears this node at
@@ -337,7 +352,9 @@ struct Neighbor {
   uint8_t infoLen;
   uint8_t info[kMaxInfo];                      // the application's bytes of its last heartbeat
   uint16_t jitter;                             // how much longer than the others this node waits before it suspects this neighbour, ms
-  uint32_t lastHeard;                          // the last time something of it got through, or an unicast of ours was acknowledged by it
+  uint32_t lastHeard;                          // the last time something of it got through, by either way, or an unicast of ours was acknowledged by it
+  uint32_t radioAt;                            // the last time something of it was heard on the radio; 0 if never
+  uint32_t udpAt;                              // and on the network; 0 if never
   uint32_t beatAt;                             // the last heartbeat; 0 before the first
   uint32_t suspectAt;
 };
@@ -367,6 +384,8 @@ struct Config {
   SealFunction seal;                           // nullptr: payloads are not enciphered and not opened
   OpenFunction open;
   void *cipherContext;
+  bool udpOnly;                                // this node has no radio in use: everything goes by the network
+  bool udpRelay;                               // this node repeats on the network what it repeats on the radio, for the nodes that have no radio
   uint32_t beatEveryMs;                        // the time between heartbeats; 0: no heartbeats, and no supervision
   uint8_t noiseLimit;                          // the percent lost that makes a minute a noisy one; 0 for the default
 };
@@ -405,6 +424,8 @@ class Node {
     memcpy(slot->to, d->via, 6);
     slot->unicast = true;
     slot->due = now + delayMs;
+    slot->paths = d->viaUdp && udpUp_ ? kPathUdp : kPathRadio;
+    slot->udpTarget = next;
     return f.counter;
   }
 
@@ -451,7 +472,8 @@ class Node {
   }
 
   // The radio heard `n` bytes from the neighbour `src`, with the signal `rssi`
-  Verdict OnReceive(const uint8_t *data, size_t n, const uint8_t src[6], int8_t rssi, uint32_t now) {
+  // `udp`: the frame came by the network, and `src` is the address the user knows the sending node by, `rssi` 0
+  Verdict OnReceive(const uint8_t *data, size_t n, const uint8_t src[6], int8_t rssi, uint32_t now, bool udp = false) {
     Frame f;
     if (!Decode(data, n, &f)) { stats_.bad++; return kBad; }
     if (cfg_.tag != nullptr && !TagMatches(cfg_.tag, cfg_.tagContext, data, n)) { stats_.bad++; return kBad; }
@@ -461,13 +483,19 @@ class Node {
     // a routed frame is for the neighbour it names, and the others, if they heard it, leave it alone
     if (f.routed() && f.next != cfg_.id) return kIgnored;
     stats_.heard++;
-    // a copy of what is in hand, or of what was handled: counted for the suppression and no more
+    if (udp) stats_.udpHeard++;
+    // a copy of what is in hand, or of what was handled: counted for the suppression, when it came by the radio, and no more
     if (SeenBefore(f.origin, f.epoch, f.counter, f.attempt())) {
       stats_.repeated++;
-      CountCopy(f.origin, f.epoch, f.counter, f.attempt(), NodeOf(src), now);
+      if (!udp) {
+        CountCopy(f.origin, f.epoch, f.counter, f.attempt(), NodeOf(src), now);
+        // a neighbour first heard by the network is on the radio too, now
+        Neighbor *heard = FindNeighbor(NodeOf(src), false);
+        if (heard != nullptr && heard->rssi == 0) { heard->rssi = rssi; heard->radioAt = now; memcpy(heard->mac, src, 6); }
+      }
       // a copy from a neighbour that hears this node is a way back to the origin when the one kept is none
       Origin *known_origin = FindOrigin(f.origin, false);
-      if (known_origin != nullptr && known_origin->synced && (!known_origin->routed || OneWay(known_origin->via))) Learn(known_origin, src, reach);
+      if (known_origin != nullptr && known_origin->synced && (!known_origin->routed || (!known_origin->viaUdp && OneWay(known_origin->via)))) Learn(known_origin, src, reach, udp);
       return kRepeated;
     }
     Origin *o = FindOrigin(f.origin, true);
@@ -486,7 +514,7 @@ class Node {
       g.len = (size_t)pn;
     }
     if (f.type() == kSync) {
-      Learn(o, src, reach);
+      Learn(o, src, reach, udp);
       Remember(f.origin, f.epoch, f.counter, f.attempt(), src);
       // an origin that asks from an epoch above the one kept has started again: it is asked in its turn, before its first data frame
       if (f.epoch > o->epoch && o->synced) o->synced = false;
@@ -496,9 +524,9 @@ class Node {
     // a frame refused for want of a sync, or for its epoch, is not remembered: it is not one this node has handled, and the
     // sender's next attempt, or this very frame heard again, is taken once the origin is known. The way back is learned
     // from it when this node has none, because the sync exchange goes that way
-    if (!o->synced) { if (!o->routed) Learn(o, src, reach); stats_.unsynced++; return kNeedsSync; }
+    if (!o->synced) { if (!o->routed) Learn(o, src, reach, udp); stats_.unsynced++; return kNeedsSync; }
     if (f.epoch < o->epoch) { stats_.stale++; return kStale; }
-    if (f.epoch > o->epoch) { o->synced = false; if (!o->routed) Learn(o, src, reach); stats_.unsynced++; return kNeedsSync; }
+    if (f.epoch > o->epoch) { o->synced = false; if (!o->routed) Learn(o, src, reach, udp); stats_.unsynced++; return kNeedsSync; }
     if (f.counter > o->highest) {
       uint32_t shift = f.counter - o->highest;
       o->seen = shift >= kReplayWindow ? 0 : o->seen << shift;
@@ -511,12 +539,12 @@ class Node {
     }
     if (known && !(f.attempt() > 0)) { stats_.replayed++; return kReplayed; }
     // the first copy of a number came by the best way: it is the way back to its origin
-    Learn(o, src, reach);
+    Learn(o, src, reach, udp);
     Remember(f.origin, f.epoch, f.counter, f.attempt(), src);
     // a frame that got through the gate is proof of its origin, and of the neighbour that sent it, just now
     uint8_t sender = NodeOf(src);
     if (sender == 0 && f.type() == kBeat) sender = f.origin;
-    Touch(sender, src, rssi, now);
+    Touch(sender, src, rssi, now, udp);
     if (f.origin != sender) NodeIsAlive(f.origin, now);
     if (f.type() == kBeat) {
       OnSupervision(g, sender, now);
@@ -603,6 +631,8 @@ class Node {
       slot->prio = FramePriority(slot->data);
       slot->heard = 1;
       slot->due = now;
+      slot->paths = PathsOf((Type)(slot->data[1] >> 5), slot->data[3], now);
+      slot->udpTarget = UdpTargetFor(slot->data[3]);
       Remember(cfg_.id, cfg_.epoch, p.counter, p.attempt, nullptr);
       p.due = now + kAnswerWaitMs;
       stats_.resent++;
@@ -639,7 +669,9 @@ class Node {
 
   // The radio is free: the frame to send next, to whom (broadcast, all ones, for a flooded frame), and whether there
   // is one. Serialised: nothing more comes until the radio says what became of the last
-  bool NextTx(uint32_t now, uint8_t *out, size_t *len, uint8_t to[6]) {
+  // `paths` says which ways to take (kPathRadio, kPathUdp, or both), and `target` to which node by the network: 0 for all of them.
+  // The radio's address is `to`; a frame for the network alone is still serialised, and the user says it is done as it does for the radio
+  bool NextTx(uint32_t now, uint8_t *out, size_t *len, uint8_t to[6], uint8_t *paths = nullptr, uint8_t *target = nullptr) {
     if (busy_) return false;
     TxItem *best = nullptr;
     for (unsigned i = 0; i < kTxQueue; i++) {
@@ -651,6 +683,9 @@ class Node {
     memcpy(out, best->data, best->len);
     memcpy(to, best->to, 6);
     *len = best->len;
+    if (paths != nullptr) *paths = best->paths;
+    if (target != nullptr) *target = best->udpTarget;
+    if (best->paths & kPathUdp) stats_.udpSent++;
     if (best->own) stats_.sentOwn++; else stats_.sentRelay++;
     inflight_ = *best;
     inflightValid_ = true;
@@ -751,6 +786,9 @@ class Node {
     return true;
   }
 
+  // The network the nodes share is up for this node, or it is not: with it down no frame is given the second way
+  void SetUdpUp(bool up) { udpUp_ = up; }
+
   // Whether this node has been calling its own channel noisy
   bool Noisy() const { return noisy_; }
 
@@ -765,11 +803,11 @@ class Node {
   unsigned waiting() const { unsigned n = 0; for (unsigned i = 0; i < kPendingSize; i++) n += pending_[i].used; return n; }
 
  private:
-  struct Origin { bool used; bool synced; bool routed; bool asked; uint8_t id; uint8_t routeHops; uint8_t via[6]; uint32_t epoch; uint32_t highest; uint32_t seen; uint32_t askedAt; };
+  struct Origin { bool used; bool synced; bool routed; bool viaUdp; bool asked; uint8_t id; uint8_t routeHops; uint8_t via[6]; uint32_t epoch; uint32_t highest; uint32_t seen; uint32_t askedAt; };
   struct Seen { bool used; bool hasFrom; uint8_t origin; uint8_t attempt; uint32_t epoch; uint32_t counter; uint8_t from[6]; };
   // `from` are the neighbours a flooded frame waiting to be repeated was heard from, for the first two copies;
   // `pingTarget` and `pingAsker` mark a ping: whom it tries, and for whom (0: for this node)
-  struct TxItem { bool used; bool own; bool unicast; uint8_t len; uint8_t prio; uint8_t heard; uint8_t tries; uint8_t to[6]; uint8_t from[2]; uint8_t fromCount; uint8_t pingTarget; uint8_t pingAsker; uint32_t due; uint8_t data[kMaxFrame]; };
+  struct TxItem { bool used; bool own; bool unicast; uint8_t len; uint8_t prio; uint8_t heard; uint8_t tries; uint8_t to[6]; uint8_t from[2]; uint8_t fromCount; uint8_t pingTarget; uint8_t pingAsker; uint8_t paths; uint8_t udpTarget; uint32_t due; uint8_t data[kMaxFrame]; };
   struct Pending { bool used; uint8_t dest; uint8_t attempt; uint8_t len; uint32_t counter; uint32_t due; uint8_t frame[kMaxFrame]; };
   struct SyncAsk { bool used; uint8_t target; uint32_t nonce; uint32_t until; };
   struct Mute { bool used; bool mine; uint8_t node; };
@@ -792,6 +830,7 @@ class Node {
   Stats stats_;
   struct BulkIn { bool used; bool done; uint8_t origin; uint8_t total; uint8_t naks; uint16_t id; uint32_t have; uint32_t lastAt; };
   BulkIn bulkIn_[kBulkInSize];
+  bool udpUp_;
   Neighbor nbrs_[kMaxNeighbors];
   Mute mutes_[kMaxOrigins];
   Notice notices_[kNoticeSize];
@@ -819,10 +858,11 @@ class Node {
   // The neighbour a frame of this origin was heard from is the way back to it, unless that neighbour does not hear this node. A way is
   // replaced only by one as near, by the hops the frame had left when it was heard: the ways kept lead nearer the origin at every hop,
   // so that a frame sent along them cannot go round or run out. A way that fails is demoted, and the next frame heard gives another
-  void Learn(Origin *o, const uint8_t src[6], uint8_t hops) {
-    if (OneWay(src)) return;
+  void Learn(Origin *o, const uint8_t src[6], uint8_t hops, bool udp) {
+    if (!udp && OneWay(src)) return;
     if (o->routed && hops < o->routeHops) return;
     o->routed = true;
+    o->viaUdp = udp;
     o->routeHops = hops;
     memcpy(o->via, src, 6);
   }
@@ -909,9 +949,46 @@ class Node {
     slot->prio = FramePriority(slot->data);
     slot->heard = 1;
     slot->due = now;
+    slot->paths = kPathRadio;
     memset(slot->to, 0xff, 6);
     Remember(f.origin, f.epoch, f.counter, f.attempt(), nullptr);
     return true;
+  }
+
+  // The ways a frame of `type` for `dest` goes, flooded: the radio alone, unless the network is up and the frame must not be lost
+  // (an event, a frame that tells who is who, a heartbeat), or the destination is a node the radio has not heard for a while, or
+  // has never heard, or this node uses no radio; and when some node is on the network alone, the frames for everyone go there too
+  uint8_t PathsOf(Type type, uint8_t dest, uint32_t now) const {
+    if (!udpUp_) return kPathRadio;
+    if (cfg_.udpOnly) return kPathUdp;
+    uint8_t p = kPathRadio;
+    if (type == kEvent || type == kMembership || type == kBeat) p |= kPathUdp;
+    else if (dest == kToAll) { if (HasUdpOnlyPeer(now)) p |= kPathUdp; }
+    else {
+      const Neighbor *n = NeighborOf(dest);
+      if (n != nullptr && n->noRadio && n->udpAt != 0) p = kPathUdp;
+      // a node heard by the network that the radio has not heard, or not for a while, or that is under suspicion: by both
+      else if (n != nullptr && n->udpAt != 0 && (n->rssi == 0 || n->state != kAlive || (int32_t)(now - n->radioAt) >= (int32_t)kHeardWindowMs)) p |= kPathUdp;
+      else if (n != nullptr && n->udpAt != 0 && IsSilent(dest)) p |= kPathUdp;
+    }
+    return p;
+  }
+
+  // The node the network sends a frame for `dest` to: that node when this node has heard it there, and all of them when not,
+  // so that a node on the network that has a radio can repeat it to a node that has none
+  uint8_t UdpTargetFor(uint8_t dest) const {
+    if (dest == kToAll) return 0;
+    const Neighbor *n = NeighborOf(dest);
+    return n != nullptr && n->udpAt != 0 ? dest : 0;
+  }
+
+  // Whether some node that has no radio in use has been heard lately by the network
+  bool HasUdpOnlyPeer(uint32_t now) const {
+    for (unsigned i = 0; i < kMaxNeighbors; i++) {
+      const Neighbor &n = nbrs_[i];
+      if (n.used && n.noRadio && n.udpAt != 0 && (int32_t)(now - n.udpAt) < (int32_t)kHeardWindowMs) return true;
+    }
+    return false;
   }
 
   // A frame of this node's, to be flooded with `hops` repetitions left. A frame that asks for an answer and is for
@@ -930,6 +1007,8 @@ class Node {
     f.payload = payload;
     f.len = len;
     if (!BuildOwn(slot, f, now)) return 0;
+    slot->paths = PathsOf(type, dest, now);
+    slot->udpTarget = UdpTargetFor(dest);
     if (wait) {
       memset(keep, 0, sizeof(*keep));
       keep->used = true;
@@ -987,7 +1066,7 @@ class Node {
     uint8_t origin = t.data[2];
     for (unsigned i = 0; i < kMaxNeighbors; i++) {
       const Neighbor &m = nbrs_[i];
-      if (!m.used || m.state != kAlive || m.listsMe == 2 || m.id == origin) continue;
+      if (!m.used || m.state != kAlive || m.rssi == 0 || m.listsMe == 2 || m.id == origin) continue;
       if ((int32_t)(now - m.lastHeard) >= (int32_t)kHeardWindowMs) continue;
       bool covered = false;
       for (unsigned k = 0; k < t.fromCount && !covered; k++) {
@@ -1011,7 +1090,7 @@ class Node {
 
   // What happens to a frame that is not for this node alone: a flooded one is repeated, a routed one goes on
   void Pass(const Frame &f, const uint8_t *data, size_t n, int8_t rssi, uint32_t now, uint8_t from = 0) {
-    if (f.hops == 0 || f.dest == cfg_.id) return;
+    if (f.hops == 0 || f.dest == cfg_.id || cfg_.udpOnly) return;     // a node on the network alone repeats nothing: its neighbours have heard it all there
     if (f.routed()) Forward(data, n, f, now); else Schedule(data, n, rssi, now, from);
   }
 
@@ -1029,6 +1108,9 @@ class Node {
     slot->heard = 1;
     slot->from[0] = from;
     slot->fromCount = 1;
+    slot->paths = kPathRadio;
+    // a node with no radio cannot hear this one: a node set to relay for it repeats on the network as well
+    if (udpUp_ && cfg_.udpRelay && !cfg_.udpOnly) slot->paths |= kPathUdp;
     uint32_t r = cfg_.random != nullptr ? cfg_.random(cfg_.context) : 0;
     slot->due = now + (rssi < cfg_.weakDbm ? r % 4 : 3 + r % 6);
   }
@@ -1051,6 +1133,8 @@ class Node {
     slot->prio = FramePriority(data);
     slot->heard = 1;
     slot->due = now;
+    slot->paths = d->viaUdp && udpUp_ ? kPathUdp : kPathRadio;
+    slot->udpTarget = next;
   }
 
   void Deliver(const Frame &f, const uint8_t src[6], int8_t rssi, bool retry) {
@@ -1264,11 +1348,20 @@ class Node {
   }
 
   // A frame that got through the gate was sent by the neighbour `id` just now, heard at `rssi`
-  void Touch(uint8_t id, const uint8_t mac[6], int8_t rssi, uint32_t now) {
+  void Touch(uint8_t id, const uint8_t mac[6], int8_t rssi, uint32_t now, bool udp = false) {
     if (id == 0 || id == cfg_.id || id == kToAll) return;
     Neighbor *n = FindNeighbor(id, true);
-    memcpy(n->mac, mac, 6);
-    n->rssi = n->rssi == 0 ? rssi : (int8_t)((3 * n->rssi + rssi) / 4);
+    if (udp) {
+      // by the network: the signal and the radio's address are not the network's to say
+      n->udpAt = now;
+      bool unknown = true;
+      for (unsigned i = 0; i < 6; i++) if (n->mac[i] != 0) unknown = false;
+      if (unknown) memcpy(n->mac, mac, 6);
+    } else {
+      memcpy(n->mac, mac, 6);
+      n->rssi = n->rssi == 0 ? rssi : (int8_t)((3 * n->rssi + rssi) / 4);
+      n->radioAt = now;
+    }
     n->lastHeard = now;
     if (n->state == kMute) n->beatAt = 0;
     n->state = kAlive;
@@ -1315,6 +1408,7 @@ class Node {
     uint8_t p[kMaxPayload];
     size_t at = 0;
     p[at++] = kSubBeat;
+    p[at++] = cfg_.udpOnly ? kBeatNoRadio : 0;
     p[at++] = infoLen_;
     if (infoLen_ > 0) memcpy(p + at, info_, infoLen_);
     at += infoLen_;
@@ -1358,7 +1452,7 @@ class Node {
       int best = -1;
       for (unsigned i = 0; i < kMaxNeighbors; i++) {
         const Neighbor &n = nbrs_[i];
-        if (!n.used || taken[i] || n.id == suspect.id || n.state != kAlive || n.listsMe == 2 || !Lists(n, suspect.id)) continue;
+        if (!n.used || taken[i] || n.id == suspect.id || n.state != kAlive || n.rssi == 0 || n.listsMe == 2 || !Lists(n, suspect.id)) continue;
         if (best < 0 || n.rssi > nbrs_[best].rssi) best = (int)i;
       }
       if (best < 0) return;
@@ -1385,16 +1479,17 @@ class Node {
 
   void OnBeat(const Frame &f, uint8_t from, uint32_t now) {
     Neighbor *n = FindNeighbor(from, false);
-    if (n == nullptr || f.len < 3) return;
-    size_t il = f.payload[1];
-    if (2 + il + 1 > f.len) return;
+    if (n == nullptr || f.len < 4) return;
+    n->noRadio = (f.payload[1] & kBeatNoRadio) != 0;
+    size_t il = f.payload[2];
+    if (3 + il + 1 > f.len) return;
     n->infoLen = (uint8_t)(il > kMaxInfo ? kMaxInfo : il);
-    memcpy(n->info, f.payload + 2, n->infoLen);
-    size_t at = 2 + il;
+    memcpy(n->info, f.payload + 3, n->infoLen);
+    size_t at = 3 + il;
     size_t count = f.payload[at++];
     if (at + 2 * count > f.len) count = (f.len - at) / 2;
     n->hearsCount = 0;
-    n->listsMe = 2;
+    n->listsMe = n->rssi == 0 || n->noRadio ? 0 : 2;   // of one the radio has not heard, the list of who it hears says nothing of this node
     n->theirRssi = 0;
     for (size_t i = 0; i < count; i++) {
       uint8_t id = f.payload[at + 2 * i];
@@ -1403,11 +1498,11 @@ class Node {
     }
     // a neighbour that does not hear this node is no way back to anyone, whatever came by it before the first heartbeat told
     if (n->listsMe == 2) {
-      for (unsigned i = 0; i < kMaxOrigins; i++) if (origins_[i].used && origins_[i].routed && memcmp(origins_[i].via, n->mac, 6) == 0) origins_[i].routed = false;
+      for (unsigned i = 0; i < kMaxOrigins; i++) if (origins_[i].used && origins_[i].routed && !origins_[i].viaUdp && memcmp(origins_[i].via, n->mac, 6) == 0) origins_[i].routed = false;
     }
     // heartbeats that should have come from a strong neighbour and did not are the channel's; a gap longer than a window
     // is the neighbour's, and a neighbour that was given up starts its count again
-    if (n->beatAt != 0 && n->rssi >= cfg_.weakDbm) {
+    if (n->beatAt != 0 && n->rssi != 0 && n->rssi >= cfg_.weakDbm) {
       uint32_t gap = now - n->beatAt, every = cfg_.beatEveryMs;
       noiseHeard_++;
       if (gap > every + every / 2 && gap < kNoiseWindowMs) noiseMissed_ += gap / every - 1;
@@ -1468,7 +1563,7 @@ class Node {
       if (n.state == kAlive && (int32_t)(now - n.lastHeard) >= (int32_t)(kSuspectAfterMs + n.jitter)) {
         n.state = kSuspect;
         n.suspectAt = now;
-        StartPing(n, 0, now);
+        if (n.rssi != 0) StartPing(n, 0, now);       // one the radio has not heard is not tried with the radio
       } else if (n.state == kSuspect && (int32_t)(now - n.suspectAt) >= (int32_t)kSilentAfterMs) {
         n.state = kMute;
         if (!IsSilent(n.id)) {
