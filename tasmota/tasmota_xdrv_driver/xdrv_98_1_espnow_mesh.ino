@@ -48,8 +48,14 @@
  * EspNowMeshNetwork that say no radio or relay, take effect at the next start; the other bit, the key
  * and the nodes at once. The key is a command argument, which Tasmota can log: set it over the web
  * API of a device on the LAN, as scripts/mesh-bench.mjs does, and not with the log level up. The device makes its own
- * identity, an X25519 key pair, the first time, and keeps it in its own NVS namespace; its public
- * key is what the other devices are given (EspNowMeshPublic).
+ * identity, an X25519 key pair, the first time, and keeps it in its own NVS namespace, with the station address of the chip it
+ * was made on: a record that comes from another chip, as a copy of the flash brings it, keeps what is configured and not the
+ * identity, which is made again, and its epoch with it. Its public key is what the other devices are given (EspNowMeshPublic).
+ *
+ * The epoch rises with every start, and a start with a lower or the same one would be refused by every neighbour as an old one
+ * and thought alive: so the epoch is saved and read back before the task that sends under it starts. A start whose epoch the flash
+ * did not take does not go on, says so in the log and is tried again in ten seconds, and a command that changes the record and
+ * finds the flash did not take it answers "flash write failed" and leaves the record as it was.
  *
  * Reported to the rule engine, and in the log:
  *   {"EspNowMesh":{"From":3,"Type":0,"Dest":1,"Counter":12,"Epoch":7,"Rssi":-61,"Flags":0,"Part":0,"Joins":0,"Behind":0,"Data":"68656c6c6f"}}
@@ -83,11 +89,13 @@
 #include <esp_now.h>
 #include <esp_wifi.h>
 #include <esp_mac.h>
+#include <nvs.h>
+#include <nvs_flash.h>
 #include <WiFiUdp.h>
 #include "espnow_mesh_core.h"
 #include "espnow_mesh_crypto.h"
 
-#define ESPNOW_MESH_SETTINGS_VERSION   2           // 1: the same record with room for 16 nodes, which a record of 2 takes as it is
+#define ESPNOW_MESH_SETTINGS_VERSION   3           // 2: the same record without the address of the chip; 1: and with room for 16 nodes. Both are taken as they are
 #define ESPNOW_MESH_NVS_NAMESPACE      "espnowmesh"
 #define ESPNOW_MESH_NODES              48          // as many as the core keeps of origins and of neighbours
 #define ESPNOW_MESH_UDP_PORT           47474
@@ -112,7 +120,8 @@ typedef struct {
   uint8_t ip[4];                             // 0.0.0.0: not known
 } EspNowMeshNode_t;
 
-// The device's record, saved as one block in its own NVS namespace
+// The device's record, saved as one block in its own NVS namespace. A record of an earlier version is the front of this one, and the
+// rest of it is cleared when it is read: version 1 ends after the 16th node, version 2 after the 48th
 struct {
   uint32_t version;
   uint8_t enabled;
@@ -127,7 +136,16 @@ struct {
   uint8_t secret[32];                        // the identity, X25519
   uint8_t group_key[32];
   EspNowMeshNode_t node[ESPNOW_MESH_NODES];
+  uint8_t mac[6];                            // the station address of the chip the identity was made on (since version 3)
+  uint8_t spare_end[2];
 } EspNowMeshSettings;
+
+// The sizes the record has had, which a record read is held to
+#define ESPNOW_MESH_RECORD_V1_SIZE     (offsetof(decltype(EspNowMeshSettings), node) + 16 * sizeof(EspNowMeshNode_t))
+#define ESPNOW_MESH_RECORD_V2_SIZE     offsetof(decltype(EspNowMeshSettings), mac)
+static_assert(ESPNOW_MESH_RECORD_V1_SIZE == 768, "the record of version 1 is 768 bytes");
+static_assert(ESPNOW_MESH_RECORD_V2_SIZE == 2144, "the record of version 2 is 2144 bytes");
+static_assert(sizeof(EspNowMeshSettings) == 2152, "the record of version 3 is 2152 bytes");
 
 // What the radio's callback hands the task
 typedef struct {
@@ -224,6 +242,7 @@ static struct {
   volatile bool awaiting = false;            // the task waits for the radio to say what became of a send
   volatile bool send_ok = false;
   volatile bool config_dirty = false;
+  uint32_t epoch_ahead = 0;                  // an epoch saved by a start that failed after it: no frame went under it, and the next start takes it
   volatile uint32_t dropped = 0;             // frames the callback had no room for
   uint8_t applied_channel = 0;
   EspNowMesh::Node* node = nullptr;
@@ -244,23 +263,111 @@ static const uint8_t EspNowMeshBroadcast[6] = {0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xF
  * Settings
 \*********************************************************************************************/
 
-static void EspNowMeshSettingsSave(void) {
-  NvmSave(ESPNOW_MESH_NVS_NAMESPACE, "settings", &EspNowMeshSettings, sizeof(EspNowMeshSettings));
-}
-
-static void EspNowMeshSettingsLoad(void) {
-  memset(&EspNowMeshSettings, 0, sizeof(EspNowMeshSettings));
-  if (!NvmLoad(ESPNOW_MESH_NVS_NAMESPACE, "settings", &EspNowMeshSettings, sizeof(EspNowMeshSettings)) ||
-      ((ESPNOW_MESH_SETTINGS_VERSION != EspNowMeshSettings.version) && (1 != EspNowMeshSettings.version))) {
-    memset(&EspNowMeshSettings, 0, sizeof(EspNowMeshSettings));
-  }
-  // A record of version 1 is shorter: it ends after the 16th node, and the rest of this one was cleared above
-  EspNowMeshSettings.version = ESPNOW_MESH_SETTINGS_VERSION;
-}
-
 static void EspNowMeshWipe(void* buffer, size_t len) {
   volatile uint8_t* p = (volatile uint8_t*)buffer;
   while (len--) { *p++ = 0; }
+}
+
+// The record, written as one blob and read back: ESP_OK only when what the flash holds is what is here. The NvmSave that the rest of
+// the firmware uses says nothing of whether it wrote, and a record that did not get there would be found as it was at the next start
+static esp_err_t EspNowMeshSave(void);
+static esp_err_t EspNowMeshSave(void) {
+  nvs_handle_t handle;
+  esp_err_t error = nvs_open(ESPNOW_MESH_NVS_NAMESPACE, NVS_READWRITE, &handle);
+  if (ESP_OK != error) { return error; }
+  error = nvs_set_blob(handle, "settings", &EspNowMeshSettings, sizeof(EspNowMeshSettings));
+  if (ESP_OK == error) { error = nvs_commit(handle); }
+  if (ESP_OK == error) {
+    size_t size = 0;
+    error = nvs_get_blob(handle, "settings", nullptr, &size);
+    if ((ESP_OK == error) && (size != sizeof(EspNowMeshSettings))) { error = ESP_ERR_INVALID_SIZE; }
+    if (ESP_OK == error) {
+      uint8_t* copy = (uint8_t*)malloc(size);          // the identity is in it: wiped before it is let go
+      if (nullptr == copy) {
+        error = ESP_ERR_NO_MEM;
+      } else {
+        error = nvs_get_blob(handle, "settings", copy, &size);
+        if ((ESP_OK == error) && ((size != sizeof(EspNowMeshSettings)) || memcmp(copy, &EspNowMeshSettings, sizeof(EspNowMeshSettings)))) {
+          error = ESP_ERR_INVALID_CRC;
+        }
+        EspNowMeshWipe(copy, sizeof(EspNowMeshSettings));
+        free(copy);
+      }
+    }
+  }
+  nvs_close(handle);
+  return error;
+}
+
+// What the entries of the NVS partition come to, for the log: the epoch and the identity live there, and a partition with no room
+// takes neither
+static void EspNowMeshLogNvs(void) {
+  nvs_stats_t stats;
+  if (ESP_OK == nvs_get_stats(nullptr, &stats)) {
+    AddLog(LOG_LEVEL_INFO, PSTR("EMH: NVS %u of %u entries used, %u free, %u namespaces"),
+      (uint32_t)stats.used_entries, (uint32_t)stats.total_entries, (uint32_t)stats.free_entries, (uint32_t)stats.namespace_count);
+  }
+}
+
+// What the flash holds as the record. A record of a version this firmware knows is taken, the front of this one. One whose size is
+// none the versions had, or that cannot be read, is not understood: the device starts over with an identity of its own, and says so.
+// A record made on another chip, which a copy of the flash brings, keeps what is configured and not the identity, so that no two
+// devices have one
+static void EspNowMeshSettingsLoad(void) {
+  memset(&EspNowMeshSettings, 0, sizeof(EspNowMeshSettings));
+  const char* trouble = nullptr;
+  size_t size = 0;
+  nvs_handle_t handle;
+  esp_err_t error = nvs_open(ESPNOW_MESH_NVS_NAMESPACE, NVS_READONLY, &handle);
+  if (ESP_OK == error) {
+    error = nvs_get_blob(handle, "settings", nullptr, &size);
+    if (ESP_OK == error) {
+      size_t read = size;
+      if (size > sizeof(EspNowMeshSettings)) {
+        trouble = PSTR("is longer than any this firmware knows");
+      } else if ((ESP_OK != nvs_get_blob(handle, "settings", &EspNowMeshSettings, &read)) || (read != size)) {
+        trouble = PSTR("could not be read");
+      } else if (!(((1 == EspNowMeshSettings.version) && (ESPNOW_MESH_RECORD_V1_SIZE == size)) ||
+                   ((2 == EspNowMeshSettings.version) && (ESPNOW_MESH_RECORD_V2_SIZE == size)) ||
+                   ((ESPNOW_MESH_SETTINGS_VERSION == EspNowMeshSettings.version) && (sizeof(EspNowMeshSettings) == size)))) {
+        trouble = PSTR("has a size that does not go with its version");
+      }
+    } else if (ESP_ERR_NVS_NOT_FOUND != error) {
+      trouble = PSTR("could not be sized");
+    }
+    nvs_close(handle);
+  } else if (ESP_ERR_NVS_NOT_FOUND != error) {
+    trouble = PSTR("namespace could not be opened");
+  }                                            // otherwise nothing was ever saved: a device not set up yet
+  if (trouble) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("EMH: The saved record of %u bytes %s (error %d): the device starts over, with an identity of its own"), (uint32_t)size, trouble, error);
+    EspNowMeshWipe(&EspNowMeshSettings, sizeof(EspNowMeshSettings));
+  }
+
+  uint8_t own[6];
+  esp_read_mac(own, ESP_MAC_WIFI_STA);
+  static const uint8_t no_mac[6] = {0, 0, 0, 0, 0, 0};
+  if (memcmp(EspNowMeshSettings.mac, no_mac, 6) && memcmp(EspNowMeshSettings.mac, own, 6) && EspNowMeshSettings.has_secret) {
+    char text[18];
+    ToHex_P(EspNowMeshSettings.mac, 6, text, sizeof(text), ':');
+    AddLog(LOG_LEVEL_INFO, PSTR("EMH: The record was made on the chip %s, and this is another: the identity and the epoch are made again, and the new public key is to be given to the other nodes"), text);
+    EspNowMeshWipe(EspNowMeshSettings.secret, sizeof(EspNowMeshSettings.secret));
+    EspNowMeshSettings.has_secret = 0;
+    EspNowMeshSettings.epoch = 0;
+  }
+  memcpy(EspNowMeshSettings.mac, own, 6);      // a record of version 1 or 2, or none, is taken to be this chip's
+  EspNowMeshSettings.version = ESPNOW_MESH_SETTINGS_VERSION;
+}
+
+// The record saved, and read back. When the flash does not take it the record is what the flash holds, as it will be at the next start:
+// what a command changed is undone, and the command says so
+static bool EspNowMeshSettingsCommit(void);
+static bool EspNowMeshSettingsCommit(void) {
+  esp_err_t error = EspNowMeshSave();
+  if (ESP_OK == error) { return true; }
+  AddLog(LOG_LEVEL_ERROR, PSTR("EMH: The flash did not take the record (error 0x%X): it is as it was"), error);
+  EspNowMeshSettingsLoad();
+  return false;
 }
 
 // Exactly `len` bytes of hex digits, and nothing in `out` unless it is so
@@ -790,8 +897,13 @@ static const char* EspNowMeshWhyNot(void) {
   return nullptr;
 }
 
-// The work of a start. Nothing is written to the flash until the whole of it has worked, and a start that fails is not tried
-// again for ten seconds (EspNowMeshStart): a failing one, with the heap short, would otherwise write the flash and the log once a second
+// The work of a start. The epoch is what a start has to get right: a node that comes back with the epoch it had, or a lower one, is
+// refused by every neighbour as an old one and asks for no sync, so it is silent and thought alive. It is therefore saved, and read
+// back, before the task that sends under it starts, and a start whose epoch the flash did not take does not go on: the log says so, and
+// it is tried again in ten seconds (EspNowMeshStart).
+//
+// The write comes before the rest of the start so that a failure of the rest does not leave the flash written and a retry write it
+// again: an epoch saved by a start that then failed is kept (epoch_ahead) and is the one the next attempt takes, for no frame was sent under it
 static bool EspNowMeshStartAttempt(void) {
   if (!EspNowMeshSettings.has_secret) {
     esp_fill_random(EspNowMeshSettings.secret, sizeof(EspNowMeshSettings.secret));
@@ -800,7 +912,21 @@ static bool EspNowMeshStartAttempt(void) {
   }
   // The epoch of a device that has none is drawn at random, so that a device that was erased does not repeat the numbers of the
   // frames it sent before, with the key of the network it still has; and it rises with every start after that
-  uint32_t epoch = EspNowMeshSettings.epoch ? (EspNowMeshSettings.epoch + 1) : ((esp_random() >> 2) | 1);
+  uint32_t epoch = EspNowMeshDriver.epoch_ahead;
+  if (!epoch) {
+    epoch = EspNowMeshSettings.epoch ? (EspNowMeshSettings.epoch + 1) : ((esp_random() >> 2) | 1);
+    if (!epoch) { epoch = 1; }
+    EspNowMeshLogNvs();
+    uint32_t before = EspNowMeshSettings.epoch;
+    EspNowMeshSettings.epoch = epoch;
+    esp_err_t error = EspNowMeshSave();
+    if (ESP_OK != error) {
+      EspNowMeshSettings.epoch = before;
+      AddLog(LOG_LEVEL_ERROR, PSTR("EMH: The flash did not take the epoch (error 0x%X): the node does not start, and tries again in 10 s"), error);
+      return false;
+    }
+    EspNowMeshDriver.epoch_ahead = epoch;
+  }
 
   EspNowMeshDriver.node = new (std::nothrow) EspNowMesh::Node;
   EspNowMeshDriver.crypto = new (std::nothrow) EspNowMesh::Crypto;
@@ -864,9 +990,7 @@ static bool EspNowMeshStartAttempt(void) {
     EspNowMeshFree();
     return false;
   }
-  // It works: now the epoch, and the identity if it is new, are written
-  EspNowMeshSettings.epoch = epoch;
-  EspNowMeshSettingsSave();
+  EspNowMeshDriver.epoch_ahead = 0;               // the epoch is in use now: the next start takes another
   EspNowMeshDriver.running = true;
   AddLog(LOG_LEVEL_INFO, PSTR("EMH: Started as node %u, epoch %u, %u bytes of heap free"), EspNowMeshSettings.id, epoch, ESP_getFreeHeap());
   return true;
@@ -988,7 +1112,7 @@ static void EspNowMeshDrainEvents(void) {
 void CmndEspNowMeshEnable(void) {
   if (XdrvMailbox.data_len > 0) {
     EspNowMeshSettings.enabled = (atoi(XdrvMailbox.data) != 0);
-    EspNowMeshSettingsSave();
+    if (!EspNowMeshSettingsCommit()) { ResponseCmndChar_P(PSTR("flash write failed")); return; }
     if (EspNowMeshSettings.enabled) {
       if (!EspNowMeshStart()) {
         const char* why = EspNowMeshWhyNot();
@@ -1007,7 +1131,7 @@ void CmndEspNowMeshId(void) {
     uint32_t id = atoi(XdrvMailbox.data);
     if ((id < 1) || (id > 254)) { ResponseCmndError(); return; }
     EspNowMeshSettings.id = id;
-    EspNowMeshSettingsSave();
+    if (!EspNowMeshSettingsCommit()) { ResponseCmndChar_P(PSTR("flash write failed")); return; }
   }
   ResponseCmndNumber(EspNowMeshSettings.id);
 }
@@ -1017,7 +1141,7 @@ void CmndEspNowMeshChannel(void) {
     uint32_t channel = atoi(XdrvMailbox.data);
     if (channel > 13) { ResponseCmndError(); return; }
     EspNowMeshSettings.channel = channel;
-    EspNowMeshSettingsSave();
+    if (!EspNowMeshSettingsCommit()) { ResponseCmndChar_P(PSTR("flash write failed")); return; }
     if (EspNowMeshDriver.running) { EspNowMeshApplyChannel(); }
   }
   ResponseCmndNumber(EspNowMeshSettings.channel);
@@ -1039,7 +1163,7 @@ void CmndEspNowMeshGroupKey(void) {
     memset(XdrvMailbox.data, '*', XdrvMailbox.data_len);       // the key is not left in the command's own buffer
     EspNowMeshSettings.group_version = version;
     EspNowMeshSettings.has_group = 1;
-    EspNowMeshSettingsSave();
+    if (!EspNowMeshSettingsCommit()) { ResponseCmndChar_P(PSTR("flash write failed")); return; }
     EspNowMeshPushShared();
   }
   Response_P(PSTR("{\"%s\":{\"Set\":%u,\"Version\":%u}}"), XdrvMailbox.command, EspNowMeshSettings.has_group, EspNowMeshSettings.group_version);
@@ -1099,7 +1223,7 @@ void CmndEspNowMeshNode(void) {
     }
     EspNowMeshSettings.node[slot] = entry;
   }
-  EspNowMeshSettingsSave();
+  if (!EspNowMeshSettingsCommit()) { ResponseCmndChar_P(PSTR("flash write failed")); return; }
   EspNowMeshPushShared();
   ResponseCmndDone();
 }
@@ -1112,7 +1236,7 @@ void CmndEspNowMeshPublic(void) {
     if (!EspNowMeshRadioReady()) { ResponseCmndChar_P(PSTR("WiFi is not up")); return; }
     esp_fill_random(EspNowMeshSettings.secret, sizeof(EspNowMeshSettings.secret));
     EspNowMeshSettings.has_secret = 1;
-    EspNowMeshSettingsSave();
+    if (!EspNowMeshSettingsCommit()) { ResponseCmndChar_P(PSTR("flash write failed")); return; }
   }
   uint8_t pub[32];
   if (!EspNowMesh::Crypto::X25519(pub, EspNowMeshSettings.secret, base)) { ResponseCmndError(); return; }
@@ -1128,7 +1252,7 @@ void CmndEspNowMeshPublic(void) {
 void CmndEspNowMeshNetwork(void) {
   if (XdrvMailbox.data_len > 0) {
     EspNowMeshSettings.network = atoi(XdrvMailbox.data) & 7;
-    EspNowMeshSettingsSave();
+    if (!EspNowMeshSettingsCommit()) { ResponseCmndChar_P(PSTR("flash write failed")); return; }
     EspNowMeshPushShared();
   }
   ResponseCmndNumber(EspNowMeshSettings.network);
