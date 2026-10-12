@@ -74,7 +74,9 @@
  * carries the origin's epoch and counter and a proof of the nonce. An epoch above the kept
  * one makes the origin unsynchronised again, because a start of the origin is the moment a
  * recorded frame of one of its earlier epochs could be played back. A frame that repeats a
- * number with a higher attempt is a retransmission: it is repeated, and delivered as one.
+ * number with a higher attempt is a retransmission: it is repeated, and delivered as one. A frame that comes after
+ * newer ones of the same origin, inside the window, is delivered with how many numbers behind it is, for the application
+ * to order what it keeps by: a command resent after a newer one, or one held and let go, is not the newest word.
  *
  * Supervision: every few seconds a node sends a heartbeat, in broadcast and never repeated, which
  * carries a few bytes of the application's own and the neighbours this node has heard lately with
@@ -305,6 +307,7 @@ struct Delivery {
   bool ackRequested;
   bool retry;                                  // a number already delivered, heard again with a higher attempt
   uint8_t part;                                // 0 a whole message, 1 the first part of two, 2 the second
+  uint8_t behind;                              // how many numbers of its origin this frame was behind the highest heard: 0 for the newest. An old frame resent, or held and let go, comes with a distance
   uint8_t attempt;
   uint8_t dest;
   uint32_t joins;                              // of a second part, the number of the first, which is not in the payload
@@ -521,6 +524,7 @@ class Node {
       return OnSync(g, data, n, rssi, now, forMe, NodeOf(src));
     }
     bool known = false;                        // this number has been delivered before
+    uint8_t behind = 0;                        // and how far behind the newest of its origin
     // a frame refused for want of a sync, or for its epoch, is not remembered: it is not one this node has handled, and the
     // sender's next attempt, or this very frame heard again, is taken once the origin is known. The way back is learned
     // from it when this node has none, because the sync exchange goes that way
@@ -535,6 +539,7 @@ class Node {
     } else {
       uint32_t back = o->highest - f.counter;
       if (back >= kReplayWindow) { stats_.stale++; return kStale; }
+      behind = (uint8_t)back;
       if ((o->seen >> back) & 1) known = true; else o->seen |= (uint32_t)1 << back;
     }
     if (known && !(f.attempt() > 0)) { stats_.replayed++; return kReplayed; }
@@ -552,7 +557,7 @@ class Node {
       HandleAck(g);
     } else if (forMe) {
       // a piece of a bulk transfer is the application's once, whatever the number of times it comes
-      if (f.type() != kBulk || TrackPiece(g, now)) Deliver(g, src, rssi, known);
+      if (f.type() != kBulk || TrackPiece(g, now)) Deliver(g, src, rssi, known, behind);
       // answered at once, before the application has done anything with it, and every attempt
       if (f.ackRequested() && f.dest == cfg_.id) SendAck(f, now);
     }
@@ -1137,7 +1142,7 @@ class Node {
     slot->udpTarget = next;
   }
 
-  void Deliver(const Frame &f, const uint8_t src[6], int8_t rssi, bool retry) {
+  void Deliver(const Frame &f, const uint8_t src[6], int8_t rssi, bool retry, uint8_t behind) {
     if (inboxCount_ >= kInboxSize) { stats_.inboxFull++; return; }
     Delivery &d = inbox_[(inboxHead_ + inboxCount_) % kInboxSize];
     inboxCount_++;
@@ -1145,6 +1150,7 @@ class Node {
     d.type = f.type();
     d.ackRequested = f.ackRequested();
     d.retry = retry;
+    d.behind = behind;
     d.part = f.part();
     d.attempt = f.attempt();
     d.dest = f.dest;
