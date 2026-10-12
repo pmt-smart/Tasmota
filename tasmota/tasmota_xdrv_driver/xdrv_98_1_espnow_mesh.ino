@@ -87,9 +87,9 @@
 #include "espnow_mesh_core.h"
 #include "espnow_mesh_crypto.h"
 
-#define ESPNOW_MESH_SETTINGS_VERSION   1
+#define ESPNOW_MESH_SETTINGS_VERSION   2           // 1: the same record with room for 16 nodes, which a record of 2 takes as it is
 #define ESPNOW_MESH_NVS_NAMESPACE      "espnowmesh"
-#define ESPNOW_MESH_NODES              16
+#define ESPNOW_MESH_NODES              48          // as many as the core keeps of origins and of neighbours
 #define ESPNOW_MESH_UDP_PORT           47474
 #define ESPNOW_MESH_RX_DEPTH           8
 #define ESPNOW_MESH_CMD_DEPTH          4
@@ -251,10 +251,11 @@ static void EspNowMeshSettingsSave(void) {
 static void EspNowMeshSettingsLoad(void) {
   memset(&EspNowMeshSettings, 0, sizeof(EspNowMeshSettings));
   if (!NvmLoad(ESPNOW_MESH_NVS_NAMESPACE, "settings", &EspNowMeshSettings, sizeof(EspNowMeshSettings)) ||
-      (ESPNOW_MESH_SETTINGS_VERSION != EspNowMeshSettings.version)) {
+      ((ESPNOW_MESH_SETTINGS_VERSION != EspNowMeshSettings.version) && (1 != EspNowMeshSettings.version))) {
     memset(&EspNowMeshSettings, 0, sizeof(EspNowMeshSettings));
-    EspNowMeshSettings.version = ESPNOW_MESH_SETTINGS_VERSION;
   }
+  // A record of version 1 is shorter: it ends after the 16th node, and the rest of this one was cleared above
+  EspNowMeshSettings.version = ESPNOW_MESH_SETTINGS_VERSION;
 }
 
 static void EspNowMeshWipe(void* buffer, size_t len) {
@@ -533,38 +534,42 @@ static void EspNowMeshUdpPoll(EspNowMesh::Node* node) {
 // What the main loop handed over: the nodes, the key of the network, how the network is used
 static void EspNowMeshApplyShared(EspNowMesh::Node* node, EspNowMeshShared_t* shared);
 static void EspNowMeshApplyShared(EspNowMesh::Node* node, EspNowMeshShared_t* shared) {
-  EspNowMeshShared_t fresh;
+  // The copy is 2 KB with 48 nodes: on the heap for the while it takes, and not on the stack of the task. If there is no room the
+  // configuration stays marked as changed, and the next turn of the task tries again
+  EspNowMeshShared_t* fresh = new (std::nothrow) EspNowMeshShared_t;
+  if (nullptr == fresh) { return; }
   xSemaphoreTake(EspNowMeshDriver.lock, portMAX_DELAY);
-  memcpy(&fresh, shared, sizeof(fresh));
+  memcpy(fresh, shared, sizeof(*fresh));
   EspNowMeshDriver.config_dirty = false;
   xSemaphoreGive(EspNowMeshDriver.lock);
 
-  if (fresh.has_group) { EspNowMeshDriver.crypto->SetGroupKey(fresh.group_key, fresh.group_version); }
+  if (fresh->has_group) { EspNowMeshDriver.crypto->SetGroupKey(fresh->group_key, fresh->group_version); }
   // The keys of the nodes that left, or whose key changed, go first: a node that moved to another slot would otherwise have its
   // new key made and then forgotten
   for (uint32_t i = 0; i < ESPNOW_MESH_NODES; i++) {
     const EspNowMeshNode_t& old_entry = EspNowMeshTable[i];
-    const EspNowMeshNode_t& entry = fresh.node[i];
+    const EspNowMeshNode_t& entry = fresh->node[i];
     if (old_entry.id && ((old_entry.id != entry.id) || memcmp(old_entry.pub, entry.pub, sizeof(entry.pub)))) {
       EspNowMeshDriver.crypto->ForgetPeer(old_entry.id);
     }
   }
   for (uint32_t i = 0; i < ESPNOW_MESH_NODES; i++) {
     const EspNowMeshNode_t& old_entry = EspNowMeshTable[i];
-    const EspNowMeshNode_t& entry = fresh.node[i];
+    const EspNowMeshNode_t& entry = fresh->node[i];
     if (entry.id && ((old_entry.id != entry.id) || memcmp(old_entry.pub, entry.pub, sizeof(entry.pub)) || !EspNowMeshDriver.crypto->HasPeer(entry.id))) {
       if (!EspNowMeshDriver.crypto->SetPeer(entry.id, entry.pub)) {
         AddLog(LOG_LEVEL_INFO, PSTR("EMH: The public key of node %u gives no key"), entry.id);
       }
     }
   }
-  memcpy(EspNowMeshTable, fresh.node, sizeof(EspNowMeshTable));
-  if (fresh.network & ESPNOW_MESH_NET_UDP) {
+  memcpy(EspNowMeshTable, fresh->node, sizeof(EspNowMeshTable));
+  if (fresh->network & ESPNOW_MESH_NET_UDP) {
     if (EspNowMeshNetworkUp()) { if (nullptr == EspNowMeshUdp) { EspNowMeshUdpStart(); } }
   } else {
     EspNowMeshUdpStop();
   }
-  EspNowMeshWipe(&fresh, sizeof(fresh));      // it held the key of the network
+  EspNowMeshWipe(fresh, sizeof(*fresh));      // it held the key of the network
+  delete fresh;
 }
 
 static void EspNowMeshPutEvent(const EspNowMeshEvent_t* event);
@@ -642,20 +647,23 @@ static void EspNowMeshSnapshotMake(EspNowMesh::Node* node);
 static void EspNowMeshSnapshotMake(EspNowMesh::Node* node) {
   EspNowMeshSnapshot_t* s = EspNowMeshDriver.snapshot;
   if (nullptr == s) { return; }
-  EspNowMeshSnapshot_t fresh;
-  memset(&fresh, 0, sizeof(fresh));
   uint32_t now = millis();
-  fresh.at = now;
-  fresh.stats = node->stats();
-  fresh.queued = node->queued();
-  fresh.waiting = node->waiting();
-  fresh.noisy = node->Noisy();
-  fresh.loss = node->LossPercent();
-  fresh.net_up = EspNowMeshNetworkUp();
+  bool net_up = EspNowMeshNetworkUp();
+  uint16_t stack_free = uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t);
+  // Made in place, under the lock: a copy of it kept on the stack of this task would hold 48 neighbours of 44 bytes
+  if (pdTRUE != xSemaphoreTake(EspNowMeshDriver.lock, pdMS_TO_TICKS(10))) { return; }
+  memset(s, 0, sizeof(*s));
+  s->at = now;
+  s->stats = node->stats();
+  s->queued = node->queued();
+  s->waiting = node->waiting();
+  s->noisy = node->Noisy();
+  s->loss = node->LossPercent();
+  s->net_up = net_up;
   for (uint32_t i = 0; i < EspNowMesh::kMaxNeighbors; i++) {
     const EspNowMesh::Neighbor* n = node->NeighborAt(i);
     if (nullptr == n) { continue; }
-    EspNowMeshNeighbor_t& out = fresh.neighbor[fresh.neighbors++];
+    EspNowMeshNeighbor_t& out = s->neighbor[s->neighbors++];
     out.id = n->id;
     out.state = n->state;
     out.lists_me = n->listsMe;
@@ -669,15 +677,12 @@ static void EspNowMeshSnapshotMake(EspNowMesh::Node* node) {
     memcpy(out.info, n->info, n->infoLen);
   }
   for (uint32_t i = 0; i < ESPNOW_MESH_NODES; i++) {
-    if (EspNowMeshTable[i].id && node->IsSilent(EspNowMeshTable[i].id) && (fresh.silent_count < ESPNOW_MESH_NODES)) {
-      fresh.silent[fresh.silent_count++] = EspNowMeshTable[i].id;
+    if (EspNowMeshTable[i].id && node->IsSilent(EspNowMeshTable[i].id) && (s->silent_count < ESPNOW_MESH_NODES)) {
+      s->silent[s->silent_count++] = EspNowMeshTable[i].id;
     }
   }
-  fresh.stack_free = uxTaskGetStackHighWaterMark(nullptr) * sizeof(StackType_t);
-  if (pdTRUE == xSemaphoreTake(EspNowMeshDriver.lock, pdMS_TO_TICKS(10))) {
-    memcpy(s, &fresh, sizeof(fresh));
-    xSemaphoreGive(EspNowMeshDriver.lock);
-  }
+  s->stack_free = stack_free;
+  xSemaphoreGive(EspNowMeshDriver.lock);
 }
 
 // What the core has ready to send, one frame at a time: by the network if it says so, then by the radio, whose word on it the
@@ -1186,12 +1191,10 @@ void CmndEspNowMeshStatus(void) {
   uint8_t own_mac[6];
   esp_read_mac(own_mac, ESP_MAC_WIFI_STA);
   ToHex_P(own_mac, 6, mac, sizeof(mac), ':');
-  EspNowMeshSnapshot_t snap;
-  bool have = false;
+  // The snapshot is read where it is, under its lock, which is given back after the last of it: a copy would take 2 KB of this stack
+  const EspNowMeshSnapshot_t* snap = nullptr;
   if (EspNowMeshDriver.running && EspNowMeshDriver.snapshot && (pdTRUE == xSemaphoreTake(EspNowMeshDriver.lock, pdMS_TO_TICKS(50)))) {
-    memcpy(&snap, EspNowMeshDriver.snapshot, sizeof(snap));
-    xSemaphoreGive(EspNowMeshDriver.lock);
-    have = true;
+    snap = EspNowMeshDriver.snapshot;
   }
   uint8_t channel = 0;
   wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
@@ -1199,26 +1202,26 @@ void CmndEspNowMeshStatus(void) {
   Response_P(PSTR("{\"EspNowMeshStatus\":{\"Running\":%u,\"Id\":%u,\"Epoch\":%u,\"Mac\":\"%s\",\"Channel\":%u,\"Group\":%u,\"GroupVersion\":%u,\"Network\":%u,\"Radio\":%u,\"Dropped\":%u,\"Heap\":%u"),
     EspNowMeshDriver.running, EspNowMeshSettings.id, EspNowMeshSettings.epoch, mac, channel, EspNowMeshSettings.has_group, EspNowMeshSettings.group_version,
     EspNowMeshSettings.network, EspNowMeshDriver.radio, EspNowMeshDriver.dropped, ESP_getFreeHeap());
-  if (have) {
-    const EspNowMesh::Stats& s = snap.stats;
+  if (snap) {
+    const EspNowMesh::Stats& s = snap->stats;
     ResponseAppend_P(PSTR(",\"Neighbors\":%u,\"Queued\":%u,\"Waiting\":%u,\"Noisy\":%u,\"Loss\":%u,\"NetUp\":%u,\"Stack\":%u,\"Silent\":%u,"
                           "\"Heard\":%u,\"Bad\":%u,\"Repeated\":%u,\"Delivered\":%u,\"SentOwn\":%u,\"SentRelay\":%u,\"Suppressed\":%u,"
                           "\"AcksSent\":%u,\"AcksHeard\":%u,\"Resent\":%u,\"GaveUp\":%u,\"HopFailed\":%u,\"SyncDone\":%u,\"Beats\":%u,\"Rescued\":%u,\"CipherBad\":%u,\"UdpSent\":%u,\"UdpHeard\":%u"),
-      snap.neighbors, snap.queued, snap.waiting, snap.noisy, snap.loss, snap.net_up, snap.stack_free, snap.silent_count,
+      snap->neighbors, snap->queued, snap->waiting, snap->noisy, snap->loss, snap->net_up, snap->stack_free, snap->silent_count,
       s.heard, s.bad, s.repeated, s.delivered, s.sentOwn, s.sentRelay, s.suppressed,
       s.acksSent, s.acksHeard, s.resent, s.gaveUp, s.hopFailed, s.syncDone, s.beatsHeard, s.rescued, s.cipherBad, s.udpSent, s.udpHeard);
+    xSemaphoreGive(EspNowMeshDriver.lock);
   }
   ResponseAppend_P(PSTR("}}"));
 }
 
 void CmndEspNowMeshNeighbors(void) {
-  EspNowMeshSnapshot_t snap;
   if (!EspNowMeshDriver.running || (nullptr == EspNowMeshDriver.snapshot) || (pdTRUE != xSemaphoreTake(EspNowMeshDriver.lock, pdMS_TO_TICKS(50)))) {
     ResponseCmndChar_P(PSTR("not running"));
     return;
   }
-  memcpy(&snap, EspNowMeshDriver.snapshot, sizeof(snap));
-  xSemaphoreGive(EspNowMeshDriver.lock);
+  // Read where it is, under the lock, and not copied: the whole of it is 2 KB of this stack
+  const EspNowMeshSnapshot_t& snap = *EspNowMeshDriver.snapshot;
   uint32_t first = XdrvMailbox.data_len ? atoi(XdrvMailbox.data) : 0;
   Response_P(PSTR("{\"%s\":{\"Count\":%u,\"From\":%u,\"List\":["), XdrvMailbox.command, snap.neighbors, first);
   for (uint32_t i = first; (i < snap.neighbors) && (i < first + 6); i++) {
@@ -1229,6 +1232,7 @@ void CmndEspNowMeshNeighbors(void) {
       (i == first) ? PSTR("") : PSTR(","), n.id, EspNowMeshStateName(n.state), n.rssi, n.their_rssi, n.lists_me, n.no_radio, n.age_s,
       (0xFFFF == n.beat_s) ? -1 : (int)n.beat_s, n.hears, info);
   }
+  xSemaphoreGive(EspNowMeshDriver.lock);
   ResponseAppend_P(PSTR("]}}"));
 }
 

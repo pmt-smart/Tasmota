@@ -50,7 +50,7 @@
 
 namespace EspNowMesh {
 
-constexpr unsigned kCryptoPeers = 16;        // the nodes a node keeps a pair key for
+constexpr unsigned kCryptoPeers = kMaxOrigins;  // the nodes a node keeps the keys of a pair for, 50 bytes each: as many as it keeps origins of, so that no node it can hear is one it cannot seal for or open from
 
 class Crypto {
  public:
