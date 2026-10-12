@@ -98,6 +98,15 @@
  * naming the transfer, its own place and the count; the destination keeps what it has had, asks
  * after 300 ms for what is missing, up to three times, and says when it has all. The sender, which
  * holds the data, sends again the pieces asked for.
+ *
+ * Secrecy: when the user of this file gives it a cipher, the payload of a frame is enciphered before the
+ * frame's tag is computed. A frame for one node alone is sealed with the key this node shares with that
+ * node, and carries 8 bytes more, a tag that only that node can check; one for everyone is enciphered
+ * with the key of the network and the tag of the frame is what authenticates it. The header, with the
+ * hop count, the next hop and the attempt left out because they change on the way and on a retransmission,
+ * is the data the seal authenticates, and the number of the message the nonce: so a node that repeats a
+ * frame reads nothing of it, and a retransmission is the very same bytes as the attempt before. A frame
+ * for this node that does not open is refused before it counts for anything.
 \*********************************************************************************************/
 
 #include <stdint.h>
@@ -111,6 +120,7 @@ constexpr size_t kMaxFrame = 250;
 constexpr size_t kHeaderLen = 14;
 constexpr size_t kTagLen = 8;
 constexpr size_t kMaxPayload = kMaxFrame - kHeaderLen - kTagLen;
+constexpr size_t kPairTagLen = 8;            // what the seal of a frame for one node adds to its payload
 constexpr uint8_t kToAll = 255;
 constexpr uint8_t kMaxHops = 3;
 constexpr unsigned kReplayWindow = 32;
@@ -170,6 +180,13 @@ typedef void (*TagFunction)(const uint8_t *data, size_t len, uint8_t tag[kTagLen
 typedef void (*ProofFunction)(void *context, uint8_t peer, uint32_t nonce, uint32_t epoch, uint32_t counter, uint8_t proof[8]);
 // The number of the node with this address, or 0 when it is not known
 typedef uint8_t (*NodeOfFunction)(void *context, const uint8_t mac[6]);
+// Seals `len` bytes of a payload: for `peer`'s eyes alone, with the key this node shares with it, and a tag of kPairTagLen
+// bytes at the end, or, when `peer` is 0, for the whole network, enciphered with the network's key and no tag. `header` is the
+// frame's, with the hops, the next hop and the attempt left out: its associated data and the source of the nonce. Returns the
+// length written to `out`, or 0 when there is no key
+typedef size_t (*SealFunction)(void *context, uint8_t peer, const uint8_t header[kHeaderLen], const uint8_t *in, size_t len, uint8_t *out);
+// The opposite: the length of the payload written to `out`, or -1 when the tag does not match or there is no key
+typedef int (*OpenFunction)(void *context, uint8_t peer, const uint8_t header[kHeaderLen], const uint8_t *in, size_t len, uint8_t *out);
 
 inline uint8_t PackKind(Type type, bool ack, uint8_t part, uint8_t attempt) {
   return (uint8_t)(((uint8_t)type & 7) << 5 | (ack ? 0x10 : 0) | (part & 3) << 2 | (attempt & 3));
@@ -300,6 +317,7 @@ struct Stats {
   uint32_t acksSent, acksHeard, resent, gaveUp, noRoute, hopFailed, syncAsked, syncDone, syncBad;
   uint32_t beatsSent, beatsHeard, pings, probes, rescued, verdictsSent, verdictsHeard, noiseSent, keptAsOnlyWay;
   uint32_t partsSent, piecesSent, piecesNew, piecesRepeated, naksSent, bulkDone, bulkLost;
+  uint32_t noKey, cipherBad;
 };
 
 // How a neighbour stands: heard lately, not heard and being tried, or declared silent by this node
@@ -346,6 +364,9 @@ struct Config {
   void *nodeContext;
   int8_t weakDbm;                              // a frame heard below this was heard from far away
   uint8_t suppressAt;                          // copies heard, the first included, that make this node drop its own
+  SealFunction seal;                           // nullptr: payloads are not enciphered and not opened
+  OpenFunction open;
+  void *cipherContext;
   uint32_t beatEveryMs;                        // the time between heartbeats; 0: no heartbeats, and no supervision
   uint8_t noiseLimit;                          // the percent lost that makes a minute a noisy one; 0 for the default
 };
@@ -371,7 +392,7 @@ class Node {
   // The same, along the way back to `dest` instead of by flooding: for an answer to a frame that was flooded. Returns the
   // counter, or 0 when this node has no way to `dest`
   uint32_t SendRouted(Type type, uint8_t dest, const uint8_t *payload, size_t len, uint32_t now, uint32_t delayMs = 0) {
-    if (len > kMaxPayload) return 0;
+    if (len > PayloadCap(dest)) return 0;
     Origin *d = FindOrigin(dest, false);
     uint8_t next = d != nullptr && d->routed ? NodeOf(d->via) : 0;
     if (next == 0) { stats_.noRoute++; return 0; }
@@ -380,7 +401,7 @@ class Node {
     Frame f = Header(type, dest, next, kMaxHops, false);
     f.payload = payload;
     f.len = len;
-    BuildOwn(slot, f, now);
+    if (!BuildOwn(slot, f, now)) return 0;
     memcpy(slot->to, d->via, 6);
     slot->unicast = true;
     slot->due = now + delayMs;
@@ -391,20 +412,24 @@ class Node {
   // each part its own frame with its own number, and each confirmed on its own when an answer is asked for. Nothing is sent
   // and false comes back when the message does not fit in two, or the queue has no room for both. `counters` get the numbers
   bool SendParts(Type type, uint8_t dest, const uint8_t *payload, size_t len, bool ackRequested, uint32_t now, uint32_t counters[2]) {
-    if (type == kBeat || len <= kMaxPayload || len > 2 * kMaxPayload - 4) return false;
+    size_t cap = PayloadCap(dest);
+    if (type == kBeat || len <= cap || len > 2 * cap - 4) return false;
     unsigned room = 0, waiting = 0;
     for (unsigned i = 0; i < kTxQueue; i++) room += !txq_[i].used;
     for (unsigned i = 0; i < kPendingSize; i++) waiting += !pending_[i].used;
     if (room < 2 || (ackRequested && dest != kToAll && waiting < 2)) { stats_.queueFull++; return false; }
     uint8_t second[kMaxPayload];
-    size_t rest = len - kMaxPayload;
-    counters[0] = Queue(type, dest, payload, kMaxPayload, ackRequested, kMaxHops, now, 1);
+    size_t rest = len - cap;
+    counters[0] = Queue(type, dest, payload, cap, ackRequested, kMaxHops, now, 1);
     Put32(second, counters[0]);
-    memcpy(second + 4, payload + kMaxPayload, rest);
+    memcpy(second + 4, payload + cap, rest);
     counters[1] = Queue(type, dest, second, rest + 4, ackRequested, kMaxHops, now, 2);
     stats_.partsSent += 2;
     return counters[0] != 0 && counters[1] != 0;
   }
+
+  // The most a payload can be in a frame for `dest`
+  size_t MaxPayloadFor(uint8_t dest) const { return PayloadCap(dest); }
 
   // The pieces a transfer of `len` bytes comes to
   static unsigned BulkPieces(size_t len) { return (unsigned)((len + kBulkPieceMax - 1) / kBulkPieceMax); }
@@ -448,12 +473,24 @@ class Node {
     Origin *o = FindOrigin(f.origin, true);
     if (o == nullptr) { stats_.unsynced++; return kNeedsSync; }
     bool forMe = f.dest == cfg_.id || f.dest == kToAll;
+    // what the frame carries, as this node reads it: a frame for this node alone is opened with the key it shares with the origin, one
+    // for everyone with the network's. A frame that does not open is refused before it counts for anything: a window, a way back, a copy
+    Frame g = f;
+    uint8_t plain[kMaxPayload];
+    if (forMe && cfg_.open != nullptr && f.len > 0) {
+      uint8_t aad[kHeaderLen];
+      CipherHeader(f, aad);
+      int pn = cfg_.open(cfg_.cipherContext, f.dest == kToAll ? 0 : f.origin, aad, f.payload, f.len, plain);
+      if (pn < 0) { stats_.cipherBad++; return kBad; }
+      g.payload = plain;
+      g.len = (size_t)pn;
+    }
     if (f.type() == kSync) {
       Learn(o, src, reach);
       Remember(f.origin, f.epoch, f.counter, f.attempt(), src);
       // an origin that asks from an epoch above the one kept has started again: it is asked in its turn, before its first data frame
       if (f.epoch > o->epoch && o->synced) o->synced = false;
-      return OnSync(f, data, n, rssi, now, forMe, NodeOf(src));
+      return OnSync(g, data, n, rssi, now, forMe, NodeOf(src));
     }
     bool known = false;                        // this number has been delivered before
     // a frame refused for want of a sync, or for its epoch, is not remembered: it is not one this node has handled, and the
@@ -482,12 +519,12 @@ class Node {
     Touch(sender, src, rssi, now);
     if (f.origin != sender) NodeIsAlive(f.origin, now);
     if (f.type() == kBeat) {
-      OnSupervision(f, sender, now);
+      OnSupervision(g, sender, now);
     } else if (forMe && f.type() == kAck) {
-      HandleAck(f);
+      HandleAck(g);
     } else if (forMe) {
       // a piece of a bulk transfer is the application's once, whatever the number of times it comes
-      if (f.type() != kBulk || TrackPiece(f, now)) Deliver(f, src, rssi, known);
+      if (f.type() != kBulk || TrackPiece(g, now)) Deliver(g, src, rssi, known);
       // answered at once, before the application has done anything with it, and every attempt
       if (f.ackRequested() && f.dest == cfg_.id) SendAck(f, now);
     }
@@ -835,10 +872,37 @@ class Node {
     return f;
   }
 
-  // Puts an own frame in a slot of the queue, sealed, remembered as heard so that a neighbour's repetition is a copy
-  void BuildOwn(TxItem *slot, const Frame &f, uint32_t now) {
+  // What fits in a frame for `dest`: a frame for one node alone loses the tag of its seal
+  size_t PayloadCap(uint8_t dest) const { return cfg_.seal != nullptr && dest != kToAll ? kMaxPayload - kPairTagLen : kMaxPayload; }
+
+  // The header as the seal sees it: with the hops and the next hop, which change at every hop, and the attempt, which changes
+  // when a frame is sent again, taken as 0
+  static void CipherHeader(const Frame &f, uint8_t aad[kHeaderLen]) {
+    aad[0] = kVersion;
+    aad[1] = (uint8_t)(f.kind & ~3);
+    aad[2] = f.origin;
+    aad[3] = f.dest;
+    aad[4] = 0;
+    aad[5] = 0;
+    Put32(aad + 6, f.epoch);
+    Put32(aad + 10, f.counter);
+  }
+
+  // Puts an own frame in a slot of the queue, enciphered if there is a cipher, sealed, remembered as heard so that a neighbour's
+  // repetition is a copy. False, and nothing in the slot, when the cipher has no key for the destination
+  bool BuildOwn(TxItem *slot, const Frame &f, uint32_t now) {
     memset(slot, 0, sizeof(*slot));
-    slot->len = (uint8_t)Encode(f, slot->data);
+    Frame c = f;
+    uint8_t sealed[kMaxPayload];
+    if (cfg_.seal != nullptr && f.len > 0) {
+      uint8_t aad[kHeaderLen];
+      CipherHeader(f, aad);
+      size_t sn = cfg_.seal(cfg_.cipherContext, f.dest == kToAll ? 0 : f.dest, aad, f.payload, f.len, sealed);
+      if (sn == 0 || sn > kMaxPayload) { stats_.noKey++; return false; }
+      c.payload = sealed;
+      c.len = sn;
+    }
+    slot->len = (uint8_t)Encode(c, slot->data);
     if (cfg_.tag != nullptr) Seal(cfg_.tag, cfg_.tagContext, slot->data, slot->len);
     slot->used = true;
     slot->own = true;
@@ -847,12 +911,13 @@ class Node {
     slot->due = now;
     memset(slot->to, 0xff, 6);
     Remember(f.origin, f.epoch, f.counter, f.attempt(), nullptr);
+    return true;
   }
 
   // A frame of this node's, to be flooded with `hops` repetitions left. A frame that asks for an answer and is for
   // one node is kept, sent again if none comes, and reported either way
   uint32_t Queue(Type type, uint8_t dest, const uint8_t *payload, size_t len, bool ackRequested, uint8_t hops, uint32_t now, uint8_t part = 0) {
-    if (len > kMaxPayload) return 0;
+    if (len > PayloadCap(dest)) return 0;
     bool wait = ackRequested && dest != kToAll;
     Pending *keep = nullptr;
     if (wait) {
@@ -864,7 +929,7 @@ class Node {
     Frame f = Header(type, dest, 0, hops, ackRequested, part);
     f.payload = payload;
     f.len = len;
-    BuildOwn(slot, f, now);
+    if (!BuildOwn(slot, f, now)) return 0;
     if (wait) {
       memset(keep, 0, sizeof(*keep));
       keep->used = true;
@@ -1271,7 +1336,7 @@ class Node {
     Frame f = Header(kBeat, to.id, to.id, 0, false);
     f.payload = payload;
     f.len = len;
-    BuildOwn(slot, f, now);
+    if (!BuildOwn(slot, f, now)) return 0;
     memcpy(slot->to, to.mac, 6);
     slot->unicast = true;
     slot->pingTarget = pingTarget;
