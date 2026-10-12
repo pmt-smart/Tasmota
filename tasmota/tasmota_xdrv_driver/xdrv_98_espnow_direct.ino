@@ -151,6 +151,11 @@
  * The mechanism stays here and the policy there: which commands a peer may send
  * is the application's to say, not this driver's.
  *
+ * Build option ESPNOW_DIRECT_RX_QUEUE_DEPTH: the frames the radio's callback has
+ * for the main loop wait in a queue of this many items (4 by default, 243 bytes
+ * of heap each), and a full queue drops the oldest. A device that is sent a
+ * burst of lines, such as a bridge handed a whole zone, sets a deeper one.
+ *
  * Commands:
  *   EspNowEnable 0|1  - stop/start the radio, reports state when called bare;
  *                       enabled with no peer set, it starts once one is
@@ -289,8 +294,11 @@ struct {
 // and reports a greeting or a ping calls for. The callback runs on its own task,
 // where running a command is not safe, so it only copies what arrived and lets
 // the main loop act on it. A full queue drops the oldest arrival rather than
-// blocking the radio task.
+// blocking the radio task. Four items by default, each of 243 bytes of heap: a build that gets bursts of lines, as a bridge that is
+// sent a whole zone at once does, sets a deeper one, and a device short of heap keeps the default.
+#ifndef ESPNOW_DIRECT_RX_QUEUE_DEPTH
 #define ESPNOW_DIRECT_RX_QUEUE_DEPTH   4
+#endif
 
 // What the main loop is asked to do besides delivering a frame
 #define ESPNOW_DIRECT_DO_HELLO         0xF0   // answer a HELLO: its session and challenge follow
