@@ -1,6 +1,7 @@
 /*
   espnow_mesh_core.h - ESP-NOW mesh: frame format, duplicate suppression, replay window, flooding,
-                       routing back along the way a frame came, acknowledgement with resend, and the sync exchange
+                       routing back along the way a frame came, acknowledgement with resend, the sync exchange,
+                       and the supervision of the neighbourhood
 
   Copyright (C) 2026  Casa Inteligente
 
@@ -74,6 +75,21 @@
  * one makes the origin unsynchronised again, because a start of the origin is the moment a
  * recorded frame of one of its earlier epochs could be played back. A frame that repeats a
  * number with a higher attempt is a retransmission: it is repeated, and delivered as one.
+ *
+ * Supervision: every few seconds a node sends a heartbeat, in broadcast and never repeated, which
+ * carries a few bytes of the application's own and the neighbours this node has heard lately with
+ * the signal of each. From the heartbeats a node knows who its neighbours are, which of them hear
+ * it back, and, from their lists, who they hear: the neighbourhood two hops deep. A neighbour not
+ * heard for a while is suspected, and the node sends it a unicast, which the radio acknowledges
+ * without the neighbour's software; failing that it asks two other neighbours that hear it to do
+ * the same, and only when none of them has an answer within a longer wait is the neighbour
+ * declared silent, to everyone, in a frame that is flooded. A silent node heard again is back.
+ * A node that has heard two copies of a frame it was waiting to repeat still repeats it when it
+ * is the only way to one of its neighbours, which the neighbours' lists tell. A neighbour that
+ * does not list this node among the ones it hears is not a way to anywhere. The heartbeats that
+ * fail to arrive from strong neighbours, the unicasts the radio does not get acknowledged and the
+ * frames nobody answers are counted, and a minute of too many of them, twice running, is a noisy
+ * channel, said to everyone.
 \*********************************************************************************************/
 
 #include <stdint.h>
@@ -98,18 +114,37 @@ constexpr unsigned kInboxSize = 8;           // the frames waiting for the appli
 constexpr unsigned kPendingSize = 8;         // the frames waiting for an answer
 constexpr unsigned kOutcomeSize = 8;         // the answers, or the lack of them, waiting for the application
 constexpr unsigned kSyncSize = 4;            // the sync exchanges in progress
+constexpr unsigned kMaxNeighbors = 16;       // the nodes heard directly that a node keeps
+constexpr unsigned kMaxInfo = 32;            // the bytes of the application's own in a heartbeat
+constexpr unsigned kNoticeSize = 8;          // the things the supervision tells the application, waiting to be read
 
 constexpr uint32_t kAnswerWaitMs = 100;      // between an attempt and the next, and after the last
 constexpr uint8_t kMaxAttempt = 2;           // the attempt that is the last: 0, 1 and 2
 constexpr unsigned kHopTries = 3;            // times a routed hop is handed to the radio
 constexpr uint32_t kSyncWaitMs = 2000;       // an exchange that has had no answer by then is given up
 constexpr uint32_t kSyncAskEveryMs = 1000;   // the least between two asks to the same origin
+constexpr uint32_t kBeatJitterMs = 500;      // added to the time between two heartbeats, so that nodes that started together part
+constexpr uint32_t kSuspectAfterMs = 15000;  // a neighbour not heard for this long is suspected
+constexpr uint32_t kSuspectJitterMs = 2000;  // added to it, a different time for each neighbour of each node
+constexpr uint32_t kSilentAfterMs = 10000;   // and declared silent this long after, if nobody has an answer from it
+constexpr uint32_t kHeardWindowMs = 15000;   // the neighbours a heartbeat lists are the ones heard within this
+constexpr unsigned kProbeHelpers = 2;        // the neighbours asked to try a suspect
+constexpr uint32_t kNoiseWindowMs = 60000;   // the span the noise is counted over
+constexpr uint8_t kNoiseLimit = 35;          // the percent of what should have got through, in a window, that makes it a noisy one, when the configuration gives none
 
 enum Type : uint8_t { kCommand = 0, kAck = 1, kState = 2, kEvent = 3, kBeat = 4, kBulk = 5, kMembership = 6, kSync = 7 };
 
 // The sync exchange's two frames, the first byte of their payload
 constexpr uint8_t kSyncAsk = 1;              // nonce(4)
 constexpr uint8_t kSyncAnswer = 2;           // nonce(4) epoch(4) counter(4) proof(8)
+
+// The supervision's frames are all of the heartbeat type, and the first byte of the payload says which
+constexpr uint8_t kSubBeat = 0;              // infoLen(1) info n(1) then n of: node(1) signal(1); to all, not repeated
+constexpr uint8_t kSubProbe = 1;             // node(1); to a neighbour: try this node for me
+constexpr uint8_t kSubPing = 2;              // nothing; to a neighbour, for the radio's acknowledgement
+constexpr uint8_t kSubAlive = 3;             // node(1); to the neighbour that asked: that node answered
+constexpr uint8_t kSubVerdict = 4;           // node(1) silent(1); to all, repeated: a node is silent, or is back
+constexpr uint8_t kSubNoise = 5;             // noisy(1); to all, repeated: the channel at the sender is noisy, or calm again
 
 // What the user of this file computes: the tag of `len` bytes, with the key it holds
 typedef void (*TagFunction)(const uint8_t *data, size_t len, uint8_t tag[kTagLen], void *context);
@@ -206,6 +241,13 @@ inline uint8_t PriorityOf(Type type) {
   }
 }
 
+// The same for a frame as bytes: of the supervision's, only the heartbeat is the lowest; a probe or a verdict is as urgent as a command
+inline uint8_t FramePriority(const uint8_t *frame) {
+  Type type = (Type)(frame[1] >> 5);
+  if (type == kBeat && frame[kHeaderLen] != kSubBeat) return 2;
+  return PriorityOf(type);
+}
+
 // What a node does with a frame it hears
 enum Verdict : uint8_t { kAccepted, kRetry, kRepeated, kReplayed, kStale, kNeedsSync, kIgnored, kBad };
 
@@ -237,6 +279,37 @@ struct Stats {
   uint32_t heard, bad, repeated, replayed, stale, unsynced, delivered, inboxFull;
   uint32_t sentOwn, sentRelay, suppressed, queueFull;
   uint32_t acksSent, acksHeard, resent, gaveUp, noRoute, hopFailed, syncAsked, syncDone, syncBad;
+  uint32_t beatsSent, beatsHeard, pings, probes, rescued, verdictsSent, verdictsHeard, noiseSent, keptAsOnlyWay;
+};
+
+// How a neighbour stands: heard lately, not heard and being tried, or declared silent by this node
+enum Liveness : uint8_t { kAlive = 0, kSuspect = 1, kMute = 2 };
+
+// A node heard directly, and what its last heartbeat said
+struct Neighbor {
+  bool used;
+  uint8_t id;
+  uint8_t state;                               // a Liveness
+  uint8_t listsMe;                             // 0 not known, 1 its heartbeat lists this node among the ones it hears, 2 it does not
+  uint8_t mac[6];
+  int8_t rssi;                                 // the signal it is heard at, smoothed; 0 before the first
+  int8_t theirRssi;                            // the signal it says it hears this node at
+  uint8_t hearsCount;
+  uint8_t hears[kMaxNeighbors];                // the nodes it listed, the ones it hears
+  uint8_t infoLen;
+  uint8_t info[kMaxInfo];                      // the application's bytes of its last heartbeat
+  uint16_t jitter;                             // how much longer than the others this node waits before it suspects this neighbour, ms
+  uint32_t lastHeard;                          // the last time something of it got through, or an unicast of ours was acknowledged by it
+  uint32_t beatAt;                             // the last heartbeat; 0 before the first
+  uint32_t suspectAt;
+};
+
+// What the supervision has to tell the application
+enum NoticeKind : uint8_t { kNoticeSilent = 1, kNoticeBack = 2, kNoticeNoisy = 3, kNoticeCalm = 4 };
+struct Notice {
+  uint8_t node;                                // the node it is about; for the noise, the node whose channel it is
+  uint8_t kind;                                // a NoticeKind
+  uint8_t by;                                  // the node that said so, this node's own number when it found out itself
 };
 
 struct Config {
@@ -252,6 +325,8 @@ struct Config {
   void *nodeContext;
   int8_t weakDbm;                              // a frame heard below this was heard from far away
   uint8_t suppressAt;                          // copies heard, the first included, that make this node drop its own
+  uint32_t beatEveryMs;                        // the time between heartbeats; 0: no heartbeats, and no supervision
+  uint8_t noiseLimit;                          // the percent lost that makes a minute a noisy one; 0 for the default
 };
 
 class Node {
@@ -261,37 +336,15 @@ class Node {
     cfg_ = config;
     if (cfg_.weakDbm == 0) cfg_.weakDbm = -70;
     if (cfg_.suppressAt == 0) cfg_.suppressAt = 2;
+    if (cfg_.noiseLimit == 0) cfg_.noiseLimit = kNoiseLimit;
   }
 
   // The application hands over a frame for `dest` (kToAll for everyone), to be flooded. Returns its counter, or 0.
-  // A frame that asks for an answer and is for one node is kept, sent again if none comes, and reported either way
+  // A frame that asks for an answer and is for one node is kept, sent again if none comes, and reported either way.
+  // The heartbeat type is the supervision's own, and is not the application's to send
   uint32_t Send(Type type, uint8_t dest, const uint8_t *payload, size_t len, bool ackRequested, uint32_t now) {
-    if (len > kMaxPayload) return 0;
-    bool wait = ackRequested && dest != kToAll;
-    Pending *keep = nullptr;
-    if (wait) {
-      keep = FreePending();
-      if (keep == nullptr) { stats_.queueFull++; return 0; }
-    }
-    TxItem *slot = FreeSlot();
-    if (slot == nullptr) { stats_.queueFull++; return 0; }
-    Frame f = Header(type, dest, 0, type == kBeat ? 0 : kMaxHops, ackRequested);
-    f.payload = payload;
-    f.len = len;
-    BuildOwn(slot, f, now);
-    memset(slot->to, 0xff, 6);
-    slot->unicast = false;
-    if (wait) {
-      memset(keep, 0, sizeof(*keep));
-      keep->used = true;
-      keep->counter = f.counter;
-      keep->dest = dest;
-      keep->attempt = 0;
-      keep->due = now + kAnswerWaitMs;
-      keep->len = slot->len;
-      memcpy(keep->frame, slot->data, slot->len);
-    }
-    return f.counter;
+    if (type == kBeat) return 0;
+    return Queue(type, dest, payload, len, ackRequested, kMaxHops, now);
   }
 
   // The same, along the way back to `dest` instead of by flooding: for an answer to a frame that was flooded. Returns the
@@ -325,7 +378,10 @@ class Node {
     // a copy of what is in hand, or of what was handled: counted for the suppression and no more
     if (SeenBefore(f.origin, f.epoch, f.counter, f.attempt())) {
       stats_.repeated++;
-      CountCopy(f.origin, f.epoch, f.counter, f.attempt());
+      CountCopy(f.origin, f.epoch, f.counter, f.attempt(), NodeOf(src), now);
+      // a copy from a neighbour that hears this node is a way back to the origin when the one kept is none
+      Origin *known_origin = FindOrigin(f.origin, false);
+      if (known_origin != nullptr && known_origin->synced && (!known_origin->routed || OneWay(known_origin->via)) && !OneWay(src)) Learn(known_origin, src);
       return kRepeated;
     }
     Origin *o = FindOrigin(f.origin, true);
@@ -336,7 +392,7 @@ class Node {
       Remember(f.origin, f.epoch, f.counter, f.attempt(), src);
       // an origin that asks from an epoch above the one kept has started again: it is asked in its turn, before its first data frame
       if (f.epoch > o->epoch && o->synced) o->synced = false;
-      return OnSync(f, data, n, rssi, now, forMe);
+      return OnSync(f, data, n, rssi, now, forMe, NodeOf(src));
     }
     bool known = false;                        // this number has been delivered before
     // a frame refused for want of a sync, or for its epoch, is not remembered: it is not one this node has handled, and the
@@ -359,14 +415,21 @@ class Node {
     // the first copy of a number came by the best way: it is the way back to its origin
     Learn(o, src);
     Remember(f.origin, f.epoch, f.counter, f.attempt(), src);
-    if (forMe && f.type() == kAck) {
+    // a frame that got through the gate is proof of its origin, and of the neighbour that sent it, just now
+    uint8_t sender = NodeOf(src);
+    if (sender == 0 && f.type() == kBeat) sender = f.origin;
+    Touch(sender, src, rssi, now);
+    if (f.origin != sender) NodeIsAlive(f.origin, now);
+    if (f.type() == kBeat) {
+      OnSupervision(f, sender, now);
+    } else if (forMe && f.type() == kAck) {
       HandleAck(f);
     } else if (forMe) {
       Deliver(f, src, rssi, known);
       // answered at once, before the application has done anything with it, and every attempt
       if (f.ackRequested() && f.dest == cfg_.id) SendAck(f, now);
     }
-    Pass(f, data, n, rssi, now);
+    Pass(f, data, n, rssi, now, sender);
     return known ? kRetry : kAccepted;
   }
 
@@ -422,24 +485,25 @@ class Node {
       if (p.attempt >= kMaxAttempt) {
         Report(p.counter, p.dest, false, p.attempt + 1);
         stats_.gaveUp++;
+        noiseTried_++;
+        noiseFailed_++;
         p.used = false;
         continue;
       }
       TxItem *slot = FreeSlot();
       if (slot == nullptr) { p.due = now + 1; continue; }
       p.attempt++;
+      memset(slot, 0, sizeof(*slot));
       memcpy(slot->data, p.frame, p.len);
       slot->len = p.len;
       slot->data[1] = (uint8_t)((slot->data[1] & ~3) | p.attempt);
       if (cfg_.tag != nullptr) Seal(cfg_.tag, cfg_.tagContext, slot->data, slot->len);
       slot->used = true;
       slot->own = true;
-      slot->unicast = false;
       memset(slot->to, 0xff, 6);
-      slot->prio = PriorityOf((Type)(slot->data[1] >> 5));
+      slot->prio = FramePriority(slot->data);
       slot->heard = 1;
       slot->due = now;
-      slot->tries = 0;
       Remember(cfg_.id, cfg_.epoch, p.counter, p.attempt, nullptr);
       p.due = now + kAnswerWaitMs;
       stats_.resent++;
@@ -453,6 +517,7 @@ class Node {
       if (o.asked && (int32_t)(now - o.askedAt) < (int32_t)kSyncAskEveryMs) continue;
       if (RequestSync(o.id, now)) { o.asked = true; o.askedAt = now; }
     }
+    if (cfg_.beatEveryMs != 0) Supervise(now);
   }
 
   // The radio is free: the frame to send next, to whom (broadcast, all ones, for a flooded frame), and whether there
@@ -491,18 +556,24 @@ class Node {
   // The radio is sending the frame NextTx gave, and has not said what became of it
   bool Busy() const { return busy_; }
 
-  // The radio says what became of the last frame: a unicast that the neighbour did not acknowledge is handed over again
+  // The radio says what became of the last frame: a unicast that the neighbour did not acknowledge is handed over again.
+  // A unicast that was a ping tells, by the neighbour's acknowledgement of it, whether the neighbour is there
   void TxDone(bool ok, uint32_t now) {
-    if (inflightValid_ && inflight_.unicast && !ok) {
+    bool unicast = inflightValid_ && inflight_.unicast;
+    uint8_t pingTarget = inflight_.pingTarget, pingAsker = inflight_.pingAsker;
+    bool again = false;
+    // a ping to a node that is gone fails for want of the node, and says nothing of the channel
+    if (unicast && pingTarget == 0) { noiseTried_++; if (!ok) noiseFailed_++; }
+    if (unicast && !ok) {
       if (++inflight_.tries < kHopTries) {
         TxItem *slot = FreeSlot();
-        if (slot != nullptr) { *slot = inflight_; slot->due = now + 1; }
-      } else {
-        stats_.hopFailed++;
+        if (slot != nullptr) { *slot = inflight_; slot->due = now + 1; again = true; }
       }
+      if (!again) stats_.hopFailed++;
     }
     inflightValid_ = false;
     busy_ = false;
+    if (unicast && pingTarget != 0 && (ok || !again)) OnPingResult(pingTarget, pingAsker, ok, now);
   }
 
   bool PopDelivery(Delivery *d) {
@@ -532,6 +603,41 @@ class Node {
     return false;
   }
 
+  // The bytes of the application's own that every heartbeat of this node carries, up to kMaxInfo
+  void SetBeatInfo(const uint8_t *info, size_t len) {
+    infoLen_ = (uint8_t)(len > kMaxInfo ? kMaxInfo : len);
+    if (infoLen_ > 0) memcpy(info_, info, infoLen_);
+  }
+
+  // The neighbours, by slot: a slot that is not in use is null
+  const Neighbor *NeighborAt(unsigned i) const { return i < kMaxNeighbors && nbrs_[i].used ? &nbrs_[i] : nullptr; }
+
+  const Neighbor *NeighborOf(uint8_t id) const {
+    for (unsigned i = 0; i < kMaxNeighbors; i++) if (nbrs_[i].used && nbrs_[i].id == id) return &nbrs_[i];
+    return nullptr;
+  }
+
+  // Whether the network has been told that `node` is silent, by this node or by another
+  bool IsSilent(uint8_t node) const {
+    for (unsigned i = 0; i < kMaxOrigins; i++) if (mutes_[i].used && mutes_[i].node == node) return true;
+    return false;
+  }
+
+  bool PopNotice(Notice *out) {
+    if (noticeCount_ == 0) return false;
+    *out = notices_[noticeHead_];
+    noticeHead_ = (noticeHead_ + 1) % kNoticeSize;
+    noticeCount_--;
+    return true;
+  }
+
+  // Whether this node has been calling its own channel noisy
+  bool Noisy() const { return noisy_; }
+
+  // How much of what should have got through did not, in the last minute judged: the greater of the percent of strong
+  // neighbours' heartbeats missed and of unicasts and answers not acknowledged
+  uint8_t LossPercent() const { return lossPercent_; }
+
   const Stats &stats() const { return stats_; }
   uint8_t id() const { return cfg_.id; }
   uint32_t epoch() const { return cfg_.epoch; }
@@ -541,9 +647,12 @@ class Node {
  private:
   struct Origin { bool used; bool synced; bool routed; bool asked; uint8_t id; uint8_t via[6]; uint32_t epoch; uint32_t highest; uint32_t seen; uint32_t askedAt; };
   struct Seen { bool used; bool hasFrom; uint8_t origin; uint8_t attempt; uint32_t epoch; uint32_t counter; uint8_t from[6]; };
-  struct TxItem { bool used; bool own; bool unicast; uint8_t len; uint8_t prio; uint8_t heard; uint8_t tries; uint8_t to[6]; uint32_t due; uint8_t data[kMaxFrame]; };
+  // `from` are the neighbours a flooded frame waiting to be repeated was heard from, for the first two copies;
+  // `pingTarget` and `pingAsker` mark a ping: whom it tries, and for whom (0: for this node)
+  struct TxItem { bool used; bool own; bool unicast; uint8_t len; uint8_t prio; uint8_t heard; uint8_t tries; uint8_t to[6]; uint8_t from[2]; uint8_t fromCount; uint8_t pingTarget; uint8_t pingAsker; uint32_t due; uint8_t data[kMaxFrame]; };
   struct Pending { bool used; uint8_t dest; uint8_t attempt; uint8_t len; uint32_t counter; uint32_t due; uint8_t frame[kMaxFrame]; };
   struct SyncAsk { bool used; uint8_t target; uint32_t nonce; uint32_t until; };
+  struct Mute { bool used; bool mine; uint8_t node; };
 
   Config cfg_;
   uint32_t counter_;
@@ -561,11 +670,33 @@ class Node {
   Outcome outcomes_[kOutcomeSize];
   unsigned outcomeHead_, outcomeCount_;
   Stats stats_;
+  Neighbor nbrs_[kMaxNeighbors];
+  Mute mutes_[kMaxOrigins];
+  Notice notices_[kNoticeSize];
+  unsigned noticeHead_, noticeCount_;
+  uint8_t info_[kMaxInfo];
+  uint8_t infoLen_;
+  bool beatArmed_;
+  uint32_t nextBeat_;
+  bool noiseArmed_;
+  uint32_t noiseAt_;
+  uint32_t noiseHeard_, noiseMissed_;          // in this window: the heartbeats of strong neighbours that came, and that did not
+  uint32_t noiseTried_, noiseFailed_;          // and the unicasts and the answers waited for, and the ones that were not acknowledged
+  uint8_t loud_;                               // the windows in a row at or above the limit
+  bool noisy_;
+  uint8_t lossPercent_;
 
   uint8_t NodeOf(const uint8_t mac[6]) const { return cfg_.nodeOf != nullptr ? cfg_.nodeOf(cfg_.nodeContext, mac) : 0; }
 
-  // The neighbour a frame of this origin was first heard from is the way back to it
-  static void Learn(Origin *o, const uint8_t src[6]) {
+  // Whether the neighbour at this address has said it does not hear this node: nothing sent to it would get there, so it is no way
+  bool OneWay(const uint8_t mac[6]) const {
+    for (unsigned i = 0; i < kMaxNeighbors; i++) if (nbrs_[i].used && memcmp(nbrs_[i].mac, mac, 6) == 0) return nbrs_[i].listsMe == 2;
+    return false;
+  }
+
+  // The neighbour a frame of this origin was first heard from is the way back to it, unless that neighbour is one that does not hear this node
+  void Learn(Origin *o, const uint8_t src[6]) {
+    if (OneWay(src)) return;
     o->routed = true;
     memcpy(o->via, src, 6);
   }
@@ -610,15 +741,45 @@ class Node {
 
   // Puts an own frame in a slot of the queue, sealed, remembered as heard so that a neighbour's repetition is a copy
   void BuildOwn(TxItem *slot, const Frame &f, uint32_t now) {
+    memset(slot, 0, sizeof(*slot));
     slot->len = (uint8_t)Encode(f, slot->data);
     if (cfg_.tag != nullptr) Seal(cfg_.tag, cfg_.tagContext, slot->data, slot->len);
     slot->used = true;
     slot->own = true;
-    slot->prio = PriorityOf(f.type());
+    slot->prio = FramePriority(slot->data);
     slot->heard = 1;
-    slot->tries = 0;
     slot->due = now;
+    memset(slot->to, 0xff, 6);
     Remember(f.origin, f.epoch, f.counter, f.attempt(), nullptr);
+  }
+
+  // A frame of this node's, to be flooded with `hops` repetitions left. A frame that asks for an answer and is for
+  // one node is kept, sent again if none comes, and reported either way
+  uint32_t Queue(Type type, uint8_t dest, const uint8_t *payload, size_t len, bool ackRequested, uint8_t hops, uint32_t now) {
+    if (len > kMaxPayload) return 0;
+    bool wait = ackRequested && dest != kToAll;
+    Pending *keep = nullptr;
+    if (wait) {
+      keep = FreePending();
+      if (keep == nullptr) { stats_.queueFull++; return 0; }
+    }
+    TxItem *slot = FreeSlot();
+    if (slot == nullptr) { stats_.queueFull++; return 0; }
+    Frame f = Header(type, dest, 0, hops, ackRequested);
+    f.payload = payload;
+    f.len = len;
+    BuildOwn(slot, f, now);
+    if (wait) {
+      memset(keep, 0, sizeof(*keep));
+      keep->used = true;
+      keep->counter = f.counter;
+      keep->dest = dest;
+      keep->attempt = 0;
+      keep->due = now + kAnswerWaitMs;
+      keep->len = slot->len;
+      memcpy(keep->frame, slot->data, slot->len);
+    }
+    return f.counter;
   }
 
   bool SeenBefore(uint8_t origin, uint32_t epoch, uint32_t counter, uint8_t attempt) const {
@@ -641,38 +802,72 @@ class Node {
     if (from != nullptr) memcpy(s.from, from, 6);
   }
 
-  // A copy of a frame this node is waiting to repeat was heard again
-  void CountCopy(uint8_t origin, uint32_t epoch, uint32_t counter, uint8_t attempt) {
+  // A copy of a frame this node is waiting to repeat was heard again, from the neighbour `from`. Two copies make this
+  // node drop its own, the neighbours having covered what it would, unless it is the only way to one of its own
+  void CountCopy(uint8_t origin, uint32_t epoch, uint32_t counter, uint8_t attempt, uint8_t from, uint32_t now) {
     for (unsigned i = 0; i < kTxQueue; i++) {
       TxItem &t = txq_[i];
       if (!t.used || t.own || t.unicast) continue;
       if (t.data[2] != origin || Get32(t.data + 6) != epoch || Get32(t.data + 10) != counter || (t.data[1] & 3) != attempt) continue;
       if (t.heard < 255) t.heard++;
-      if (t.heard >= cfg_.suppressAt) { t.used = false; stats_.suppressed++; }
+      if (t.fromCount < 2) t.from[t.fromCount++] = from;
+      if (t.heard >= cfg_.suppressAt) {
+        if (SolePath(t, now)) stats_.keptAsOnlyWay++;
+        else { t.used = false; stats_.suppressed++; }
+      }
       return;
     }
   }
 
-  // What happens to a frame that is not for this node alone: a flooded one is repeated, a routed one goes on
-  void Pass(const Frame &f, const uint8_t *data, size_t n, int8_t rssi, uint32_t now) {
-    if (f.hops == 0 || f.dest == cfg_.id) return;
-    if (f.routed()) Forward(data, n, f, now); else Schedule(data, n, rssi, now);
+  // Whether the frame waiting in `t` is the only way it has to one of this node's neighbours: one that the senders it was heard
+  // from, and its origin, do not hear, by the lists in their heartbeats. A sender whose list is not known covers only itself
+  bool SolePath(const TxItem &t, uint32_t now) const {
+    if (cfg_.beatEveryMs == 0) return false;
+    uint8_t origin = t.data[2];
+    for (unsigned i = 0; i < kMaxNeighbors; i++) {
+      const Neighbor &m = nbrs_[i];
+      if (!m.used || m.state != kAlive || m.listsMe == 2 || m.id == origin) continue;
+      if ((int32_t)(now - m.lastHeard) >= (int32_t)kHeardWindowMs) continue;
+      bool covered = false;
+      for (unsigned k = 0; k < t.fromCount && !covered; k++) {
+        if (t.from[k] == m.id) { covered = true; break; }
+        const Neighbor *s = NeighborOf(t.from[k]);
+        covered = s != nullptr && Lists(*s, m.id);
+      }
+      const Neighbor *o = NeighborOf(origin);
+      if (!covered && o != nullptr && Lists(*o, m.id)) covered = true;
+      if (!covered) return true;
+    }
+    return false;
   }
 
-  void Schedule(const uint8_t *data, size_t n, int8_t rssi, uint32_t now) {
+  // Whether the last heartbeat of `n` listed `id` among the ones it hears
+  static bool Lists(const Neighbor &n, uint8_t id) {
+    if (n.beatAt == 0) return false;
+    for (unsigned i = 0; i < n.hearsCount; i++) if (n.hears[i] == id) return true;
+    return false;
+  }
+
+  // What happens to a frame that is not for this node alone: a flooded one is repeated, a routed one goes on
+  void Pass(const Frame &f, const uint8_t *data, size_t n, int8_t rssi, uint32_t now, uint8_t from = 0) {
+    if (f.hops == 0 || f.dest == cfg_.id) return;
+    if (f.routed()) Forward(data, n, f, now); else Schedule(data, n, rssi, now, from);
+  }
+
+  void Schedule(const uint8_t *data, size_t n, int8_t rssi, uint32_t now, uint8_t from) {
     TxItem *slot = FreeSlot();
     if (slot == nullptr) { stats_.queueFull++; return; }
+    memset(slot, 0, sizeof(*slot));
     memcpy(slot->data, data, n);
     slot->len = (uint8_t)n;
     slot->data[4] = 0;
     slot->data[5] = data[5] - 1;
     slot->used = true;
-    slot->own = false;
-    slot->unicast = false;
-    slot->tries = 0;
     memset(slot->to, 0xff, 6);
-    slot->prio = PriorityOf((Type)(data[1] >> 5));
+    slot->prio = FramePriority(data);
     slot->heard = 1;
+    slot->from[0] = from;
+    slot->fromCount = 1;
     uint32_t r = cfg_.random != nullptr ? cfg_.random(cfg_.context) : 0;
     slot->due = now + (rssi < cfg_.weakDbm ? r % 4 : 3 + r % 6);
   }
@@ -684,16 +879,15 @@ class Node {
     if (next == 0) { stats_.noRoute++; return; }
     TxItem *slot = FreeSlot();
     if (slot == nullptr) { stats_.queueFull++; return; }
+    memset(slot, 0, sizeof(*slot));
     memcpy(slot->data, data, n);
     slot->len = (uint8_t)n;
     slot->data[4] = next;
     slot->data[5] = data[5] - 1;
     slot->used = true;
-    slot->own = false;
     slot->unicast = true;
-    slot->tries = 0;
     memcpy(slot->to, d->via, 6);
-    slot->prio = PriorityOf((Type)(data[1] >> 5));
+    slot->prio = FramePriority(data);
     slot->heard = 1;
     slot->due = now;
   }
@@ -744,6 +938,7 @@ class Node {
       if (!p.used || p.counter != counter || p.dest != f.origin) continue;
       Report(p.counter, p.dest, true, p.attempt + 1);
       stats_.acksHeard++;
+      noiseTried_++;
       p.used = false;
       return;
     }
@@ -751,7 +946,7 @@ class Node {
 
   // The sync exchange. It has no replay window of its own: a frame of it is a copy or it is handled, and an answer
   // counts only for the exchange this node started, with its nonce
-  Verdict OnSync(const Frame &f, const uint8_t *data, size_t n, int8_t rssi, uint32_t now, bool forMe) {
+  Verdict OnSync(const Frame &f, const uint8_t *data, size_t n, int8_t rssi, uint32_t now, bool forMe, uint8_t from) {
     if (forMe && f.len >= 5 && f.payload[0] == kSyncAsk && f.origin != cfg_.id) {
       uint8_t a[21];
       a[0] = kSyncAnswer;
@@ -784,8 +979,289 @@ class Node {
         break;
       }
     }
-    Pass(f, data, n, rssi, now);
+    Pass(f, data, n, rssi, now, from);
     return kAccepted;
+  }
+
+  // --- the supervision ---------------------------------------------------------------------------
+
+  void Post(NoticeKind kind, uint8_t node, uint8_t by) {
+    if (noticeCount_ >= kNoticeSize) return;
+    Notice &n = notices_[(noticeHead_ + noticeCount_) % kNoticeSize];
+    noticeCount_++;
+    n.node = node;
+    n.kind = kind;
+    n.by = by;
+  }
+
+  Neighbor *FindNeighbor(uint8_t id, bool create) {
+    Neighbor *free_slot = nullptr, *oldest = nullptr;
+    for (unsigned i = 0; i < kMaxNeighbors; i++) {
+      Neighbor &n = nbrs_[i];
+      if (n.used && n.id == id) return &n;
+      if (!n.used) { if (free_slot == nullptr) free_slot = &n; }
+      else if (oldest == nullptr || (int32_t)(n.lastHeard - oldest->lastHeard) < 0) oldest = &n;
+    }
+    if (!create) return nullptr;
+    Neighbor *n = free_slot != nullptr ? free_slot : oldest;
+    memset(n, 0, sizeof(*n));
+    n->used = true;
+    n->id = id;
+    // a heartbeat is heard by all the neighbours of its sender at once, so their timers would run out together: each waits
+    // a different while, and the first to give up a neighbour says so for the others, that are by then trying it
+    n->jitter = (uint16_t)(cfg_.random != nullptr ? cfg_.random(cfg_.context) % kSuspectJitterMs : 0);
+    return n;
+  }
+
+  Mute *FindMute(uint8_t node) {
+    for (unsigned i = 0; i < kMaxOrigins; i++) if (mutes_[i].used && mutes_[i].node == node) return &mutes_[i];
+    return nullptr;
+  }
+
+  // A frame that got through the gate was sent by the neighbour `id` just now, heard at `rssi`
+  void Touch(uint8_t id, const uint8_t mac[6], int8_t rssi, uint32_t now) {
+    if (id == 0 || id == cfg_.id || id == kToAll) return;
+    Neighbor *n = FindNeighbor(id, true);
+    memcpy(n->mac, mac, 6);
+    n->rssi = n->rssi == 0 ? rssi : (int8_t)((3 * n->rssi + rssi) / 4);
+    n->lastHeard = now;
+    if (n->state == kMute) n->beatAt = 0;
+    n->state = kAlive;
+    NodeIsAlive(id, now);
+  }
+
+  // `id` is known to be alive: if the network was told it is silent, it is back, and the node that said so says it
+  void NodeIsAlive(uint8_t id, uint32_t now) {
+    Mute *m = FindMute(id);
+    if (m == nullptr) return;
+    bool mine = m->mine;
+    m->used = false;
+    Post(kNoticeBack, id, cfg_.id);
+    if (mine) FloodVerdict(id, false, now);
+  }
+
+  void SetMute(uint8_t node, bool silent, bool mine, uint8_t by) {
+    Mute *m = FindMute(node);
+    if (!silent) {
+      if (m != nullptr) { m->used = false; Post(kNoticeBack, node, by); }
+      return;
+    }
+    if (m != nullptr) return;
+    for (unsigned i = 0; i < kMaxOrigins; i++) {
+      if (mutes_[i].used) continue;
+      mutes_[i].used = true;
+      mutes_[i].node = node;
+      mutes_[i].mine = mine;
+      Post(kNoticeSilent, node, by);
+      // a neighbour this node was itself trying is given up with the others, without a verdict of this node's own
+      Neighbor *suspect = FindNeighbor(node, false);
+      if (suspect != nullptr && suspect->state == kSuspect) suspect->state = kMute;
+      return;
+    }
+  }
+
+  void FloodVerdict(uint8_t node, bool silent, uint32_t now) {
+    uint8_t p[3] = {kSubVerdict, node, (uint8_t)(silent ? 1 : 0)};
+    if (Queue(kBeat, kToAll, p, sizeof(p), false, kMaxHops, now) != 0) stats_.verdictsSent++;
+  }
+
+  // The heartbeat: what the application keeps in it, and who this node has heard lately, with the signal
+  void QueueBeat(uint32_t now) {
+    uint8_t p[kMaxPayload];
+    size_t at = 0;
+    p[at++] = kSubBeat;
+    p[at++] = infoLen_;
+    if (infoLen_ > 0) memcpy(p + at, info_, infoLen_);
+    at += infoLen_;
+    size_t countAt = at++;
+    uint8_t count = 0;
+    for (unsigned i = 0; i < kMaxNeighbors; i++) {
+      const Neighbor &n = nbrs_[i];
+      if (!n.used || n.rssi == 0 || (int32_t)(now - n.lastHeard) >= (int32_t)kHeardWindowMs) continue;
+      p[at++] = n.id;
+      p[at++] = (uint8_t)n.rssi;
+      count++;
+    }
+    p[countAt] = count;
+    if (Queue(kBeat, kToAll, p, at, false, 0, now) != 0) stats_.beatsSent++;
+  }
+
+  // A unicast to a neighbour's own address, which the radio hands over and the neighbour's radio acknowledges
+  uint32_t SendDirect(const Neighbor &to, const uint8_t *payload, size_t len, uint32_t now, uint8_t pingTarget, uint8_t pingAsker) {
+    TxItem *slot = FreeSlot();
+    if (slot == nullptr) { stats_.queueFull++; return 0; }
+    Frame f = Header(kBeat, to.id, to.id, 0, false);
+    f.payload = payload;
+    f.len = len;
+    BuildOwn(slot, f, now);
+    memcpy(slot->to, to.mac, 6);
+    slot->unicast = true;
+    slot->pingTarget = pingTarget;
+    slot->pingAsker = pingAsker;
+    return f.counter;
+  }
+
+  void StartPing(const Neighbor &target, uint8_t asker, uint32_t now) {
+    uint8_t p[1] = {kSubPing};
+    if (SendDirect(target, p, sizeof(p), now, target.id, asker) != 0) stats_.pings++;
+  }
+
+  // The neighbours asked to try a suspect: of those that hear it and are heard back, the two of the best signal
+  void SendProbes(const Neighbor &suspect, uint32_t now) {
+    bool taken[kMaxNeighbors] = {};
+    for (unsigned sent = 0; sent < kProbeHelpers; sent++) {
+      int best = -1;
+      for (unsigned i = 0; i < kMaxNeighbors; i++) {
+        const Neighbor &n = nbrs_[i];
+        if (!n.used || taken[i] || n.id == suspect.id || n.state != kAlive || n.listsMe == 2 || !Lists(n, suspect.id)) continue;
+        if (best < 0 || n.rssi > nbrs_[best].rssi) best = (int)i;
+      }
+      if (best < 0) return;
+      taken[best] = true;
+      uint8_t p[2] = {kSubProbe, suspect.id};
+      if (SendDirect(nbrs_[best], p, sizeof(p), now, 0, 0) != 0) stats_.probes++;
+    }
+  }
+
+  // What became of a ping: for this node's own, a neighbour that answers is alive and one that does not is tried through
+  // the others; for another's, an answer is passed on to the one that asked
+  void OnPingResult(uint8_t target, uint8_t asker, bool ok, uint32_t now) {
+    if (asker == 0) {
+      Neighbor *n = FindNeighbor(target, false);
+      if (n == nullptr || n->state != kSuspect) return;
+      if (ok) { n->state = kAlive; n->lastHeard = now; stats_.rescued++; }
+      else SendProbes(*n, now);
+    } else if (ok) {
+      const Neighbor *a = NeighborOf(asker);
+      uint8_t p[2] = {kSubAlive, target};
+      if (a != nullptr) SendDirect(*a, p, sizeof(p), now, 0, 0);
+    }
+  }
+
+  void OnBeat(const Frame &f, uint8_t from, uint32_t now) {
+    Neighbor *n = FindNeighbor(from, false);
+    if (n == nullptr || f.len < 3) return;
+    size_t il = f.payload[1];
+    if (2 + il + 1 > f.len) return;
+    n->infoLen = (uint8_t)(il > kMaxInfo ? kMaxInfo : il);
+    memcpy(n->info, f.payload + 2, n->infoLen);
+    size_t at = 2 + il;
+    size_t count = f.payload[at++];
+    if (at + 2 * count > f.len) count = (f.len - at) / 2;
+    n->hearsCount = 0;
+    n->listsMe = 2;
+    n->theirRssi = 0;
+    for (size_t i = 0; i < count; i++) {
+      uint8_t id = f.payload[at + 2 * i];
+      if (id == cfg_.id) { n->listsMe = 1; n->theirRssi = (int8_t)f.payload[at + 2 * i + 1]; }
+      if (n->hearsCount < kMaxNeighbors) n->hears[n->hearsCount++] = id;
+    }
+    // a neighbour that does not hear this node is no way back to anyone, whatever came by it before the first heartbeat told
+    if (n->listsMe == 2) {
+      for (unsigned i = 0; i < kMaxOrigins; i++) if (origins_[i].used && origins_[i].routed && memcmp(origins_[i].via, n->mac, 6) == 0) origins_[i].routed = false;
+    }
+    // heartbeats that should have come from a strong neighbour and did not are the channel's; a gap longer than a window
+    // is the neighbour's, and a neighbour that was given up starts its count again
+    if (n->beatAt != 0 && n->rssi >= cfg_.weakDbm) {
+      uint32_t gap = now - n->beatAt, every = cfg_.beatEveryMs;
+      noiseHeard_++;
+      if (gap > every + every / 2 && gap < kNoiseWindowMs) noiseMissed_ += gap / every - 1;
+    }
+    n->beatAt = now;
+    stats_.beatsHeard++;
+  }
+
+  void OnSupervision(const Frame &f, uint8_t from, uint32_t now) {
+    if (f.len < 1) return;
+    switch (f.payload[0]) {
+      case kSubBeat:
+        OnBeat(f, from, now);
+        break;
+      case kSubProbe:
+        if (f.dest == cfg_.id && f.len >= 2) {
+          const Neighbor *t = NeighborOf(f.payload[1]);
+          if (t != nullptr && t->state != kMute) StartPing(*t, f.origin, now);
+        }
+        break;
+      case kSubAlive:
+        if (f.dest == cfg_.id && f.len >= 2) {
+          Neighbor *t = FindNeighbor(f.payload[1], false);
+          if (t != nullptr && t->state == kSuspect) { t->state = kAlive; t->lastHeard = now; stats_.rescued++; }
+        }
+        break;
+      case kSubVerdict:
+        if (f.dest == kToAll && f.len >= 3) {
+          stats_.verdictsHeard++;
+          uint8_t node = f.payload[1];
+          bool silent = f.payload[2] != 0;
+          // a node told it is silent says it is not
+          if (node == cfg_.id) { if (silent) FloodVerdict(cfg_.id, false, now); }
+          else SetMute(node, silent, false, f.origin);
+        }
+        break;
+      case kSubNoise:
+        if (f.dest == kToAll && f.len >= 2) Post(f.payload[1] != 0 ? kNoticeNoisy : kNoticeCalm, f.origin, f.origin);
+        break;
+      default:
+        break;
+    }
+  }
+
+  // The heartbeat is due, the neighbours that have gone quiet are suspected and, in the end, declared silent, and
+  // the noise of the last minute is judged
+  void Supervise(uint32_t now) {
+    if (!beatArmed_) {
+      beatArmed_ = true;
+      nextBeat_ = now + (cfg_.random != nullptr ? cfg_.random(cfg_.context) % cfg_.beatEveryMs : 0);
+    } else if ((int32_t)(now - nextBeat_) >= 0) {
+      QueueBeat(now);
+      nextBeat_ = now + cfg_.beatEveryMs + (cfg_.random != nullptr ? cfg_.random(cfg_.context) % kBeatJitterMs : 0);
+    }
+    for (unsigned i = 0; i < kMaxNeighbors; i++) {
+      Neighbor &n = nbrs_[i];
+      if (!n.used) continue;
+      if (n.state == kAlive && (int32_t)(now - n.lastHeard) >= (int32_t)(kSuspectAfterMs + n.jitter)) {
+        n.state = kSuspect;
+        n.suspectAt = now;
+        StartPing(n, 0, now);
+      } else if (n.state == kSuspect && (int32_t)(now - n.suspectAt) >= (int32_t)kSilentAfterMs) {
+        n.state = kMute;
+        if (!IsSilent(n.id)) {
+          SetMute(n.id, true, true, cfg_.id);
+          FloodVerdict(n.id, true, now);
+        }
+      }
+    }
+    if (!noiseArmed_) {
+      noiseArmed_ = true;
+      noiseAt_ = now + kNoiseWindowMs;
+    } else if ((int32_t)(now - noiseAt_) >= 0) {
+      noiseAt_ = now + kNoiseWindowMs;
+      // a minute is loud when enough of what should have got through did not: of the heartbeats of strong neighbours, or of the
+      // unicasts and the answers; and quiet when less than half that did not. Too few to judge is quiet
+      uint32_t beats = noiseHeard_ + noiseMissed_, limit = cfg_.noiseLimit;
+      uint32_t byBeats = beats != 0 ? noiseMissed_ * 100 / beats : 0, byHops = noiseTried_ != 0 ? noiseFailed_ * 100 / noiseTried_ : 0;
+      lossPercent_ = (uint8_t)(byBeats > byHops ? byBeats : byHops);
+      bool loud = (beats >= 12 && noiseMissed_ * 100 >= limit * beats) || (noiseTried_ >= 6 && noiseFailed_ * 100 >= limit * noiseTried_);
+      bool quiet = (beats == 0 || noiseMissed_ * 200 < limit * beats) && (noiseTried_ == 0 || noiseFailed_ * 200 < limit * noiseTried_);
+      if (loud) {
+        if (++loud_ >= 2 && !noisy_) {
+          noisy_ = true;
+          Post(kNoticeNoisy, cfg_.id, cfg_.id);
+          uint8_t p[2] = {kSubNoise, 1};
+          if (Queue(kBeat, kToAll, p, sizeof(p), false, kMaxHops, now) != 0) stats_.noiseSent++;
+        }
+      } else {
+        loud_ = 0;
+        if (quiet && noisy_) {
+          noisy_ = false;
+          Post(kNoticeCalm, cfg_.id, cfg_.id);
+          uint8_t p[2] = {kSubNoise, 0};
+          if (Queue(kBeat, kToAll, p, sizeof(p), false, kMaxHops, now) != 0) stats_.noiseSent++;
+        }
+      }
+      noiseHeard_ = noiseMissed_ = noiseTried_ = noiseFailed_ = 0;
+    }
   }
 };
 
