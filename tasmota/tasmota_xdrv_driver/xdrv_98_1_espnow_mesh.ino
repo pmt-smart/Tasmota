@@ -141,6 +141,9 @@
 #define ESPNOW_MESH_BEAT_MS            5000
 #define ESPNOW_MESH_SNAPSHOT_MS        500
 #define ESPNOW_MESH_SENDS_PER_TURN     4
+#ifndef ESPNOW_MESH_CHOOSE_RELAYS
+#define ESPNOW_MESH_CHOOSE_RELAYS      1           // 1: the device chooses the neighbours that repeat for it, says whom in its heartbeat and repeats later when a sender did not choose it; 0: every device that hears a flooded frame repeats it
+#endif
 
 #define ESPNOW_MESH_NET_UDP            1
 #define ESPNOW_MESH_NET_NO_RADIO       2
@@ -1277,6 +1280,7 @@ static bool EspNowMeshStartAttempt(void) {
   config.beatEveryMs = ESPNOW_MESH_BEAT_MS;
   config.udpOnly = (EspNowMeshSettings.network & ESPNOW_MESH_NET_NO_RADIO) != 0;
   config.udpRelay = (EspNowMeshSettings.network & ESPNOW_MESH_NET_RELAY) != 0;
+  config.chooseRelays = (ESPNOW_MESH_CHOOSE_RELAYS != 0);
   EspNowMeshDriver.node->Begin(config);
 
   EspNowMeshDriver.stop = false;
@@ -1736,11 +1740,11 @@ void CmndEspNowMeshStats(void) {
         s.acksSent, s.acksHeard, s.resent, s.gaveUp, s.hopFailed);
     } else {
       ResponseAppend_P(PSTR(",\"SyncAsked\":%u,\"SyncDone\":%u,\"SyncBad\":%u,\"SyncShed\":%u,\"StartAsks\":%u,"
-                            "\"BeatsSent\":%u,\"BeatsHeard\":%u,\"Pings\":%u,\"Probes\":%u,\"Rescued\":%u,\"VerdictsSent\":%u,\"VerdictsHeard\":%u,\"NoiseSent\":%u,\"KeptAsOnlyWay\":%u,"
+                            "\"BeatsSent\":%u,\"BeatsHeard\":%u,\"Pings\":%u,\"Probes\":%u,\"Rescued\":%u,\"VerdictsSent\":%u,\"VerdictsHeard\":%u,\"NoiseSent\":%u,\"KeptAsOnlyWay\":%u,\"RelayHeld\":%u,"
                             "\"PartsSent\":%u,\"PiecesSent\":%u,\"PiecesNew\":%u,\"PiecesRepeated\":%u,\"NaksSent\":%u,\"BulkDone\":%u,\"BulkLost\":%u,"
                             "\"UdpSent\":%u,\"UdpHeard\":%u"),
         s.syncAsked, s.syncDone, s.syncBad, s.syncShed, s.startAsks,
-        s.beatsSent, s.beatsHeard, s.pings, s.probes, s.rescued, s.verdictsSent, s.verdictsHeard, s.noiseSent, s.keptAsOnlyWay,
+        s.beatsSent, s.beatsHeard, s.pings, s.probes, s.rescued, s.verdictsSent, s.verdictsHeard, s.noiseSent, s.keptAsOnlyWay, s.relayHeld,
         s.partsSent, s.piecesSent, s.piecesNew, s.piecesRepeated, s.naksSent, s.bulkDone, s.bulkLost,
         s.udpSent, s.udpHeard);
     }
