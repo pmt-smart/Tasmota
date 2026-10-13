@@ -1846,7 +1846,7 @@ void CmndEspNowMeshHealth(void) {
 //                                               application is ready
 //   espnow_mesh_ready([ready])               -> true; says the application is ready (the default) or, with false, that it is not
 //   espnow_mesh_health()                     -> a map of what EspNowMeshHealth says of the surroundings (neighbors, weak, twohop, branches, cut,
-//                                               solewas, alone, relays), or false when the task is not running
+//                                               soleways, alone, relays), or false when the task is not running
 //
 // The frames for the application are not taken, and not answered, until it says it is ready: a script registers its rules and then
 // says so. What arrives, and what became of what was sent, comes to the rules, as the log and the header say.
@@ -1947,7 +1947,7 @@ int EspNowMeshBerryHealth(struct bvm *vm) {
   be_map_insert_int(vm, "twohop", h.twoHop);
   be_map_insert_int(vm, "branches", h.branches);
   be_map_insert_int(vm, "cut", (h.branches > 1) ? 1 : 0);
-  be_map_insert_int(vm, "solewas", h.soleWays);
+  be_map_insert_int(vm, "soleways", h.soleWays);
   be_map_insert_int(vm, "alone", (1 == h.neighbors) ? 1 : 0);
   be_map_insert_int(vm, "relays", h.relays);
   be_pop(vm, 1);
