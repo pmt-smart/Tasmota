@@ -299,6 +299,7 @@ static struct {
   volatile bool config_dirty = false;
   uint32_t epoch_ahead = 0;                  // an epoch saved by a start that failed after it: no frame went under it, and the next start takes it
   volatile bool app_ready = true;            // the application has its rules registered: until it says so the frames for it are not taken
+  volatile bool epoch_renew = false;         // the counter of the core is near its end: the mesh starts again, under the next epoch
   uint32_t ticket = 0;                       // the last a send was given, by the main loop alone
   volatile uint32_t dropped = 0;             // frames the callback had no room for
   uint8_t applied_channel = 0;
@@ -485,6 +486,16 @@ static uint32_t EspNowMeshRandom(void* context) {
 
 // The nodes the task knows, a copy of the main loop's, for the core to tell a neighbour by its address
 static EspNowMeshNode_t EspNowMeshTable[ESPNOW_MESH_NODES];
+
+// The core's counter has passed the point where it wants the next epoch. The epoch is the one the next start saves, so it is not the task's to take:
+// the task says no and the main loop starts the mesh again (EspNowMeshEverySecond), which numbers from 1 under an epoch above this one that the flash
+// has kept. The core goes on giving numbers, some 65 000 of them, until the main loop has done it
+static bool EspNowMeshRenewEpoch(void* context, uint32_t epoch) {
+  (void)context;
+  (void)epoch;
+  EspNowMeshDriver.epoch_renew = true;
+  return false;
+}
 
 static uint8_t EspNowMeshNodeOf(void* context, const uint8_t mac[6]) {
   (void)context;
@@ -1281,6 +1292,8 @@ static bool EspNowMeshStartAttempt(void) {
   config.udpOnly = (EspNowMeshSettings.network & ESPNOW_MESH_NET_NO_RADIO) != 0;
   config.udpRelay = (EspNowMeshSettings.network & ESPNOW_MESH_NET_RELAY) != 0;
   config.chooseRelays = (ESPNOW_MESH_CHOOSE_RELAYS != 0);
+  config.renewEpoch = EspNowMeshRenewEpoch;
+  EspNowMeshDriver.epoch_renew = false;
   EspNowMeshDriver.node->Begin(config);
 
   EspNowMeshDriver.stop = false;
@@ -1360,6 +1373,13 @@ static void EspNowMeshEverySecond(void) {
   EspNowMeshBerryCheck();
 #endif
   if (EspNowMeshDriver.running && EspNowMeshDriver.exited) { EspNowMeshReap(); }       // a task that was slow to end
+  if (EspNowMeshDriver.running && EspNowMeshDriver.epoch_renew) {
+    // The number of a frame is the nonce of its cipher and is never used twice: the counter of the core is near the end of its 32 bits, and a start
+    // numbers from 1 again under the next epoch, which is saved and read back before the task that sends under it starts
+    EspNowMeshDriver.epoch_renew = false;
+    AddLog(LOG_LEVEL_INFO, PSTR("EMH: The frame counter is near its end: the mesh stops and starts again under the next epoch"));
+    EspNowMeshStop();
+  }
   if (!EspNowMeshSettings.enabled) { return; }
   if (!EspNowMeshDriver.running) {
     if (EspNowMeshDriver.retry_wait && ((int32_t)(millis() - EspNowMeshDriver.retry_at) < 0)) { return; }
@@ -1740,11 +1760,11 @@ void CmndEspNowMeshStats(void) {
         s.acksSent, s.acksHeard, s.resent, s.gaveUp, s.hopFailed);
     } else {
       ResponseAppend_P(PSTR(",\"SyncAsked\":%u,\"SyncDone\":%u,\"SyncBad\":%u,\"SyncShed\":%u,\"StartAsks\":%u,"
-                            "\"BeatsSent\":%u,\"BeatsHeard\":%u,\"Pings\":%u,\"Probes\":%u,\"Rescued\":%u,\"VerdictsSent\":%u,\"VerdictsHeard\":%u,\"NoiseSent\":%u,\"KeptAsOnlyWay\":%u,\"RelayHeld\":%u,"
+                            "\"BeatsSent\":%u,\"BeatsHeard\":%u,\"Pings\":%u,\"Probes\":%u,\"Rescued\":%u,\"VerdictsSent\":%u,\"VerdictsHeard\":%u,\"NoiseSent\":%u,\"KeptAsOnlyWay\":%u,\"RelayHeld\":%u,\"CounterOut\":%u,"
                             "\"PartsSent\":%u,\"PiecesSent\":%u,\"PiecesNew\":%u,\"PiecesRepeated\":%u,\"NaksSent\":%u,\"BulkDone\":%u,\"BulkLost\":%u,"
                             "\"UdpSent\":%u,\"UdpHeard\":%u"),
         s.syncAsked, s.syncDone, s.syncBad, s.syncShed, s.startAsks,
-        s.beatsSent, s.beatsHeard, s.pings, s.probes, s.rescued, s.verdictsSent, s.verdictsHeard, s.noiseSent, s.keptAsOnlyWay, s.relayHeld,
+        s.beatsSent, s.beatsHeard, s.pings, s.probes, s.rescued, s.verdictsSent, s.verdictsHeard, s.noiseSent, s.keptAsOnlyWay, s.relayHeld, s.counterOut,
         s.partsSent, s.piecesSent, s.piecesNew, s.piecesRepeated, s.naksSent, s.bulkDone, s.bulkLost,
         s.udpSent, s.udpHeard);
     }
