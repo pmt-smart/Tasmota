@@ -582,12 +582,26 @@ static int32_t EspNowMeshPeerFind(const uint8_t* mac) {
   return -1;
 }
 
-// What it is worth to give a peer up, the largest going first, and 0 for one that is never to go. Today it is the time since a frame last
-// went to the peer, and a peer sent to within the last few seconds is never given up
+// What it is worth to give a peer up, the largest going first, and 0 for one that is never to go. A peer sent to within the last few seconds
+// is never given up, and neither is one that is the only neighbour to list some node that no other neighbour lists: it is this device's only
+// way to that node. Of the others the ones the device no longer hears go first, then the ones it hears and does not count on because they
+// deliver too few of their heartbeats, then the redundant ones, and in each the one that has gone unused longest. What the core knows of the
+// neighbours is the task's to read: from another thread the cost is the time unused alone
 static uint32_t EspNowMeshPeerCost(const EspNowMeshPeer_t& peer, uint32_t now);
 static uint32_t EspNowMeshPeerCost(const EspNowMeshPeer_t& peer, uint32_t now) {
   uint32_t idle = now - peer.used_at;
-  return (idle < ESPNOW_MESH_PEER_KEEP_MS) ? 0 : idle;
+  if (idle < ESPNOW_MESH_PEER_KEEP_MS) { return 0; }
+  uint32_t band = 1;
+  if (EspNowMeshDriver.node && (xTaskGetCurrentTaskHandle() == EspNowMeshDriver.task)) {
+    switch (EspNowMeshDriver.node->PeerRoleOf(peer.mac, now)) {
+      case EspNowMesh::kPeerOnlyWay: return 0;
+      case EspNowMesh::kPeerGone: band = 3; break;
+      case EspNowMesh::kPeerWeak: band = 2; break;
+      default: break;
+    }
+  }
+  if (idle > 0x0FFFFFFF) { idle = 0x0FFFFFFF; }
+  return (band << 28) | idle;
 }
 
 static int32_t EspNowMeshPeerVictim(uint32_t now) {
