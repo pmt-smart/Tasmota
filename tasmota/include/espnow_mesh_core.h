@@ -126,8 +126,10 @@
  * identity of the timeline it counts on, 5 bytes, the node's number and its epoch, which names one run of one node. A node that hears a heartbeat of
  * another timeline takes the one whose time is greater, that of the node that has been running longer, and moves its own time by the difference; of
  * two timelines whose times differ by less than a margin (a hop of latency) the one with the lower identity wins, so that both sides settle on the
- * same one and the two never wait on each other. Inside one timeline a node follows a greater time heard (as the timing synchronisation function of an
- * IEEE 802.11 IBSS does) and never goes back, up to an hour, so that the drift of the crystals does not add up. No real-time clock is read: the mesh
+ * same one and the two never wait on each other; the node that takes the timeline of the lower identity keeps its own time when that is the greater, for the time
+ * of a node never goes back, and where the frames take so long in the two directions that each side sees the other's timeline beyond the margin, the lower
+ * identity is taken after a few heartbeats in a row of the same neighbour. Inside one timeline a node follows a greater time heard (as the timing synchronisation
+ * function of an IEEE 802.11 IBSS does) and never goes back, up to an hour, so that the drift of the crystals does not add up. No real-time clock is read: the mesh
  * time is the caller's own millisecond counter and what the heartbeats move it by. A node is synced when it has taken a timeline, or when it has
  * listened to the heartbeats for a while after its start and found none to take. What the node tells its application of it is a queue of events (a
  * timeline taken, with the difference, and the node becoming synced), the clock at a point (ClockNow), a stamp of 6 bytes for a message, the mesh time
@@ -234,6 +236,8 @@ constexpr uint8_t kInfoSynced = 1;
 constexpr unsigned kInfoClockLen = 20;       // the bytes the application's part has at the least, when the clock is on: up to the flags
 constexpr uint32_t kClockListenMs = 10000;   // a node that has taken no timeline is synced this long after it could first hear one: two heartbeats
 constexpr uint32_t kClockBandMs = 20;        // two timelines whose times differ by no more than this are of the same age, and the lower identity wins
+constexpr uint32_t kClockWideMs = 100;       // a timeline of a lower identity that is behind this node's by more than the band and by no more than this is taken too, ...
+constexpr uint8_t kClockWideBeats = 3;       // ... when this many heartbeats in a row of the same neighbour have shown it
 constexpr uint32_t kClockFollowMs = 3600000; // inside a timeline a node follows a greater time up to this much; more is not a drift
 constexpr uint64_t kClockMaxMs = (uint64_t)1 << 47;   // a time in a heartbeat from this on (4 400 years) is no time of a running node, and is not taken: the 48 bits it travels in must hold the sum of what a node is moved by
 constexpr unsigned kClockEventSize = 8;      // the things the clock tells the application, waiting to be read
@@ -445,6 +449,7 @@ struct Neighbor {
   uint32_t beatRadioAt;                        // the last heartbeat of it that came on the radio; 0 before the first
   int16_t clockSkew;                           // its mesh time in its last heartbeat less this node's when it came, ms, held within 16 bits; 0 before the first
   uint8_t clockSeen;                           // 0 its heartbeat carried no clock, 1 it did and it is in another timeline than this node's, 2 the same
+  uint8_t clockHold;                           // its heartbeats in a row that show a timeline of a lower identity behind this node's by more than the band and no more than kClockWideMs
 };
 
 // What the supervision has to tell the application
@@ -2047,7 +2052,17 @@ class Node {
   // kClockFollowMs; in another, it is taken when it has been running longer, or, when the times are within kClockBandMs of each other, when its
   // timeline has the lower identity: the two settle on one, whoever hears first. What this node did on its own timeline is the application's to move,
   // by what the event says. The time the heartbeat says is the time it was made at, so it is a little behind the time it is heard at, by the
-  // wait of the queue, the air and the task that reads it: the neighbour is followed a few milliseconds late, and never early
+  // wait of the queue, the air and the task that reads it: the neighbour is followed a few milliseconds late, and never early.
+  //
+  // Each side therefore sees the difference of two timelines greater or smaller than it is, by what the frames take in its own direction. For two timelines of
+  // about the same age, whose difference is near the band, the node of the higher identity can see the other's behind it by more than the band while the other sees
+  // its own within it, and neither takes the other's, until the crystals have moved the difference out of that window, which takes minutes. A timeline of a lower
+  // identity that is behind this node's by more than the band and by no more than kClockWideMs is therefore taken as well, when kClockWideBeats heartbeats in a row
+  // of the same neighbour have shown it. And a node never moves its time back, taking a timeline included: it moves it by the difference when that is positive,
+  // and only changes the name when it is not. Without that the nodes of two groups that see each other at the band take the timelines of one another in turn,
+  // moving back by up to the band and then forward by more than the band, again and again; with it two nodes that took each other's timelines at once have the
+  // same time again and the lower identity decides, and a node can return to a timeline it left only by being moved forward by more than the band, which the
+  // drift of its crystal against the others' allows once in minutes at the most. So the timelines a node takes are bounded by the nodes there are and by that drift
   void ClockHear(Neighbor &n, uint32_t now) {
     const uint8_t *timeline = n.info + kInfoTimelineAt;
     uint64_t theirs = 0;
@@ -2057,21 +2072,34 @@ class Node {
     n.clockSkew = d > 32767 ? 32767 : (d < -32768 ? -32768 : (int16_t)d);
     int order = memcmp(timeline, timeline_, sizeof(timeline_));
     n.clockSeen = order == 0 ? 2 : 1;
+    bool take = false;
     if (order == 0) {
+      n.clockHold = 0;
       if (d > 0 && d <= (int64_t)kClockFollowMs) {
         clockOff_ += d;
         clockVersion_++;
         stats_.clockSteps++;
       }
-    } else if (d > (int64_t)kClockBandMs || (d >= -(int64_t)kClockBandMs && order < 0)) {
+    } else {
+      take = d > (int64_t)kClockBandMs || (d >= -(int64_t)kClockBandMs && order < 0);
+      if (!take && order < 0 && d >= -(int64_t)kClockWideMs) {
+        if (n.clockHold < 255) n.clockHold++;
+        take = n.clockHold >= kClockWideBeats;
+      } else if (!take) {
+        n.clockHold = 0;
+      }
+    }
+    if (take) {
       uint8_t left[5];
       memcpy(left, timeline_, sizeof(left));
-      clockOff_ += d;
+      int64_t step = d > 0 ? d : 0;
+      clockOff_ += step;
       memcpy(timeline_, timeline, sizeof(timeline_));
       adopted_ = true;
+      for (unsigned i = 0; i < kMaxNeighbors; i++) nbrs_[i].clockHold = 0;
       clockVersion_++;
       stats_.timelinesTaken++;
-      PostClock(kClockTimeline, left, d, true);
+      PostClock(kClockTimeline, left, step, true);
     }
     ClockPoll(now);
   }
@@ -2266,6 +2294,8 @@ class Node {
     n->noRadio = (f.payload[1] & kBeatNoRadio) != 0;
     size_t il = f.payload[2];
     if (3 + il + 1 > f.len) return;
+    // the count of heartbeats in a row that show a timeline starts again with a timeline that is not the one of the last
+    if (!(n->infoLen >= kInfoClockLen && il >= kInfoClockLen && memcmp(n->info + kInfoTimelineAt, f.payload + 3 + kInfoTimelineAt, 5) == 0)) n->clockHold = 0;
     n->infoLen = (uint8_t)(il > kMaxInfo ? kMaxInfo : il);
     memcpy(n->info, f.payload + 3, n->infoLen);
     size_t at = 3 + il;
