@@ -84,6 +84,14 @@
  *       core refused (no room, no key, too long) has an outcome with Ok 0, no attempts and Frame 0
  *   {"EspNowMesh":{"Notice":{"Kind":"Silent","Node":3,"By":2,"Value":0}}}
  *       Silent, Back, Noisy, Calm, BulkDone, BulkLost
+ *   {"EspNowMesh":{"Timeline":{"Old":"0300000007","New":"0100000002","Ticks":-12,"Delta":"-1184","Synced":1}}}
+ *       the device took the timeline of the mesh clock (see EspNowMeshClock) that another one counts on: the one it left, the one it took, by how many
+ *       ticks of 100 ms its mesh time moved (rounded, the low 32 bits of it, signed) and by how many ms (as text: it can pass 32 bits), for the
+ *       application to move by whatever it marked in the timeline it left. espnow_mesh_clock() answers in the new timeline from the moment the device took it,
+ *       before this reaches the rules, so what the application marks after reading the clock is in the new one, and what it marked before is for the
+ *       ticks to move
+ *   {"EspNowMesh":{"Synced":{"Value":1,"Timeline":"0100000002","Tag":258}}}
+ *       the synced bit of the clock changed, to Value: the device has taken a timeline, or has listened for 10 s and found none to take
  *
  * Commands:
  *   EspNowMeshEnable 0|1       - stop/start, reports the state when called bare
@@ -104,6 +112,15 @@
  *   EspNowMeshNeighbors [<first>] - the neighbours the heartbeats have given, six at a time
  *   EspNowMeshHealth [<first>] - what the heartbeats say of the surroundings, two hops deep: the neighbours that are counted on, how many of each one's
  *                                heartbeats come, the groups the neighbours fall in, and which neighbour is the only way to some node; six at a time
+ *   EspNowMeshClock [<first>]  - the mesh clock: the time this device counts since it started, ms, and the timeline it counts on (its own number and epoch, until
+ *                                it takes another), whether it is synced, how many times the clock was stepped to follow a neighbour, how many timelines
+ *                                were taken, and the neighbours heard, six at a time, each with the timeline of its last heartbeat (Seen 0: none, 1: another,
+ *                                2: this one), its synced bit, and how far its time was from this device's when the heartbeat came (Skew, ms)
+ *
+ * The mesh clock: the heartbeat carries the time and the timeline, and a device that hears another timeline whose time is greater takes it, and follows the
+ * time of a neighbour in its own when it is greater, as the timing synchronisation function of an IEEE 802.11 IBSS does. The real-time clock is never read.
+ * The heartbeat's bytes of the application (EspNowMeshInfo) begin with a layout byte, 1; the device fills in bytes 0 to 11 (the layout, the timeline, the
+ * time) and bit 0 of byte 19 (synced) as it sends, and the rest are the application's, up to 32. ESPNOW_MESH_CLOCK 0 leaves the heartbeat as it was.
  *
  * And, in Berry, without the trip through the command handler:
  *   espnow_mesh_send(dest, type, ack, data) - the ticket of the send, an integer above 0, or false when it was not taken; data is bytes
@@ -111,6 +128,16 @@
  *   espnow_mesh_max_payload(dest)           - the most bytes a payload to dest can be
  *   espnow_mesh_info(data)                  - true when the task took the bytes (up to 32) every heartbeat carries; says the application is ready
  *   espnow_mesh_ready([ready])              - true; says the application is ready, or with false that it is not
+ *   espnow_mesh_clock()                     - a map of the mesh clock, or false when the task is not running: synced, adopted (the device has taken a
+ *                                             timeline since it started), ticks10 and ticks100 (the mesh time in ticks of 10 and 100 ms, the low 32
+ *                                             bits, signed: compare two of them by their difference), tag (the 16 bits that name the timeline in a stamp),
+ *                                             timeline (hex, 10 digits), taken (the timelines taken since the device started) and lo, hi (the mesh time
+ *                                             in ms, the low 32 bits and the rest)
+ *   espnow_mesh_stamp()                     - the 6 bytes that vouch for the time a message was made at: the tag (2 bytes) and the mesh time in ticks of 10 ms
+ *                                             (4), most significant first; false when the device is not synced, or the task is not running
+ *   espnow_mesh_age(stamp)                  - a map of how old a stamp is by this device's clock now: age (ms, signed: negative for one from the future),
+ *                                             tag (true when the stamp is of this device's timeline: the time of another has no meaning here) and
+ *                                             synced; false when the bytes are not a stamp or the task is not running
 \*********************************************************************************************/
 
 #define XDRV_100                       100
@@ -144,6 +171,10 @@
 #ifndef ESPNOW_MESH_CHOOSE_RELAYS
 #define ESPNOW_MESH_CHOOSE_RELAYS      1           // 1: the device chooses the neighbours that repeat for it, says whom in its heartbeat and repeats later when a sender did not choose it; 0: every device that hears a flooded frame repeats it
 #endif
+#ifndef ESPNOW_MESH_CLOCK
+#define ESPNOW_MESH_CLOCK              1           // 1: the heartbeat carries the mesh clock and the device takes it from the ones it hears; 0: the application's bytes go as they are
+#endif
+#define ESPNOW_MESH_CLOCK_REFRESH_MS   500         // the clock the main loop reads is made again at least this often, so that it never grows older than the counter can tell
 
 #define ESPNOW_MESH_NET_UDP            1
 #define ESPNOW_MESH_NET_NO_RADIO       2
@@ -225,15 +256,20 @@ typedef struct {
 // that a node went silent, or that a frame was not answered
 #define ESPNOW_MESH_NOTE_OUTCOME       1
 #define ESPNOW_MESH_NOTE_NOTICE        2
+#define ESPNOW_MESH_NOTE_TIMELINE      3       // the clock took another timeline
+#define ESPNOW_MESH_NOTE_SYNCED        4       // and the synced bit changed
 typedef struct {
   uint8_t kind;
   uint8_t node;                              // a notice's node
   uint8_t type;                              // a notice's kind
-  uint8_t ok;                                // an outcome's: answered
+  uint8_t ok;                                // an outcome's: answered; a clock note's: synced
   uint8_t attempts;                          // an outcome's
   uint8_t dest;                              // an outcome's frame's destination; a notice's: by
-  uint32_t counter;                          // an outcome's: the ticket the send gave; a notice's value
-  uint32_t frame;                            // an outcome's: the number the frame had on the air, 0 for one that was never sent
+  uint8_t from[5];                           // a clock note's: the timeline left
+  uint8_t to[5];                             // and the timeline the clock is in
+  uint32_t counter;                          // an outcome's: the ticket the send gave; a notice's value; a timeline's: the ticks of 100 ms it moved by
+  uint32_t frame;                            // an outcome's: the number the frame had on the air, 0 for one that was never sent; a timeline's: the ms it moved by, low 32 bits
+  uint32_t delta_high;                       // and the high 32 bits of them
 } EspNowMeshNote_t;
 
 typedef struct {
@@ -248,6 +284,8 @@ typedef struct {
   uint8_t hears;
   uint8_t info_len;
   uint8_t info[EspNowMesh::kMaxInfo];
+  int16_t clock_skew;                        // its mesh time in its last heartbeat less this device's when it came, ms
+  uint8_t clock_seen;                        // 0 its heartbeat carried no clock, 1 it did and it is in another timeline, 2 the same
 } EspNowMeshNeighbor_t;
 
 // What the task publishes for the status commands
@@ -315,6 +353,13 @@ static struct {
   SemaphoreHandle_t lock = nullptr;          // the shared copy and the snapshot
   SemaphoreHandle_t radio_lock = nullptr;    // the radio, between the task that sends and the main loop that takes ESP-NOW apart; made once, never freed
   TaskHandle_t task = nullptr;
+  // The mesh clock, as the task last made it, for the main loop to read under the lock: the mesh time at that instant of the millisecond counter, and the
+  // main loop adds what the counter has gone on by. The task makes it again when the clock changes and at least every ESPNOW_MESH_CLOCK_REFRESH_MS
+  bool clock_valid = false;
+  EspNowMesh::ClockPoint clock_point;
+  uint32_t clock_taken = 0;                  // the timelines the clock has taken since the start
+  uint32_t clock_version = 0;                // the task's alone: the version of the clock that was made, and when
+  uint32_t clock_made_at = 0;
 } EspNowMeshDriver;
 
 // What the driver counts of its own, for the status: the core counts the frames, this counts what happens around it
@@ -959,6 +1004,25 @@ static bool EspNowMeshPutNote(const EspNowMeshNote_t* note) {
   return false;
 }
 
+// The clock, for the main loop: made again when its version has changed (the time was stepped, a timeline taken, the synced bit moved) and at least every
+// ESPNOW_MESH_CLOCK_REFRESH_MS, under the lock. When the lock is not to be had at once it is tried again on the next turn: the main loop is reading, which
+// takes a moment. True when the clock the main loop reads is of the version the core has: a timeline the core took is told to the application only then,
+// so that no one who knows of it reads the clock of the one it left
+static bool EspNowMeshClockPublish(EspNowMesh::Node* node, uint32_t now);
+static bool EspNowMeshClockPublish(EspNowMesh::Node* node, uint32_t now) {
+  uint32_t version = node->ClockVersion();
+  bool current = EspNowMeshDriver.clock_valid && (version == EspNowMeshDriver.clock_version);
+  if (current && ((now - EspNowMeshDriver.clock_made_at) < ESPNOW_MESH_CLOCK_REFRESH_MS)) { return true; }
+  if (pdTRUE != xSemaphoreTake(EspNowMeshDriver.lock, pdMS_TO_TICKS(2))) { return current; }
+  node->ClockNow(now, &EspNowMeshDriver.clock_point);
+  EspNowMeshDriver.clock_taken = node->stats().timelinesTaken;
+  EspNowMeshDriver.clock_valid = true;
+  xSemaphoreGive(EspNowMeshDriver.lock);
+  EspNowMeshDriver.clock_version = version;
+  EspNowMeshDriver.clock_made_at = now;
+  return true;
+}
+
 // What the core has to tell the main loop: the frames for this device, what became of the ones that asked for an answer, and
 // what the supervision found.
 //
@@ -989,6 +1053,21 @@ static void EspNowMeshDrain(EspNowMesh::Node* node) {
     note.type = n.kind;
     note.dest = n.by;
     note.counter = n.value;
+    EspNowMeshPutNote(&note);
+  }
+  // what the clock has to tell: a timeline it took, and the synced bit, once the clock the main loop reads is the one the core has
+  EspNowMesh::ClockEvent c;
+  bool clock_current = EspNowMeshClockPublish(node, millis());
+  while (clock_current && (uxQueueSpacesAvailable(EspNowMeshDriver.note) > 0) && node->PopClockEvent(&c)) {
+    EspNowMeshNote_t note;
+    memset(&note, 0, sizeof(note));
+    note.kind = (EspNowMesh::kClockTimeline == c.kind) ? ESPNOW_MESH_NOTE_TIMELINE : ESPNOW_MESH_NOTE_SYNCED;
+    note.ok = c.synced;
+    memcpy(note.from, c.from, sizeof(note.from));
+    memcpy(note.to, c.to, sizeof(note.to));
+    note.counter = (uint32_t)c.ticks;
+    note.frame = (uint32_t)c.delta;
+    note.delta_high = (uint32_t)((uint64_t)c.delta >> 32);
     EspNowMeshPutNote(&note);
   }
   EspNowMesh::Delivery d;
@@ -1073,6 +1152,8 @@ static void EspNowMeshSnapshotMake(EspNowMesh::Node* node) {
     out.hears = n->hearsCount;
     out.info_len = n->infoLen;
     memcpy(out.info, n->info, n->infoLen);
+    out.clock_skew = n->clockSkew;
+    out.clock_seen = n->clockSeen;
   }
   for (uint32_t i = 0; i < ESPNOW_MESH_NODES; i++) {
     if (EspNowMeshTable[i].id && node->IsSilent(EspNowMeshTable[i].id) && (s->silent_count < ESPNOW_MESH_NODES)) {
@@ -1174,6 +1255,7 @@ static void EspNowMeshPushShared(void) {
 }
 
 static void EspNowMeshFree(void) {
+  EspNowMeshDriver.clock_valid = false;
   if (EspNowMeshDriver.rx) { vQueueDelete(EspNowMeshDriver.rx); EspNowMeshDriver.rx = nullptr; }
   if (EspNowMeshDriver.cmd) { vQueueDelete(EspNowMeshDriver.cmd); EspNowMeshDriver.cmd = nullptr; }
   if (EspNowMeshDriver.event) { vQueueDelete(EspNowMeshDriver.event); EspNowMeshDriver.event = nullptr; }
@@ -1293,7 +1375,12 @@ static bool EspNowMeshStartAttempt(void) {
   config.udpRelay = (EspNowMeshSettings.network & ESPNOW_MESH_NET_RELAY) != 0;
   config.chooseRelays = (ESPNOW_MESH_CHOOSE_RELAYS != 0);
   config.renewEpoch = EspNowMeshRenewEpoch;
+  config.clock = (ESPNOW_MESH_CLOCK != 0);
   EspNowMeshDriver.epoch_renew = false;
+  EspNowMeshDriver.clock_valid = false;
+  EspNowMeshDriver.clock_taken = 0;
+  EspNowMeshDriver.clock_version = 0;
+  EspNowMeshDriver.clock_made_at = 0;
   EspNowMeshDriver.node->Begin(config);
 
   EspNowMeshDriver.stop = false;
@@ -1416,6 +1503,20 @@ static const char* EspNowMeshNoticeName(uint8_t kind) {
   return PSTR("?");
 }
 
+// A signed number of up to 64 bits as text: the log and the printf of the chip do not take a 64-bit integer
+static void EspNowMeshText64(char* out, size_t size, int64_t value);
+static void EspNowMeshText64(char* out, size_t size, int64_t value) {
+  char digits[24];
+  size_t n = 0;
+  bool negative = value < 0;
+  uint64_t v = negative ? (uint64_t)0 - (uint64_t)value : (uint64_t)value;
+  do { digits[n++] = (char)('0' + (uint32_t)(v % 10)); v /= 10; } while ((v != 0) && (n < sizeof(digits)));
+  size_t at = 0;
+  if (negative && (at + 1 < size)) { out[at++] = '-'; }
+  while ((n > 0) && (at + 1 < size)) { out[at++] = digits[--n]; }
+  if (size > 0) { out[at] = '\0'; }
+}
+
 static void EspNowMeshDrainEvents(void) {
   if ((nullptr == EspNowMeshDriver.event) || (nullptr == EspNowMeshDriver.note)) { return; }
   EspNowMeshNote_t note;
@@ -1423,6 +1524,20 @@ static void EspNowMeshDrainEvents(void) {
     if (ESPNOW_MESH_NOTE_OUTCOME == note.kind) {
       AddLog(LOG_LEVEL_INFO, PSTR("EMH: Send %u (frame %u) for %u %s after %u attempts"), note.counter, note.frame, note.dest, note.ok ? PSTR("was answered") : PSTR("was not answered"), note.attempts);
       Response_P(PSTR("{\"EspNowMesh\":{\"Outcome\":{\"Counter\":%u,\"Frame\":%u,\"Dest\":%u,\"Ok\":%u,\"Attempts\":%u}}}"), note.counter, note.frame, note.dest, note.ok, note.attempts);
+    } else if (ESPNOW_MESH_NOTE_TIMELINE == note.kind) {
+      char from[11];
+      char to[11];
+      char delta[24];
+      ToHex_P(note.from, sizeof(note.from), from, sizeof(from));
+      ToHex_P(note.to, sizeof(note.to), to, sizeof(to));
+      EspNowMeshText64(delta, sizeof(delta), (int64_t)(((uint64_t)note.delta_high << 32) | note.frame));
+      AddLog(LOG_LEVEL_INFO, PSTR("EMH: The clock took the timeline %s from %s: %s ms, %d ticks of 100 ms"), to, from, delta, (int32_t)note.counter);
+      Response_P(PSTR("{\"EspNowMesh\":{\"Timeline\":{\"Old\":\"%s\",\"New\":\"%s\",\"Ticks\":%d,\"Delta\":\"%s\",\"Synced\":%u}}}"), from, to, (int32_t)note.counter, delta, note.ok);
+    } else if (ESPNOW_MESH_NOTE_SYNCED == note.kind) {
+      char to[11];
+      ToHex_P(note.to, sizeof(note.to), to, sizeof(to));
+      AddLog(LOG_LEVEL_INFO, PSTR("EMH: The clock is %s, in the timeline %s"), note.ok ? PSTR("synced") : PSTR("not synced"), to);
+      Response_P(PSTR("{\"EspNowMesh\":{\"Synced\":{\"Value\":%u,\"Timeline\":\"%s\",\"Tag\":%u}}}"), note.ok, to, (uint32_t)EspNowMesh::TimelineTag(note.to));
     } else {
       AddLog(LOG_LEVEL_INFO, PSTR("EMH: %s, node %u, said by %u"), EspNowMeshNoticeName(note.type), note.node, note.dest);
       Response_P(PSTR("{\"EspNowMesh\":{\"Notice\":{\"Kind\":\"%s\",\"Node\":%u,\"By\":%u,\"Value\":%u}}}"), EspNowMeshNoticeName(note.type), note.node, note.dest, note.counter);
@@ -1832,6 +1947,57 @@ void CmndEspNowMeshHealth(void) {
   ResponseAppend_P(PSTR("]}}"));
 }
 
+// The clock the task made last, for the main loop: the point it described and the timelines taken. False when the task is not running or has not made one.
+// Whoever reads it finds the mesh time now with EspNowMesh::ClockAt, from the same counter the task's is
+static bool EspNowMeshClockRead(EspNowMesh::ClockPoint* point, uint32_t* taken);
+static bool EspNowMeshClockRead(EspNowMesh::ClockPoint* point, uint32_t* taken) {
+  if (!EspNowMeshDriver.running || (nullptr == EspNowMeshDriver.lock) || (pdTRUE != xSemaphoreTake(EspNowMeshDriver.lock, pdMS_TO_TICKS(50)))) { return false; }
+  bool valid = EspNowMeshDriver.clock_valid;
+  if (valid) {
+    *point = EspNowMeshDriver.clock_point;
+    *taken = EspNowMeshDriver.clock_taken;
+  }
+  xSemaphoreGive(EspNowMeshDriver.lock);
+  return valid;
+}
+
+// The mesh clock: what this device counts since it started and the timeline it counts on, whether it is synced, and the clocks of the neighbours its
+// heartbeats have shown, six at a time: the timeline of the last one (Seen 0 if it carried none, 1 another than this device's, 2 the same), its synced
+// bit, and how far its time was from this device's when it came, ms: negative by the wait of the frame in the queue, on the air and in the task that read it
+// when the two clocks agree, positive when the neighbour's was ahead and this device followed it. Mesh is the time in ms
+void CmndEspNowMeshClock(void) {
+  EspNowMesh::ClockPoint point;
+  uint32_t taken = 0;
+  if (!EspNowMeshClockRead(&point, &taken)) {
+    ResponseCmndChar_P(PSTR("not running"));
+    return;
+  }
+  uint64_t mesh = EspNowMesh::ClockAt(point, millis());
+  char timeline[11];
+  char text[24];
+  ToHex_P(point.timeline, sizeof(point.timeline), timeline, sizeof(timeline));
+  EspNowMeshText64(text, sizeof(text), (int64_t)mesh);
+  Response_P(PSTR("{\"%s\":{\"Clock\":%u,\"Synced\":%u,\"Adopted\":%u,\"Timeline\":\"%s\",\"Tag\":%u,\"Mesh\":%s,\"Ticks10\":%u,\"Taken\":%u"),
+    XdrvMailbox.command, (ESPNOW_MESH_CLOCK != 0) ? 1 : 0, point.synced, point.adopted, timeline, (uint32_t)EspNowMesh::TimelineTag(point.timeline), text,
+    (uint32_t)(mesh / EspNowMesh::kStampTickMs), taken);
+  if (EspNowMeshDriver.snapshot && (pdTRUE == xSemaphoreTake(EspNowMeshDriver.lock, pdMS_TO_TICKS(50)))) {
+    const EspNowMeshSnapshot_t& snap = *EspNowMeshDriver.snapshot;
+    uint32_t first = XdrvMailbox.data_len ? atoi(XdrvMailbox.data) : 0;
+    ResponseAppend_P(PSTR(",\"Steps\":%u,\"EventsLost\":%u,\"Count\":%u,\"From\":%u,\"List\":["), snap.stats.clockSteps, snap.stats.clockEventsLost, snap.neighbors, first);
+    for (uint32_t i = first; (i < snap.neighbors) && (i < first + 6); i++) {
+      const EspNowMeshNeighbor_t& n = snap.neighbor[i];
+      bool carries = (n.info_len >= EspNowMesh::kInfoClockLen) && (EspNowMesh::kInfoLayout == n.info[0]);
+      char theirs[11] = "";
+      if (carries) { ToHex_P(n.info + EspNowMesh::kInfoTimelineAt, 5, theirs, sizeof(theirs)); }
+      ResponseAppend_P(PSTR("%s{\"Id\":%u,\"Seen\":%u,\"Sync\":%u,\"Skew\":%d,\"Timeline\":\"%s\"}"),
+        (i == first) ? PSTR("") : PSTR(","), n.id, n.clock_seen, carries ? (n.info[EspNowMesh::kInfoFlagsAt] & EspNowMesh::kInfoSynced) : 0, n.clock_skew, theirs);
+    }
+    xSemaphoreGive(EspNowMeshDriver.lock);
+    ResponseAppend_P(PSTR("]"));
+  }
+  ResponseAppend_P(PSTR("}}"));
+}
+
 #ifdef USE_BERRY
 // Going through the command handler costs a full dispatch on the main loop, about 8 ms even for a command that does nothing
 // (xdrv_98), and a script that sends often should not pay it. So Berry gets entry points of its own:
@@ -1847,6 +2013,9 @@ void CmndEspNowMeshHealth(void) {
 //   espnow_mesh_ready([ready])               -> true; says the application is ready (the default) or, with false, that it is not
 //   espnow_mesh_health()                     -> a map of what EspNowMeshHealth says of the surroundings (neighbors, weak, twohop, branches, cut,
 //                                               soleways, alone, relays), or false when the task is not running
+//   espnow_mesh_clock()                      -> a map of the mesh clock (synced, adopted, ticks10, ticks100, tag, timeline, taken, lo, hi), or false
+//   espnow_mesh_stamp()                      -> the 6 bytes that stamp a message with the mesh time and the tag of the timeline, or false when not synced
+//   espnow_mesh_age(stamp)                   -> a map (age in ms, tag, synced) of how old a stamp is, or false
 //
 // The frames for the application are not taken, and not answered, until it says it is ready: a script registers its rules and then
 // says so. What arrives, and what became of what was sent, comes to the rules, as the log and the header say.
@@ -1954,6 +2123,69 @@ int EspNowMeshBerryHealth(struct bvm *vm) {
   be_return(vm);
 }
 
+// The clock as a map: the mesh time as the task's clock has it, plus what the counter has gone on by since it was made. The numbers are integers of the
+// machine, 32 bits with their sign: a time in ticks wraps in 497 days (of 10 ms) or 13.6 years (of 100 ms), and two of them are compared by their difference
+int EspNowMeshBerryClock(struct bvm *vm);
+int EspNowMeshBerryClock(struct bvm *vm) {
+  EspNowMesh::ClockPoint point;
+  uint32_t taken = 0;
+  if (!EspNowMeshClockRead(&point, &taken)) {
+    be_pushbool(vm, false);
+    be_return(vm);
+  }
+  uint64_t mesh = EspNowMesh::ClockAt(point, millis());
+  char timeline[11];
+  ToHex_P(point.timeline, sizeof(point.timeline), timeline, sizeof(timeline));
+  be_newobject(vm, "map");
+  be_map_insert_bool(vm, "synced", point.synced);
+  be_map_insert_bool(vm, "adopted", point.adopted);
+  be_map_insert_int(vm, "ticks10", (bint)(int32_t)(uint32_t)(mesh / EspNowMesh::kStampTickMs));
+  be_map_insert_int(vm, "ticks100", (bint)(int32_t)(uint32_t)(mesh / 100));
+  be_map_insert_int(vm, "tag", (bint)EspNowMesh::TimelineTag(point.timeline));
+  be_map_insert_str(vm, "timeline", timeline);
+  be_map_insert_int(vm, "taken", (bint)taken);
+  be_map_insert_int(vm, "lo", (bint)(int32_t)(uint32_t)mesh);
+  be_map_insert_int(vm, "hi", (bint)(int32_t)(uint32_t)(mesh >> 32));
+  be_pop(vm, 1);
+  be_return(vm);
+}
+
+int EspNowMeshBerryStamp(struct bvm *vm);
+int EspNowMeshBerryStamp(struct bvm *vm) {
+  EspNowMesh::ClockPoint point;
+  uint32_t taken = 0;
+  uint8_t stamp[EspNowMesh::kStampLen];
+  if (EspNowMeshClockRead(&point, &taken) && EspNowMesh::ClockStamp(point, millis(), stamp)) {
+    be_pushbytes(vm, stamp, sizeof(stamp));
+  } else {
+    be_pushbool(vm, false);
+  }
+  be_return(vm);
+}
+
+int EspNowMeshBerryAge(struct bvm *vm);
+int EspNowMeshBerryAge(struct bvm *vm) {
+  if ((be_top(vm) >= 1) && be_isbytes(vm, 1)) {
+    size_t len = 0;
+    const uint8_t* stamp = (const uint8_t*)be_tobytes(vm, 1, &len);
+    EspNowMesh::ClockPoint point;
+    uint32_t taken = 0;
+    int32_t age = 0;
+    bool same = false;
+    if (EspNowMeshClockRead(&point, &taken) && EspNowMesh::ClockAge(point, millis(), stamp, len, &age, &same)) {
+      be_newobject(vm, "map");
+      be_map_insert_int(vm, "age", (bint)age);
+      be_map_insert_bool(vm, "tag", same);
+      be_map_insert_bool(vm, "synced", point.synced);
+      be_pop(vm, 1);
+    } else {
+      be_pushbool(vm, false);
+    }
+    be_return(vm);
+  }
+  be_raise(vm, kTypeError, nullptr);
+}
+
 static void EspNowMeshBerryRegister(void) {
   if (nullptr == berry.vm) { return; }
   be_pushntvfunction(berry.vm, EspNowMeshBerrySend);
@@ -1971,6 +2203,15 @@ static void EspNowMeshBerryRegister(void) {
   be_pushntvfunction(berry.vm, EspNowMeshBerryHealth);
   be_setglobal(berry.vm, "espnow_mesh_health");
   be_pop(berry.vm, 1);
+  be_pushntvfunction(berry.vm, EspNowMeshBerryClock);
+  be_setglobal(berry.vm, "espnow_mesh_clock");
+  be_pop(berry.vm, 1);
+  be_pushntvfunction(berry.vm, EspNowMeshBerryStamp);
+  be_setglobal(berry.vm, "espnow_mesh_stamp");
+  be_pop(berry.vm, 1);
+  be_pushntvfunction(berry.vm, EspNowMeshBerryAge);
+  be_setglobal(berry.vm, "espnow_mesh_age");
+  be_pop(berry.vm, 1);
 }
 
 // The Berry machine is a new one after BrRestart, with none of what was registered in the old one: the entry points are put in it again,
@@ -1987,10 +2228,11 @@ static void EspNowMeshBerryCheck(void) {
 
 const char kEspNowMeshCommands[] PROGMEM = "|"
   "EspNowMeshEnable|EspNowMeshId|EspNowMeshChannel|EspNowMeshGroupKey|EspNowMeshNode|EspNowMeshPublic|EspNowMeshNetwork|"
-  "EspNowMeshInfo|EspNowMeshSend|EspNowMeshStatus|EspNowMeshNeighbors|EspNowMeshReady|EspNowMeshStats|EspNowMeshHealth";
+  "EspNowMeshInfo|EspNowMeshSend|EspNowMeshStatus|EspNowMeshNeighbors|EspNowMeshReady|EspNowMeshStats|EspNowMeshHealth|EspNowMeshClock";
 void (* const kEspNowMeshCommand[])(void) PROGMEM = {
   &CmndEspNowMeshEnable, &CmndEspNowMeshId, &CmndEspNowMeshChannel, &CmndEspNowMeshGroupKey, &CmndEspNowMeshNode, &CmndEspNowMeshPublic,
-  &CmndEspNowMeshNetwork, &CmndEspNowMeshInfo, &CmndEspNowMeshSend, &CmndEspNowMeshStatus, &CmndEspNowMeshNeighbors, &CmndEspNowMeshReady, &CmndEspNowMeshStats, &CmndEspNowMeshHealth };
+  &CmndEspNowMeshNetwork, &CmndEspNowMeshInfo, &CmndEspNowMeshSend, &CmndEspNowMeshStatus, &CmndEspNowMeshNeighbors, &CmndEspNowMeshReady, &CmndEspNowMeshStats, &CmndEspNowMeshHealth,
+  &CmndEspNowMeshClock };
 
 /*********************************************************************************************\
  * Interface
