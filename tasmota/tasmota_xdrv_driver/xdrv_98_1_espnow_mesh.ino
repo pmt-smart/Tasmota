@@ -88,8 +88,9 @@
  *       the device took the timeline of the mesh clock (see EspNowMeshClock) that another one counts on: the one it left, the one it took, by how many
  *       ticks of 100 ms its mesh time moved (rounded to the nearest, from half up, as the low 32 bits of it, signed) and by how many ms (as text: it can
  *       pass 32 bits), for the application to move by whatever it marked in the timeline it left. A device takes a timeline whose time is greater than
- *       its own, or within a few tens of ms of it when the timeline has the lower identity, so Ticks is never below 0 (except as the low 32 bits of a
- *       move of more than 2^31 ticks: add it with a wrap of 32 bits) and Delta is below 0 only by those few ms, which round to 0 ticks.
+ *       its own, or within a few tens of ms of it (behind it too) when the timeline has the lower identity, and its time never goes back: it moves forward
+ *       by the difference, or stays as it was and only changes name, so Ticks and Delta are never below 0 (Ticks as the low 32 bits of a move of more
+ *       than 2^31 ticks: add it with a wrap of 32 bits).
  *       espnow_mesh_clock() answers in the new timeline from the moment the device took it,
  *       before this reaches the rules, so what the application marks after reading the clock is in the new one, and what it marked before is for the
  *       ticks to move
@@ -122,8 +123,9 @@
  *                                were taken, and the neighbours heard, each with the timeline of its last heartbeat (Seen 0: none, 1: another,
  *                                2: this one), its synced bit, and how far its time was from this device's when the heartbeat came (Skew, ms)
  *
- * The mesh clock: the heartbeat carries the time and the timeline, and a device that hears another timeline whose time is greater takes it, and follows the
- * time of a neighbour in its own when it is greater, as the timing synchronisation function of an IEEE 802.11 IBSS does. The real-time clock is never read.
+ * The mesh clock: the heartbeat carries the time and the timeline, and a device that hears another timeline whose time is greater takes it (or one of a lower
+ * identity whose time is about the same: the two settle on one), and follows the time of a neighbour in its own when it is greater, as the timing synchronisation
+ * function of an IEEE 802.11 IBSS does. The time of a device never goes back. The real-time clock is never read.
  * The heartbeat's bytes of the application (EspNowMeshInfo) begin with a layout byte, 1; the device fills in bytes 0 to 11 (the layout, the timeline, the
  * time) and bit 0 of byte 19 (synced) as it sends, and the rest are the application's, up to 32. ESPNOW_MESH_CLOCK 0 leaves the heartbeat as it was.
  *
