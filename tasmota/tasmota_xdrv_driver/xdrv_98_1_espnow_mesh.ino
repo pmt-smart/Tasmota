@@ -388,8 +388,9 @@ static void EspNowMeshLogNvs(void) {
 
 // What the flash holds as the record. A record of a version this firmware knows is taken, the front of this one. One whose size is
 // none the versions had, or that cannot be read, is not understood: the device starts over with an identity of its own, and says so.
-// A record made on another chip, which a copy of the flash brings, keeps what is configured and not the identity, so that no two
-// devices have one
+// A record made on another chip, which a copy of the flash brings, keeps the key of the network and the nodes, and not what makes the
+// device the one it was made on: not the identity, and not the number either, so that no two devices have one. It starts as a new one
+// does, with the mesh off, until it is given a number (EspNowMeshId) and started
 static void EspNowMeshSettingsLoad(void) {
   memset(&EspNowMeshSettings, 0, sizeof(EspNowMeshSettings));
   const char* trouble = nullptr;
@@ -424,13 +425,20 @@ static void EspNowMeshSettingsLoad(void) {
   uint8_t own[6];
   esp_read_mac(own, ESP_MAC_WIFI_STA);
   static const uint8_t no_mac[6] = {0, 0, 0, 0, 0, 0};
-  if (memcmp(EspNowMeshSettings.mac, no_mac, 6) && memcmp(EspNowMeshSettings.mac, own, 6) && EspNowMeshSettings.has_secret) {
+  if (memcmp(EspNowMeshSettings.mac, no_mac, 6) && memcmp(EspNowMeshSettings.mac, own, 6)) {
     char text[18];
     ToHex_P(EspNowMeshSettings.mac, 6, text, sizeof(text), ':');
-    AddLog(LOG_LEVEL_INFO, PSTR("EMH: The record was made on the chip %s, and this is another: the identity and the epoch are made again, and the new public key is to be given to the other nodes"), text);
-    EspNowMeshWipe(EspNowMeshSettings.secret, sizeof(EspNowMeshSettings.secret));
-    EspNowMeshSettings.has_secret = 0;
-    EspNowMeshSettings.epoch = 0;
+    if (EspNowMeshSettings.has_secret) {
+      AddLog(LOG_LEVEL_INFO, PSTR("EMH: The record was made on the chip %s, and this is another: the identity and the epoch are made again, and the new public key is to be given to the other nodes"), text);
+      EspNowMeshWipe(EspNowMeshSettings.secret, sizeof(EspNowMeshSettings.secret));
+      EspNowMeshSettings.has_secret = 0;
+      EspNowMeshSettings.epoch = 0;
+    }
+    if (EspNowMeshSettings.id || EspNowMeshSettings.enabled) {
+      AddLog(LOG_LEVEL_INFO, PSTR("EMH: The record was made on the chip %s: its node number %u was cleared and the mesh is off, as on a new device; give this one a number with EspNowMeshId, then EspNowMeshEnable 1"), text, EspNowMeshSettings.id);
+      EspNowMeshSettings.id = 0;
+      EspNowMeshSettings.enabled = 0;
+    }
   }
   memcpy(EspNowMeshSettings.mac, own, 6);      // a record of version 1 or 2, or none, is taken to be this chip's
   EspNowMeshSettings.version = ESPNOW_MESH_SETTINGS_VERSION;
@@ -1164,6 +1172,7 @@ static const char* EspNowMeshWhyNot(void) {
 // The write comes before the rest of the start so that a failure of the rest does not leave the flash written and a retry write it
 // again: an epoch saved by a start that then failed is kept (epoch_ahead) and is the one the next attempt takes, for no frame was sent under it
 static bool EspNowMeshStartAttempt(void) {
+  if (!EspNowMeshSettings.id) { return false; }          // a device with no number sends nothing, and starts nothing
   if (!EspNowMeshSettings.has_secret) {
     esp_fill_random(EspNowMeshSettings.secret, sizeof(EspNowMeshSettings.secret));
     EspNowMeshSettings.has_secret = 1;
@@ -1413,6 +1422,10 @@ void CmndEspNowMeshId(void) {
     uint32_t id = atoi(XdrvMailbox.data);
     if ((id < 1) || (id > 254)) { ResponseCmndError(); return; }
     EspNowMeshSettings.id = id;
+    // a device is not one of its own nodes: a row of the list that has the number it now has is not another device's
+    for (uint32_t i = 0; i < ESPNOW_MESH_NODES; i++) {
+      if (EspNowMeshSettings.node[i].id == id) { memset(&EspNowMeshSettings.node[i], 0, sizeof(EspNowMeshNode_t)); }
+    }
     if (!EspNowMeshSettingsCommit()) { ResponseCmndChar_P(PSTR("flash write failed")); return; }
   }
   ResponseCmndNumber(EspNowMeshSettings.id);
@@ -1662,6 +1675,10 @@ void CmndEspNowMeshStatus(void) {
   Response_P(PSTR("{\"EspNowMeshStatus\":{\"Running\":%u,\"Id\":%u,\"Epoch\":%u,\"Mac\":\"%s\",\"Channel\":%u,\"Group\":%u,\"GroupVersion\":%u,\"Network\":%u,\"Radio\":%u,\"Ready\":%u,\"Dropped\":%u,\"Peers\":%d,\"Heap\":%u"),
     EspNowMeshDriver.running, EspNowMeshSettings.id, EspNowMeshSettings.epoch, mac, channel, EspNowMeshSettings.has_group, EspNowMeshSettings.group_version,
     EspNowMeshSettings.network, EspNowMeshDriver.radio, EspNowMeshDriver.app_ready, EspNowMeshDriver.dropped, peers.total_num, ESP_getFreeHeap());
+  if (!EspNowMeshDriver.running) {
+    const char* why = EspNowMeshWhyNot();
+    if (why) { ResponseAppend_P(PSTR(",\"Why\":\"%s\""), why); }
+  }
   if (snap) {
     const EspNowMesh::Stats& s = snap->stats;
     ResponseAppend_P(PSTR(",\"Neighbors\":%u,\"Queued\":%u,\"Waiting\":%u,\"Noisy\":%u,\"Loss\":%u,\"NetUp\":%u,\"Stack\":%u,\"Silent\":%u,"
