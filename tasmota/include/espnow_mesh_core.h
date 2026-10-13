@@ -48,6 +48,15 @@
  * payload, so that it holds from the origin to the destination and whoever repeats a frame
  * does not recompute it. The function that computes it belongs to the user of this file.
  *
+ * The key of the network changes: a node that takes a new one holds the one it had too (Config::tagPrevious, and the application's SetKeyState), and sends with
+ * the new. A frame whose tag does not check with the key in use is checked with the previous key, and a node that has not taken the change is recognised by it.
+ * For kKeyConvergeMs after a node took the change (120 s) a frame under the previous key is taken as one under the key in use, of any type. After that, and
+ * until the application lets the previous key go, the nodes that have not taken the change are let through for what brings them up to date and no more: their
+ * heartbeat, of which only that the node is there, which key it holds and that it needs the key are taken, a sync exchange, which the node answers under the tag
+ * the asker can check, and a frame of the membership for this node alone, whose payload is sealed for it and which carries the new key, sent under the previous
+ * key's tag (Send, with `previousKey`) to a node that has not taken the change. All other frames under the previous key are dropped and counted. A node that hears
+ * frames whose tag it cannot check, and none that it can, says in its heartbeat that it needs the key.
+ *
  * The number is also the nonce of the cipher, so a number is never used twice. The counter has 32 bits: a node whose counter passes kCounterRenew
  * takes the next epoch and numbers from 1 again under it, as a start would, which the others learn as they learn of a start; the application keeps the
  * epoch before it says yes (Config::renewEpoch). When it cannot have one the node goes on until the number before the last, and then it has no number to
@@ -225,6 +234,27 @@ constexpr unsigned kLinkMinSlots = 4;        // fewer intervals than this are to
 constexpr uint8_t kLinkGoodPercent = 50;     // a neighbour that delivers fewer of its heartbeats than this is heard, but not counted on as a way
 constexpr uint8_t kQualityUnknown = 255;     // the delivery of a neighbour not yet judged
 
+// The change of the network's key. A node that takes a new key holds the one it had too, as the previous key, until the change has reached every node
+// (Crypto::ChangeGroupKey, and SetKeyState here). In the time the others have to take it, kKeyConvergeMs from the moment this node took it, a frame
+// under the tag of the previous key is taken for one under the key in use, of any type. After that the nodes that have not taken the change are let
+// through for no more than what brings them up to date: their heartbeat, of which only the fact that the node is there, which key it holds and that it
+// needs the key are taken, a sync exchange, and a frame of the membership for this node alone, which carries the new key sealed for it. All other
+// frames under the previous key are dropped, and counted
+constexpr uint8_t kGroupPrevious = 255;      // as the peer of an open: the network's previous key (a node's own number is never 255)
+#ifndef ESPNOW_MESH_KEY_CONVERGE_S
+#define ESPNOW_MESH_KEY_CONVERGE_S 120
+#endif
+static_assert(ESPNOW_MESH_KEY_CONVERGE_S >= 1 && ESPNOW_MESH_KEY_CONVERGE_S <= 3600, "ESPNOW_MESH_KEY_CONVERGE_S: from 1 s to an hour");
+constexpr uint32_t kKeyConvergeMs = (uint32_t)ESPNOW_MESH_KEY_CONVERGE_S * 1000;
+constexpr uint32_t kNeedKeyAfterMs = 15000;  // a node that hears no frame whose tag it can check, and some that it cannot, for this long says it needs the key: three heartbeats
+constexpr uint8_t kInfoHoldsPrevious = 0x20; // the heartbeat's flags, bit 5: this node holds the previous key, a change of the network's key has not closed for it
+constexpr uint8_t kInfoNeedsKey = 0x40;      // bit 6: it needs the key
+constexpr unsigned kInfoKeyVersionAt = 22;   // the version of the key it sends with
+constexpr unsigned kInfoKeyLen = 23;         // the bytes the application's part has at the least, when the node says which key it holds
+constexpr uint8_t kKeyHoldsPrevious = 1;     // the bits of Neighbor::keyBits: the neighbour's heartbeat says it holds the previous key,
+constexpr uint8_t kKeyNeeds = 2;             // that it needs the key,
+constexpr uint8_t kKeyUnderPrevious = 4;     // and its last heartbeat came under the tag of the previous key
+
 // The mesh clock (Config::clock). The heartbeat's bytes of the application, when it is on: byte 0 is the layout, 1 to 5 the timeline (the node and
 // the epoch, most significant byte first), 6 to 11 the mesh time in milliseconds (48 bits, most significant first), 19 the flags, bit 0 of which says
 // the node is synced; the bytes in between, and the other bits of the flags, are the application's. A heartbeat of another layout carries no clock
@@ -277,6 +307,8 @@ constexpr uint8_t kBulkMaxNaks = 3;          // and given up after as many asks
 
 // What the user of this file computes: the tag of `len` bytes, with the key it holds
 typedef void (*TagFunction)(const uint8_t *data, size_t len, uint8_t tag[kTagLen], void *context);
+// The same with the key the network had before the last change of it: false, and `tag` untouched, when this node holds none
+typedef bool (*PreviousTagFunction)(const uint8_t *data, size_t len, uint8_t tag[kTagLen], void *context);
 // The proof that `peer`'s answer to a nonce is its own: from the key this node shares with `peer`
 typedef void (*ProofFunction)(void *context, uint8_t peer, uint32_t nonce, uint32_t epoch, uint32_t counter, uint8_t proof[8]);
 // The number of the node with this address, or 0 when it is not known
@@ -286,7 +318,8 @@ typedef uint8_t (*NodeOfFunction)(void *context, const uint8_t mac[6]);
 // frame's, with the hops, the next hop and the attempt left out: its associated data and the source of the nonce. Returns the
 // length written to `out`, or 0 when there is no key
 typedef size_t (*SealFunction)(void *context, uint8_t peer, const uint8_t header[kHeaderLen], const uint8_t *in, size_t len, uint8_t *out);
-// The opposite: the length of the payload written to `out`, or -1 when the tag does not match or there is no key
+// The opposite: the length of the payload written to `out`, or -1 when the tag does not match or there is no key. `peer` is also kGroupPrevious,
+// for a frame for everyone that came under the key the network had before: it is opened with that key
 typedef int (*OpenFunction)(void *context, uint8_t peer, const uint8_t header[kHeaderLen], const uint8_t *in, size_t len, uint8_t *out);
 
 inline uint8_t PackKind(Type type, bool ack, uint8_t part, uint8_t attempt) {
@@ -368,6 +401,31 @@ inline bool TagMatches(TagFunction fn, void *context, const uint8_t *frame, size
   return diff == 0;
 }
 
+// The same with the previous key: false when the frame does not carry a tag made with it, and when there is no such key
+inline bool PreviousTagMatches(PreviousTagFunction fn, void *context, const uint8_t *frame, size_t n) {
+  uint8_t scratch[kMaxFrame], tag[kTagLen];
+  size_t covered = n - kTagLen;
+  memcpy(scratch, frame, covered);
+  scratch[4] = 0;
+  scratch[5] = 0;
+  if (!fn(scratch, covered, tag, context)) return false;
+  uint8_t diff = 0;
+  for (size_t i = 0; i < kTagLen; i++) diff |= tag[i] ^ frame[n - kTagLen + i];
+  return diff == 0;
+}
+
+// Stamps the tag of a frame in place with the previous key; false, and the frame as it was, when there is no such key
+inline bool SealPrevious(PreviousTagFunction fn, void *context, uint8_t *frame, size_t n) {
+  uint8_t scratch[kMaxFrame], tag[kTagLen];
+  size_t covered = n - kTagLen;
+  memcpy(scratch, frame, covered);
+  scratch[4] = 0;
+  scratch[5] = 0;
+  if (!fn(scratch, covered, tag, context)) return false;
+  memcpy(frame + covered, tag, kTagLen);
+  return true;
+}
+
 // How the queue orders what waits to be sent: the lower goes first
 inline uint8_t PriorityOf(Type type) {
   switch (type) {
@@ -400,6 +458,7 @@ struct Delivery {
   uint32_t epoch;
   uint32_t counter;
   int8_t rssi;
+  bool previousKey;                            // the frame came under the tag of the key the network had before its last change: its sender has not taken the change
   uint8_t from[6];                             // the neighbour the frame was heard from
   uint8_t len;
   uint8_t payload[kMaxPayload];
@@ -425,6 +484,7 @@ struct Stats {
   uint32_t relayHeld;
   uint32_t counterOut, epochRenewed;
   uint32_t clockSteps, timelinesTaken, clockEventsLost;
+  uint32_t prevKeyHeard, prevKeyDropped;       // the frames let through under the previous key, and the ones that were not, after the change had had its time
 };
 
 // How a neighbour stands: heard lately, not heard and being tried, or declared silent by this node
@@ -457,6 +517,8 @@ struct Neighbor {
   int16_t clockSkew;                           // its mesh time in its last heartbeat less this node's when it came, ms, held within 16 bits; 0 before the first
   uint8_t clockSeen;                           // 0 its heartbeat carried no clock, 1 it did and it is in another timeline than this node's, 2 the same
   uint8_t clockHold;                           // its heartbeats in a row that show a timeline of a lower identity behind this node's by more than the band and no more than kClockWideMs
+  uint8_t keyVersion;                          // the version of the network's key that its heartbeat says it sends with; 0 when it does not say
+  uint8_t keyBits;                             // kKeyHoldsPrevious, kKeyNeeds, kKeyUnderPrevious
 };
 
 // What the supervision has to tell the application
@@ -572,6 +634,7 @@ struct Config {
   void *context;
   TagFunction tag;                             // nullptr: tags are not computed and not checked
   void *tagContext;
+  PreviousTagFunction tagPrevious;             // nullptr: no frame is taken under another key than the one in use. Called with tagContext
   ProofFunction proof;                         // nullptr: the sync answers carry no proof and none is checked
   void *proofContext;
   NodeOfFunction nodeOf;                       // needed to route: the number of a neighbour, from its address
@@ -620,9 +683,14 @@ class Node {
   // The application hands over a frame for `dest` (kToAll for everyone), to be flooded. Returns its counter, or 0.
   // A frame that asks for an answer and is for one node is kept, sent again if none comes, and reported either way.
   // The heartbeat type is the supervision's own, and is not the application's to send
-  uint32_t Send(Type type, uint8_t dest, const uint8_t *payload, size_t len, bool ackRequested, uint32_t now) {
+  // `previousKey`: the tag is made with the key the network had before its last change, for a node that has not taken it: the frame that carries the new
+  // key to it, whose payload is sealed for that node alone. When this node holds no previous key the tag is the usual
+  uint32_t Send(Type type, uint8_t dest, const uint8_t *payload, size_t len, bool ackRequested, uint32_t now, bool previousKey = false) {
     if (type == kBeat) return 0;
-    return Queue(type, dest, payload, len, ackRequested, kMaxHops, now);
+    forcePrevious_ = previousKey;
+    uint32_t counter = Queue(type, dest, payload, len, ackRequested, kMaxHops, now);
+    forcePrevious_ = false;
+    return counter;
   }
 
   // The same, along the way back to `dest` instead of by flooding: for an answer to a frame that was flooded. Returns the
@@ -695,7 +763,19 @@ class Node {
     ClockAdvance(now);
     Frame f;
     if (!Decode(data, n, &f)) { stats_.bad++; return kBad; }
-    if (cfg_.tag != nullptr && !TagMatches(cfg_.tag, cfg_.tagContext, data, n)) { stats_.bad++; return kBad; }
+    // the key the tag was made with: the one in use or, for a node that has not taken the last change of the network's key, the one before it
+    rxPrevious_ = false;
+    if (cfg_.tag != nullptr) {
+      if (!TagMatches(cfg_.tag, cfg_.tagContext, data, n)) {
+        if (cfg_.tagPrevious == nullptr || !PreviousTagMatches(cfg_.tagPrevious, cfg_.tagContext, data, n)) { stats_.bad++; NoteTag(false, now); return kBad; }
+        rxPrevious_ = true;
+      }
+      NoteTag(true, now);
+    }
+    if (rxPrevious_) {
+      if (!PreviousAdmitted(f, now)) { stats_.prevKeyDropped++; return kIgnored; }
+      stats_.prevKeyHeard++;
+    }
     if (f.origin == cfg_.id || f.origin == 0 || f.origin == kToAll) return kIgnored;
     // how near its origin a frame was heard: the hops it has left, which a heartbeat, sent with none, does not say, being heard from the origin itself
     uint8_t reach = f.type() == kBeat ? kMaxHops : f.hops;
@@ -721,6 +801,7 @@ class Node {
     }
     Origin *o = FindOrigin(f.origin, true);
     if (o == nullptr) { stats_.unsynced++; return kNeedsSync; }
+    o->keyPrevious = rxPrevious_;              // the sync frames this node sends it are under the tag it can check
     bool forMe = f.dest == cfg_.id || f.dest == kToAll;
     // what the frame carries, as this node reads it: a frame for this node alone is opened with the key it shares with the origin, one
     // for everyone with the network's. A frame that does not open is refused before it counts for anything: a window, a way back, a copy
@@ -729,11 +810,13 @@ class Node {
     if (forMe && cfg_.open != nullptr && f.len > 0) {
       uint8_t aad[kHeaderLen];
       CipherHeader(f, aad);
-      int pn = cfg_.open(cfg_.cipherContext, f.dest == kToAll ? 0 : f.origin, aad, f.payload, f.len, plain);
+      int pn = cfg_.open(cfg_.cipherContext, f.dest == kToAll ? (rxPrevious_ ? kGroupPrevious : 0) : f.origin, aad, f.payload, f.len, plain);
       if (pn < 0) { stats_.cipherBad++; return kBad; }
       g.payload = plain;
       g.len = (size_t)pn;
     }
+    // of the supervision a node that has not taken the change is let through for its heartbeat alone, once the change has had its time
+    if (rxPrevious_ && !Converging(now) && f.type() == kBeat && (g.len < 1 || g.payload[0] != kSubBeat)) { stats_.prevKeyDropped++; return kIgnored; }
     if (f.type() == kSync) {
       Learn(o, src, reach, udp, forMe && g.len >= 1 && g.payload[0] == kSyncAsk);
       Remember(f.origin, f.epoch, f.counter, f.attempt(), src);
@@ -785,7 +868,8 @@ class Node {
     if (!udp && IsBeatShape(f)) NoteBeat(f.origin, now);   // the first heartbeat of a neighbour made known by this frame
     if (f.origin != sender) NodeIsAlive(f.origin, now);
     if (f.type() == kBeat) {
-      OnSupervision(g, sender, now);
+      if (rxPrevious_ && !Converging(now)) OnPreviousBeat(g, sender, now);
+      else OnSupervision(g, sender, now);
     } else if (forMe && f.type() == kAck) {
       HandleAck(g);
     } else if (forMe) {
@@ -869,6 +953,9 @@ class Node {
   void Tick(uint32_t now) {
     ClockAdvance(now);
     ClockPoll(now);
+    // the time of a change that has passed, and the frames that could not be checked that stopped coming, are let go before the clock of 32 bits wraps them back
+    if (converging_ && (int32_t)(convergeUntil_ - now) <= 0) converging_ = false;
+    if (badHeard_ && (int32_t)(now - badLastAt_) >= (int32_t)kNeedKeyAfterMs) badHeard_ = false;
     for (unsigned i = 0; i < kPendingSize; i++) {
       Pending &p = pending_[i];
       if (!p.used || (int32_t)(now - p.due) < 0) continue;
@@ -887,7 +974,7 @@ class Node {
       memcpy(slot->data, p.frame, p.len);
       slot->len = p.len;
       slot->data[1] = (uint8_t)((slot->data[1] & ~3) | p.attempt);
-      if (cfg_.tag != nullptr) Seal(cfg_.tag, cfg_.tagContext, slot->data, slot->len);
+      slot->previousTag = TagOwn(slot->data, slot->len, p.previousTag);
       slot->used = true;
       slot->own = true;
       memset(slot->to, 0xff, 6);
@@ -1041,6 +1128,27 @@ class Node {
   void SetBeatInfo(const uint8_t *info, size_t len) {
     infoLen_ = (uint8_t)(len > kMaxInfo ? kMaxInfo : len);
     if (infoLen_ > 0) memcpy(info_, info, infoLen_);
+  }
+
+  // The application says which keys of the network this node holds: the version of the one it sends with (1 to 255; 0: it does not say, and the
+  // heartbeat carries no word of the key), and whether it holds the previous one too. `changed`: the key has just changed here, and the change has
+  // kKeyConvergeMs to reach the other nodes. With the clock on, the heartbeat carries all this in the bytes 19 (bits 5 and 6) and 22
+  void SetKeyState(uint8_t version, bool holdsPrevious, bool changed, uint32_t now) {
+    keyVersion_ = version;
+    holdsPrevious_ = holdsPrevious;
+    if (!holdsPrevious) converging_ = false;
+    else if (changed) { converging_ = true; convergeUntil_ = now + kKeyConvergeMs; }
+  }
+
+  uint8_t KeyVersion() const { return keyVersion_; }
+  bool HoldsPreviousKey() const { return holdsPrevious_; }
+
+  // Whether a change of the key was taken here less than kKeyConvergeMs ago
+  bool Converging(uint32_t now) const { return converging_ && (int32_t)(convergeUntil_ - now) > 0; }
+
+  // Whether this node has heard frames whose tag it cannot check, and none that it can, for kNeedKeyAfterMs, and is still hearing them
+  bool NeedsKey(uint32_t now) const {
+    return badHeard_ && (int32_t)(now - badSince_) >= (int32_t)kNeedKeyAfterMs && (int32_t)(now - badLastAt_) < (int32_t)kNeedKeyAfterMs;
   }
 
   // The neighbours, by slot: a slot that is not in use is null
@@ -1252,12 +1360,12 @@ class Node {
   // `covered`: a bit for each of the 32 numbers up to `highest` that the origin had used when it said where it was, to the sync
   // that made it known: what is heard with one of them, as a first attempt, is a frame sent before, or a copy of one, and is not taken.
   // `beats`: the heartbeats of the origin heard since then, up to 255. `asks`: the asks to it since it was last known, up to 255
-  struct Origin { bool used; bool synced; bool routed; bool viaUdp; bool asked; uint8_t id; uint8_t routeHops; uint8_t beats; uint8_t asks; uint8_t via[6]; uint32_t epoch; uint32_t highest; uint32_t seen; uint32_t covered; uint32_t askedAt; };
+  struct Origin { bool used; bool synced; bool routed; bool viaUdp; bool asked; bool keyPrevious; uint8_t id; uint8_t routeHops; uint8_t beats; uint8_t asks; uint8_t via[6]; uint32_t epoch; uint32_t highest; uint32_t seen; uint32_t covered; uint32_t askedAt; };
   struct Seen { bool used; bool hasFrom; uint8_t origin; uint8_t attempt; uint32_t epoch; uint32_t counter; uint8_t from[6]; };
   // `from` are the neighbours a flooded frame waiting to be repeated was heard from, for the first two copies;
   // `pingTarget` and `pingAsker` mark a ping: whom it tries, and for whom (0: for this node)
-  struct TxItem { bool used; bool own; bool unicast; bool wait; uint8_t len; uint8_t prio; uint8_t heard; uint8_t tries; uint8_t to[6]; uint8_t from[2]; uint8_t fromCount; uint8_t pingTarget; uint8_t pingAsker; uint8_t paths; uint8_t udpTarget; uint32_t due; uint8_t data[kMaxFrame]; };
-  struct Pending { bool used; uint8_t dest; uint8_t attempt; uint8_t len; uint32_t counter; uint32_t due; uint8_t frame[kMaxFrame]; };
+  struct TxItem { bool used; bool own; bool unicast; bool wait; bool previousTag; uint8_t len; uint8_t prio; uint8_t heard; uint8_t tries; uint8_t to[6]; uint8_t from[2]; uint8_t fromCount; uint8_t pingTarget; uint8_t pingAsker; uint8_t paths; uint8_t udpTarget; uint32_t due; uint8_t data[kMaxFrame]; };
+  struct Pending { bool used; bool previousTag; uint8_t dest; uint8_t attempt; uint8_t len; uint32_t counter; uint32_t due; uint8_t frame[kMaxFrame]; };
   struct SyncAsk { bool used; uint8_t target; uint32_t nonce; uint32_t until; };
   struct Mute { bool used; bool mine; uint8_t node; };
 
@@ -1278,6 +1386,14 @@ class Node {
   Outcome outcomes_[kOutcomeSize];
   unsigned outcomeHead_, outcomeCount_;
   Stats stats_;
+  uint8_t keyVersion_;                         // the version of the key in use, as the application says; 0 when it does not
+  bool holdsPrevious_;                         // the application holds the previous key too
+  bool converging_;                            // a change of the network's key was taken here less than kKeyConvergeMs ago
+  uint32_t convergeUntil_;
+  bool rxPrevious_;                            // the frame being handled came under the previous key
+  bool forcePrevious_;                         // the frame being made is for the previous key's tag
+  bool badHeard_;                              // since the last frame whose tag could be checked, some came that could not
+  uint32_t badSince_, badLastAt_;
   struct BulkIn { bool used; bool done; uint8_t origin; uint8_t total; uint8_t naks; uint16_t id; uint32_t have; uint32_t lastAt; };
   BulkIn bulkIn_[kBulkInSize];
   bool udpUp_;
@@ -1432,6 +1548,60 @@ class Node {
     return true;
   }
 
+  // Stamps the tag of a frame of this node's: with the key in use, or, when `previous` is asked for and this node holds one, the key before it.
+  // Returns whether it is under the previous key
+  bool TagOwn(uint8_t *frame, size_t n, bool previous) {
+    if (cfg_.tag == nullptr) return false;
+    if (previous && cfg_.tagPrevious != nullptr && SealPrevious(cfg_.tagPrevious, cfg_.tagContext, frame, n)) return true;
+    Seal(cfg_.tag, cfg_.tagContext, frame, n);
+    return false;
+  }
+
+  // Whether the last frame heard of `id` was under the previous key
+  bool KeyPreviousOf(uint8_t id) const {
+    for (unsigned i = 0; i < kMaxOrigins; i++) if (origins_[i].used && origins_[i].id == id) return origins_[i].keyPrevious;
+    return false;
+  }
+
+  // What a frame under the previous key may be, once the change has had its time (before it, anything): of the supervision only a heartbeat for everyone,
+  // whose first byte is checked when it has been opened; a sync frame; and a frame of the membership for one node, which is sealed for it alone and so
+  // is not one that a node holding only the previous key can make for everyone
+  bool PreviousAdmitted(const Frame &f, uint32_t now) const {
+    if (Converging(now)) return true;
+    switch (f.type()) {
+      case kBeat: return f.dest == kToAll;
+      case kSync: return true;
+      case kMembership: return f.dest != kToAll;
+      default: return false;
+    }
+  }
+
+  // A frame whose tag could be checked, or that could not
+  void NoteTag(bool good, uint32_t now) {
+    if (good) { badHeard_ = false; return; }
+    if (!badHeard_) { badHeard_ = true; badSince_ = now; }
+    badLastAt_ = now;
+  }
+
+  // What a frame carries that holds nothing but a node's heartbeat under the previous key: it is there, which key it holds, and that it needs the key
+  void OnPreviousBeat(const Frame &f, uint8_t from, uint32_t now) {
+    Neighbor *n = FindNeighbor(from, false);
+    if (n == nullptr || f.len < 4 || f.payload[0] != kSubBeat) return;
+    size_t il = f.payload[2];
+    if (3 + il + 1 > f.len) return;
+    n->beatAt = now;
+    stats_.beatsHeard++;
+    n->infoLen = 0;
+    n->clockSeen = 0;
+    n->hearsCount = 0;
+    n->listsMe = 0;
+    n->selectsMe = 0;
+    n->clockHold = 0;
+    bool clockLayout = il > 0 && f.payload[3] == kInfoLayout;
+    n->keyVersion = clockLayout && il > kInfoKeyVersionAt ? f.payload[3 + kInfoKeyVersionAt] : 0;
+    n->keyBits = (uint8_t)(kKeyUnderPrevious | (clockLayout && il > kInfoFlagsAt ? (f.payload[3 + kInfoFlagsAt] >> 5) & 3 : 0));
+  }
+
   // What fits in a frame for `dest`: a frame for one node alone loses the tag of its seal
   size_t PayloadCap(uint8_t dest) const { return cfg_.seal != nullptr && dest != kToAll ? kMaxPayload - kPairTagLen : kMaxPayload; }
 
@@ -1463,7 +1633,10 @@ class Node {
       c.len = sn;
     }
     slot->len = (uint8_t)Encode(c, slot->data);
-    if (cfg_.tag != nullptr) Seal(cfg_.tag, cfg_.tagContext, slot->data, slot->len);
+    // under the key in use, except for the frame the application asked to go under the previous one, and for a sync frame to a node whose frames come under
+    // it: a node that has not taken the change cannot check the answer to what it asks, or ask what it needs to be able to hear
+    bool previous = forcePrevious_ || (f.type() == kSync && f.dest != kToAll && KeyPreviousOf(f.dest));
+    slot->previousTag = TagOwn(slot->data, slot->len, previous);
     slot->used = true;
     slot->own = true;
     slot->prio = FramePriority(slot->data);
@@ -1538,6 +1711,7 @@ class Node {
       keep->attempt = 0;
       keep->due = now + kAnswerWaitMs;
       keep->len = slot->len;
+      keep->previousTag = slot->previousTag;
       memcpy(keep->frame, slot->data, slot->len);
     }
     return f.counter;
@@ -1760,6 +1934,7 @@ class Node {
     d.epoch = f.epoch;
     d.counter = f.counter;
     d.rssi = rssi;
+    d.previousKey = rxPrevious_;
     memcpy(d.from, src, 6);
     // the second part of a message leads with the number of the first, which is not the application's data
     bool second = f.part() == 2 && f.len >= 4;
@@ -2216,6 +2391,12 @@ class Node {
     if (cfg_.clock) {
       if (infoLen < kInfoClockLen) { memset(info + infoLen, 0, kInfoClockLen - infoLen); infoLen = kInfoClockLen; }
       ClockFill(info, now);
+      // a node that says which key it holds says it in the bytes the clock's layout leaves for it, which are not the application's
+      if (keyVersion_ != 0) {
+        if (infoLen < kInfoKeyLen) { memset(info + infoLen, 0, kInfoKeyLen - infoLen); infoLen = kInfoKeyLen; }
+        info[kInfoFlagsAt] = (uint8_t)((info[kInfoFlagsAt] & ~(kInfoHoldsPrevious | kInfoNeedsKey)) | (holdsPrevious_ ? kInfoHoldsPrevious : 0) | (NeedsKey(now) ? kInfoNeedsKey : 0));
+        info[kInfoKeyVersionAt] = keyVersion_;
+      }
     }
     p[at++] = (uint8_t)infoLen;
     if (infoLen > 0) memcpy(p + at, info, infoLen);
@@ -2305,6 +2486,9 @@ class Node {
     if (!(n->infoLen >= kInfoClockLen && il >= kInfoClockLen && memcmp(n->info + kInfoTimelineAt, f.payload + 3 + kInfoTimelineAt, 5) == 0)) n->clockHold = 0;
     n->infoLen = (uint8_t)(il > kMaxInfo ? kMaxInfo : il);
     memcpy(n->info, f.payload + 3, n->infoLen);
+    bool keyLayout = n->infoLen > 0 && n->info[0] == kInfoLayout;
+    n->keyVersion = keyLayout && n->infoLen > kInfoKeyVersionAt ? n->info[kInfoKeyVersionAt] : 0;
+    n->keyBits = (uint8_t)((keyLayout && n->infoLen > kInfoFlagsAt ? (n->info[kInfoFlagsAt] >> 5) & 3 : 0) | (rxPrevious_ ? kKeyUnderPrevious : 0));
     size_t at = 3 + il;
     size_t count = f.payload[at++];
     if (at + 2 * count > f.len) count = (f.len - at) / 2;
