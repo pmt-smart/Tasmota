@@ -121,6 +121,18 @@
  * went away, unless by a way longer than two hops, which it cannot see. And the lists say which neighbour to give up when the radio's table of peers is
  * full (PeerRoleOf).
  *
+ * A clock the nodes share (Config::clock): every node counts the time since it started, and calls it its mesh time; the heartbeat carries it, with the
+ * identity of the timeline it counts on, 5 bytes, the node's number and its epoch, which names one run of one node. A node that hears a heartbeat of
+ * another timeline takes the one whose time is greater, that of the node that has been running longer, and moves its own time by the difference; of
+ * two timelines whose times differ by less than a margin (a hop of latency) the one with the lower identity wins, so that both sides settle on the
+ * same one and the two never wait on each other. Inside one timeline a node follows a greater time heard (as the timing synchronisation function of an
+ * IEEE 802.11 IBSS does) and never goes back, up to an hour, so that the drift of the crystals does not add up. No real-time clock is read: the mesh
+ * time is the caller's own millisecond counter and what the heartbeats move it by. A node is synced when it has taken a timeline, or when it has
+ * listened to the heartbeats for a while after its start and found none to take. What the node tells its application of it is a queue of events (a
+ * timeline taken, with the difference, and the node becoming synced), the clock at a point (ClockNow), a stamp of 6 bytes for a message, the mesh time
+ * in ticks of 10 ms and the 16 bits of a tag of the timeline, and the age of a stamp. The heartbeat's bytes of the application have a layout, the
+ * first byte, 1: with the clock on, the node fills in the timeline, the time and the synced bit itself, and the rest of them are the application's.
+ *
  * Messages longer than a frame: one that does not fit goes in two, each with a number of its own, the
  * second carrying the number of the first ahead of the rest, and the destination's application gets
  * the two, the second marked with the first's number, to join. A list that is longer still goes as a
@@ -205,6 +217,22 @@ constexpr unsigned kBeatWindow = 16;         // the heartbeat intervals the deli
 constexpr unsigned kLinkMinSlots = 4;        // fewer intervals than this are too few to say anything of a link
 constexpr uint8_t kLinkGoodPercent = 50;     // a neighbour that delivers fewer of its heartbeats than this is heard, but not counted on as a way
 constexpr uint8_t kQualityUnknown = 255;     // the delivery of a neighbour not yet judged
+
+// The mesh clock (Config::clock). The heartbeat's bytes of the application, when it is on: byte 0 is the layout, 1 to 5 the timeline (the node and
+// the epoch, most significant byte first), 6 to 11 the mesh time in milliseconds (48 bits, most significant first), 19 the flags, bit 0 of which says
+// the node is synced; the bytes in between, and the other bits of the flags, are the application's. A heartbeat of another layout carries no clock
+constexpr uint8_t kInfoLayout = 1;
+constexpr unsigned kInfoTimelineAt = 1;
+constexpr unsigned kInfoTimeAt = 6;
+constexpr unsigned kInfoFlagsAt = 19;
+constexpr uint8_t kInfoSynced = 1;
+constexpr unsigned kInfoClockLen = 20;       // the bytes the application's part has at the least, when the clock is on: up to the flags
+constexpr uint32_t kClockListenMs = 10000;   // a node that has taken no timeline is synced this long after it could first hear one: two heartbeats
+constexpr uint32_t kClockBandMs = 20;        // two timelines whose times differ by no more than this are of the same age, and the lower identity wins
+constexpr uint32_t kClockFollowMs = 3600000; // inside a timeline a node follows a greater time up to this much; more is not a drift
+constexpr unsigned kClockEventSize = 8;      // the things the clock tells the application, waiting to be read
+constexpr size_t kStampLen = 6;              // a stamp: the tag of the timeline (2 bytes), the mesh time in ticks of 10 ms (4), most significant first
+constexpr uint32_t kStampTickMs = 10;
 
 enum Type : uint8_t { kCommand = 0, kAck = 1, kState = 2, kEvent = 3, kBeat = 4, kBulk = 5, kMembership = 6, kSync = 7 };
 
@@ -379,6 +407,7 @@ struct Stats {
   uint32_t covered, syncShed, startAsks;
   uint32_t relayHeld;
   uint32_t counterOut, epochRenewed;
+  uint32_t clockSteps, timelinesTaken, clockEventsLost;
 };
 
 // How a neighbour stands: heard lately, not heard and being tried, or declared silent by this node
@@ -408,6 +437,8 @@ struct Neighbor {
   uint8_t beatSlots;                           // the heartbeat intervals the delivery below covers so far, up to kBeatWindow
   uint16_t beatBits;                           // one bit for each, the latest the lowest: set when a heartbeat of it came on the radio in that interval
   uint32_t beatRadioAt;                        // the last heartbeat of it that came on the radio; 0 before the first
+  int16_t clockSkew;                           // its mesh time in its last heartbeat less this node's when it came, ms, held within 16 bits; 0 before the first
+  uint8_t clockSeen;                           // 0 its heartbeat carried no clock, 1 it did and it is in another timeline than this node's, 2 the same
 };
 
 // What the supervision has to tell the application
@@ -454,6 +485,68 @@ struct Health {
   uint8_t soleWays;                            // the usable neighbours that are the only way this node has to some node
 };
 
+// What the clock tells the application: it took another timeline, or it became synced
+enum ClockEventKind : uint8_t { kClockTimeline = 1, kClockSynced = 2 };
+struct ClockEvent {
+  uint8_t kind;                                // a ClockEventKind
+  uint8_t synced;                              // whether the node is synced, after it
+  uint8_t from[5];                             // of a timeline taken: the one the node was in
+  uint8_t to[5];                               // and the one it is in now
+  int32_t ticks;                               // by how many ticks of 100 ms its time moved, rounded: the low 32 bits of it, for the application to add to what it has marked
+  int64_t delta;                               // and by how many milliseconds
+};
+
+// The clock at a point of the caller's own millisecond counter: from it the mesh time at any later time of the counter is worked out
+// without the node, which belongs to another task
+struct ClockPoint {
+  uint32_t at;                                 // the caller's counter, ms
+  uint64_t mesh;                               // the mesh time then, ms
+  uint8_t timeline[5];
+  bool synced;
+  bool adopted;                                // the node has taken a timeline since its start
+};
+
+// The 16 bits of a tag of a timeline: what a stamp carries to say which timeline its time is in
+inline uint16_t TimelineTag(const uint8_t timeline[5]) {
+  uint32_t epoch = (uint32_t)timeline[1] << 24 | (uint32_t)timeline[2] << 16 | (uint32_t)timeline[3] << 8 | timeline[4];
+  return (uint16_t)(((uint32_t)timeline[0] << 8) ^ (epoch >> 16) ^ (epoch & 0xffff));
+}
+
+// The mesh time at `now`, from a point
+inline uint64_t ClockAt(const ClockPoint &p, uint32_t now) {
+  int64_t v = (int64_t)p.mesh + (int32_t)(now - p.at);
+  return v < 0 ? 0 : (uint64_t)v;
+}
+
+// The stamp of a message at `now`: the tag of the timeline and the mesh time in ticks of 10 ms, which wrap in 497 days. False, and nothing written,
+// when the node is not synced: it has no time to vouch for
+inline bool ClockStamp(const ClockPoint &p, uint32_t now, uint8_t out[kStampLen]) {
+  if (!p.synced) return false;
+  uint16_t tag = TimelineTag(p.timeline);
+  uint32_t ticks = (uint32_t)(ClockAt(p, now) / kStampTickMs);
+  out[0] = (uint8_t)(tag >> 8);
+  out[1] = (uint8_t)tag;
+  out[2] = (uint8_t)(ticks >> 24);
+  out[3] = (uint8_t)(ticks >> 16);
+  out[4] = (uint8_t)(ticks >> 8);
+  out[5] = (uint8_t)ticks;
+  return true;
+}
+
+// How old a stamp is at `now`, in ms: this node's mesh time less the stamp's, the difference of 32 bits with its sign, so that it is right across the
+// wrap, held within the range of 32 bits; negative for a stamp from the future. `sameTimeline` says the stamp's tag is this node's: a stamp of another
+// timeline has a time that means nothing here. False when `len` is not the length of a stamp
+inline bool ClockAge(const ClockPoint &p, uint32_t now, const uint8_t *stamp, size_t len, int32_t *ageMs, bool *sameTimeline) {
+  if (len != kStampLen) return false;
+  uint16_t tag = (uint16_t)((uint16_t)stamp[0] << 8 | stamp[1]);
+  uint32_t issued = (uint32_t)stamp[2] << 24 | (uint32_t)stamp[3] << 16 | (uint32_t)stamp[4] << 8 | stamp[5];
+  int32_t ticks = (int32_t)((uint32_t)(ClockAt(p, now) / kStampTickMs) - issued);
+  int64_t ms = (int64_t)ticks * (int64_t)kStampTickMs;
+  *ageMs = ms > 2147483647LL ? 2147483647 : (ms < -2147483647LL ? -2147483647 : (int32_t)ms);
+  *sameTimeline = tag == TimelineTag(p.timeline);
+  return true;
+}
+
 struct Config {
   uint8_t id;                                  // this node's number
   uint32_t epoch;                              // this node's epoch, already raised for this start
@@ -484,6 +577,7 @@ struct Config {
   uint8_t relayMinNeighbors;                   // the neighbours counted on that a node needs to choose repeaters; 0 for the default
   bool (*renewEpoch)(void *, uint32_t);        // asked when the counter passes kCounterRenew, with the epoch above this node's: the application keeps it, so that the next start is above it, and says yes; nullptr: yes
   void *renewContext;
+  bool clock;                                  // the heartbeat carries the mesh time and the timeline, and takes them from the heartbeats it hears; false: it does not, and the application's bytes go as they are
 };
 
 class Node {
@@ -500,6 +594,9 @@ class Node {
     if (cfg_.relayBackupMs == 0) cfg_.relayBackupMs = kRelayBackupMs;
     if (cfg_.relayDropAt == 0) cfg_.relayDropAt = (uint8_t)(cfg_.suppressAt + 1);
     if (cfg_.relayMinNeighbors == 0) cfg_.relayMinNeighbors = (uint8_t)kRelayMinNeighbors;
+    // the timeline of this run: this node's number and its epoch, which the application has made sure no other run of the node has had
+    timeline_[0] = cfg_.id;
+    for (unsigned i = 0; i < 4; i++) timeline_[1 + i] = (uint8_t)(cfg_.epoch >> (8 * (3 - i)));
   }
 
   // The application hands over a frame for `dest` (kToAll for everyone), to be flooded. Returns its counter, or 0.
@@ -577,6 +674,7 @@ class Node {
   // The radio heard `n` bytes from the neighbour `src`, with the signal `rssi`
   // `udp`: the frame came by the network, and `src` is the address the user knows the sending node by, `rssi` 0
   Verdict OnReceive(const uint8_t *data, size_t n, const uint8_t src[6], int8_t rssi, uint32_t now, bool udp = false) {
+    ClockAdvance(now);
     Frame f;
     if (!Decode(data, n, &f)) { stats_.bad++; return kBad; }
     if (cfg_.tag != nullptr && !TagMatches(cfg_.tag, cfg_.tagContext, data, n)) { stats_.bad++; return kBad; }
@@ -751,6 +849,8 @@ class Node {
   // The timers: the frames that have waited for an answer long enough, the exchanges that have waited too long,
   // and the origins that need a sync. Called often, at least every few milliseconds
   void Tick(uint32_t now) {
+    ClockAdvance(now);
+    ClockPoll(now);
     for (unsigned i = 0; i < kPendingSize; i++) {
       Pending &p = pending_[i];
       if (!p.used || (int32_t)(now - p.due) < 0) continue;
@@ -1078,6 +1178,37 @@ class Node {
     return true;
   }
 
+  // The clock at `now`: the mesh time, the timeline it is on, and whether the node is synced. From the point returned, ClockAt, ClockStamp and ClockAge
+  // work out the mesh time at any later time of the counter `now` is of, which another task can do without the node
+  void ClockNow(uint32_t now, ClockPoint *p) const {
+    p->at = now;
+    p->mesh = MeshTime(now);
+    memcpy(p->timeline, timeline_, sizeof(timeline_));
+    p->synced = ClockSynced(now);
+    p->adopted = adopted_;
+  }
+
+  // Whether the node is synced: it has taken a timeline, or has listened to the heartbeats for kClockListenMs from the time it could first hear them (when
+  // it asks the others where they are at its start, from the ask, for only then do they hear and answer it) and has found no older timeline to take
+  bool ClockSynced(uint32_t now) const {
+    if (adopted_) return true;
+    if (!clockArmed_ || (!cfg_.noStartSync && !startDone_)) return false;
+    return ClockUp(now) >= clockListenAt_ + kClockListenMs;
+  }
+
+  // Counts every change of the mesh time that is not the counter's own going on, of the timeline and of the synced bit: a copy of the clock kept
+  // elsewhere is as old as the last version it has
+  uint32_t ClockVersion() const { return clockVersion_; }
+
+  // What the clock has told the application: a timeline taken, with the difference, and the node becoming synced
+  bool PopClockEvent(ClockEvent *e) {
+    if (clockEventCount_ == 0) return false;
+    *e = clockEvents_[clockEventHead_];
+    clockEventHead_ = (clockEventHead_ + 1) % kClockEventSize;
+    clockEventCount_--;
+    return true;
+  }
+
   // The network the nodes share is up for this node, or it is not: with it down no frame is given the second way
   void SetUdpUp(bool up) { udpUp_ = up; }
 
@@ -1151,6 +1282,17 @@ class Node {
   bool noisy_;
   uint8_t lossPercent_;
   IdSet relays_;                               // the neighbours this node has chosen to repeat for it
+  bool clockArmed_;                            // the counter's first value has been taken: the mesh time starts from it
+  bool adopted_;                               // this node has taken a timeline since it started
+  bool syncedTold_;                            // the synced bit the application was last told
+  uint8_t timeline_[5];                        // the timeline this node counts on: its own, until it takes another
+  uint32_t clockLast_;                         // the last value of the counter
+  uint64_t clockUp_;                           // the time since the first, ms, past the 32 bits the counter has
+  uint64_t clockListenAt_;                     // the time of that from which the node listens for a timeline to take
+  int64_t clockOff_;                           // what the time taken from the others adds to it: the mesh time is the two
+  uint32_t clockVersion_;
+  ClockEvent clockEvents_[kClockEventSize];
+  unsigned clockEventHead_, clockEventCount_;
 
   uint8_t NodeOf(const uint8_t mac[6]) const { return cfg_.nodeOf != nullptr ? cfg_.nodeOf(cfg_.nodeContext, mac) : 0; }
 
@@ -1710,9 +1852,11 @@ class Node {
     if ((int32_t)(now - startAt_) < 0) return;
     if (RequestSync(kToAll, now)) {
       startDone_ = true;
+      clockListenAt_ = ClockUp(now);
       stats_.startAsks++;
     } else if ((int32_t)(now - startAt_) >= (int32_t)kStartGiveUpMs) {
       startDone_ = true;                       // no room, or no key: not for want of trying
+      clockListenAt_ = ClockUp(now);
     }
   }
 
@@ -1820,6 +1964,111 @@ class Node {
     }
   }
 
+  // --- the clock ---------------------------------------------------------------------------------
+
+  // The first value of the counter starts the time, and a later one adds to it what the counter went on by, so that the time has more than the 32 bits the
+  // counter has. It is called at least every few days, which a node does every few milliseconds; a value behind the last, from a caller that read it
+  // a moment before, moves nothing back
+  void ClockAdvance(uint32_t now) {
+    if (!clockArmed_) {
+      clockArmed_ = true;
+      clockLast_ = now;
+      clockUp_ = 0;
+      return;
+    }
+    int32_t step = (int32_t)(now - clockLast_);
+    if (step > 0) {
+      clockUp_ += (uint32_t)step;
+      clockLast_ = now;
+    }
+  }
+
+  // The time since the first value of the counter, at `now`
+  uint64_t ClockUp(uint32_t now) const {
+    if (!clockArmed_) return 0;
+    int64_t v = (int64_t)clockUp_ + (int32_t)(now - clockLast_);
+    return v < 0 ? 0 : (uint64_t)v;
+  }
+
+  // The mesh time, ms: the node's own time and what it was moved by
+  uint64_t MeshTime(uint32_t now) const {
+    int64_t v = (int64_t)ClockUp(now) + clockOff_;
+    return v < 0 ? 0 : (uint64_t)v;
+  }
+
+  // The ticks of 100 ms a move of `ms` comes to, rounded to the nearest and up from half, the low 32 bits of them
+  static int32_t TicksOf(int64_t ms) {
+    int64_t v = ms + 50;
+    int64_t t = v / 100;
+    if (v % 100 < 0) t--;
+    return (int32_t)(uint32_t)(uint64_t)t;
+  }
+
+  void PostClock(ClockEventKind kind, const uint8_t *from, int64_t delta, bool synced) {
+    if (clockEventCount_ >= kClockEventSize) { stats_.clockEventsLost++; return; }
+    ClockEvent &e = clockEvents_[(clockEventHead_ + clockEventCount_) % kClockEventSize];
+    clockEventCount_++;
+    memset(&e, 0, sizeof(e));
+    e.kind = kind;
+    e.synced = synced ? 1 : 0;
+    if (from != nullptr) memcpy(e.from, from, sizeof(e.from));
+    memcpy(e.to, timeline_, sizeof(e.to));
+    e.ticks = TicksOf(delta);
+    e.delta = delta;
+  }
+
+  // Tells the application the synced bit when it has changed
+  void ClockPoll(uint32_t now) {
+    if (!cfg_.clock) return;
+    bool synced = ClockSynced(now);
+    if (synced == syncedTold_) return;
+    syncedTold_ = synced;
+    clockVersion_++;
+    PostClock(kClockSynced, nullptr, 0, synced);
+  }
+
+  // The application's bytes of a heartbeat, with the clock in them: the layout, the timeline, the mesh time at `now` and the synced bit. What the
+  // application gave, up to the flags, is as it gave it
+  void ClockFill(uint8_t *info, uint32_t now) const {
+    info[0] = kInfoLayout;
+    memcpy(info + kInfoTimelineAt, timeline_, sizeof(timeline_));
+    uint64_t mesh = MeshTime(now);
+    for (unsigned i = 0; i < 6; i++) info[kInfoTimeAt + i] = (uint8_t)(mesh >> (8 * (5 - i)));
+    info[kInfoFlagsAt] = (uint8_t)((info[kInfoFlagsAt] & ~kInfoSynced) | (ClockSynced(now) ? kInfoSynced : 0));
+  }
+
+  // A heartbeat of the neighbour `n` with a clock in it came at `now`. In the timeline of this node, its time is followed when it is greater, up to
+  // kClockFollowMs; in another, it is taken when it has been running longer, or, when the times are within kClockBandMs of each other, when its
+  // timeline has the lower identity: the two settle on one, whoever hears first. What this node did on its own timeline is the application's to move,
+  // by what the event says. The time the heartbeat says is the time it was made at, so it is a little behind the time it is heard at, by the
+  // wait of the queue, the air and the task that reads it: the neighbour is followed a few milliseconds late, and never early
+  void ClockHear(Neighbor &n, uint32_t now) {
+    const uint8_t *timeline = n.info + kInfoTimelineAt;
+    uint64_t theirs = 0;
+    for (unsigned i = 0; i < 6; i++) theirs = theirs << 8 | n.info[kInfoTimeAt + i];
+    int64_t d = (int64_t)theirs - (int64_t)MeshTime(now);
+    n.clockSkew = d > 32767 ? 32767 : (d < -32768 ? -32768 : (int16_t)d);
+    int order = memcmp(timeline, timeline_, sizeof(timeline_));
+    n.clockSeen = order == 0 ? 2 : 1;
+    if (order == 0) {
+      if (d > 0 && d <= (int64_t)kClockFollowMs) {
+        clockOff_ += d;
+        clockVersion_++;
+        stats_.clockSteps++;
+      }
+    } else if (d > (int64_t)kClockBandMs || (d >= -(int64_t)kClockBandMs && order < 0)) {
+      uint8_t left[5];
+      memcpy(left, timeline_, sizeof(left));
+      clockOff_ += d;
+      memcpy(timeline_, timeline, sizeof(timeline_));
+      adopted_ = true;
+      clockVersion_++;
+      stats_.timelinesTaken++;
+      PostClock(kClockTimeline, left, d, true);
+    }
+    ClockPoll(now);
+  }
+
   // --- the supervision ---------------------------------------------------------------------------
 
   void Post(NoticeKind kind, uint8_t node, uint8_t by, uint32_t value = 0) {
@@ -1918,9 +2167,17 @@ class Node {
     size_t at = 0;
     p[at++] = kSubBeat;
     p[at++] = cfg_.udpOnly ? kBeatNoRadio : 0;
-    p[at++] = infoLen_;
-    if (infoLen_ > 0) memcpy(p + at, info_, infoLen_);
-    at += infoLen_;
+    // with the clock on, the application's bytes reach at least the flags, and the clock's own are filled in as they go out
+    uint8_t info[kMaxInfo];
+    size_t infoLen = infoLen_;
+    memcpy(info, info_, infoLen);
+    if (cfg_.clock) {
+      if (infoLen < kInfoClockLen) { memset(info + infoLen, 0, kInfoClockLen - infoLen); infoLen = kInfoClockLen; }
+      ClockFill(info, now);
+    }
+    p[at++] = (uint8_t)infoLen;
+    if (infoLen > 0) memcpy(p + at, info, infoLen);
+    at += infoLen;
     size_t countAt = at++;
     uint8_t count = 0;
     for (unsigned i = 0; i < kMaxNeighbors; i++) {
@@ -2041,6 +2298,9 @@ class Node {
     }
     n->beatAt = now;
     stats_.beatsHeard++;
+    // the clock the heartbeat carries, if it carries one
+    n->clockSeen = 0;
+    if (cfg_.clock && n->infoLen >= kInfoClockLen && n->info[0] == kInfoLayout) ClockHear(*n, now);
   }
 
   void OnSupervision(const Frame &f, uint8_t from, uint32_t now) {
