@@ -236,8 +236,15 @@ constexpr uint8_t kInfoSynced = 1;
 constexpr unsigned kInfoClockLen = 20;       // the bytes the application's part has at the least, when the clock is on: up to the flags
 constexpr uint32_t kClockListenMs = 10000;   // a node that has taken no timeline is synced this long after it could first hear one: two heartbeats
 constexpr uint32_t kClockBandMs = 20;        // two timelines whose times differ by no more than this are of the same age, and the lower identity wins
-constexpr uint32_t kClockWideMs = 100;       // a timeline of a lower identity that is behind this node's by more than the band and by no more than this is taken too, ...
-constexpr uint8_t kClockWideBeats = 3;       // ... when this many heartbeats in a row of the same neighbour have shown it
+#ifndef ESPNOW_MESH_CLOCK_WIDE_MS
+#define ESPNOW_MESH_CLOCK_WIDE_MS 100            // 0 turns the persistence off: a timeline just beyond the band is left to the delay of the frames
+#endif
+#ifndef ESPNOW_MESH_CLOCK_WIDE_BEATS
+#define ESPNOW_MESH_CLOCK_WIDE_BEATS 3
+#endif
+constexpr uint32_t kClockWideMs = ESPNOW_MESH_CLOCK_WIDE_MS;        // a timeline of a lower identity that is behind this node's by more than the band and by no more than this is taken too, ...
+constexpr uint8_t kClockWideBeats = ESPNOW_MESH_CLOCK_WIDE_BEATS;   // ... when this many heartbeats in a row of the same neighbour have shown it
+static_assert(kClockWideBeats >= 1, "ESPNOW_MESH_CLOCK_WIDE_BEATS: at least one heartbeat");
 constexpr uint32_t kClockFollowMs = 3600000; // inside a timeline a node follows a greater time up to this much; more is not a drift
 constexpr uint64_t kClockMaxMs = (uint64_t)1 << 47;   // a time in a heartbeat from this on (4 400 years) is no time of a running node, and is not taken: the 48 bits it travels in must hold the sum of what a node is moved by
 constexpr unsigned kClockEventSize = 8;      // the things the clock tells the application, waiting to be read
