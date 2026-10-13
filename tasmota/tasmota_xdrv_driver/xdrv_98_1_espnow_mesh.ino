@@ -109,12 +109,14 @@
  *   EspNowMeshStats [0|1]      - every counter, in two pages: 0 the frames and what the driver counts of its own (the queues, the
  *                                radio's refusals, the late word of the radio, the peers given up), 1 the supervision, the sync, the
  *                                lists in pieces and the network. All count from the start of the node
- *   EspNowMeshNeighbors [<first>] - the neighbours the heartbeats have given, six at a time
+ *   EspNowMeshNeighbors [<first>] - the neighbours the heartbeats have given, as many as a message takes from the one asked for: Count is all of them, From
+ *                                where this page starts, and Next, only when some remain, where the next one does (a bridge's 32 bytes of Info are 64
+ *                                characters, so a page can be as few as five). EspNowMeshHealth and EspNowMeshClock page the same way
  *   EspNowMeshHealth [<first>] - what the heartbeats say of the surroundings, two hops deep: the neighbours that are counted on, how many of each one's
- *                                heartbeats come, the groups the neighbours fall in, and which neighbour is the only way to some node; six at a time
+ *                                heartbeats come, the groups the neighbours fall in, and which neighbour is the only way to some node
  *   EspNowMeshClock [<first>]  - the mesh clock: the time this device counts since it started, ms, and the timeline it counts on (its own number and epoch, until
  *                                it takes another), whether it is synced, how many times the clock was stepped to follow a neighbour, how many timelines
- *                                were taken, and the neighbours heard, six at a time, each with the timeline of its last heartbeat (Seen 0: none, 1: another,
+ *                                were taken, and the neighbours heard, each with the timeline of its last heartbeat (Seen 0: none, 1: another,
  *                                2: this one), its synced bit, and how far its time was from this device's when the heartbeat came (Skew, ms)
  *
  * The mesh clock: the heartbeat carries the time and the timeline, and a device that hears another timeline whose time is greater takes it, and follows the
@@ -1910,6 +1912,25 @@ void CmndEspNowMeshStats(void) {
   ResponseAppend_P(PSTR("}}"));
 }
 
+// The lists the commands answer in pages are held to what a message takes: it is MESSZ characters, and an answer that goes over is lost or arrives
+// cut in the middle of an entry, which is not JSON. An entry is added while it, and the end of the answer, still fit under a margin of 40, at least
+// one is always added, and when some remain the answer says where the next page starts: "Next", the index to ask for, and nothing when the list ended
+#define ESPNOW_MESH_PAGE_MAX           (MESSZ - 40)
+#define ESPNOW_MESH_PAGE_END           16          // the end of a page that stops early: ],"Next":255}}
+#define ESPNOW_MESH_ENTRY_MAX          256         // the largest entry of any of the lists, formatted before it is known to fit
+
+static bool EspNowMeshPageRoom(size_t entry);
+static bool EspNowMeshPageRoom(size_t entry) {
+  return (ResponseLength() + entry + ESPNOW_MESH_PAGE_END) <= ESPNOW_MESH_PAGE_MAX;
+}
+
+// The end of a list: the entries are closed, and, when some remain, the index the next page starts at
+static void EspNowMeshPageClose(uint32_t next, uint32_t count);
+static void EspNowMeshPageClose(uint32_t next, uint32_t count) {
+  ResponseAppend_P(PSTR("]"));
+  if (next < count) { ResponseAppend_P(PSTR(",\"Next\":%u"), next); }
+}
+
 void CmndEspNowMeshNeighbors(void) {
   if (!EspNowMeshDriver.running || (nullptr == EspNowMeshDriver.snapshot) || (pdTRUE != xSemaphoreTake(EspNowMeshDriver.lock, pdMS_TO_TICKS(50)))) {
     ResponseCmndChar_P(PSTR("not running"));
@@ -1919,16 +1940,22 @@ void CmndEspNowMeshNeighbors(void) {
   const EspNowMeshSnapshot_t& snap = *EspNowMeshDriver.snapshot;
   uint32_t first = XdrvMailbox.data_len ? atoi(XdrvMailbox.data) : 0;
   Response_P(PSTR("{\"%s\":{\"Count\":%u,\"From\":%u,\"List\":["), XdrvMailbox.command, snap.neighbors, first);
-  for (uint32_t i = first; (i < snap.neighbors) && (i < first + 6); i++) {
+  uint32_t i = first;
+  for (; i < snap.neighbors; i++) {
     const EspNowMeshNeighbor_t& n = snap.neighbor[i];
     char info[2 * EspNowMesh::kMaxInfo + 1];
     ToHex_P(n.info, n.info_len, info, sizeof(info));
-    ResponseAppend_P(PSTR("%s{\"Id\":%u,\"State\":\"%s\",\"Rssi\":%d,\"TheirRssi\":%d,\"Lists\":%u,\"NoRadio\":%u,\"Age\":%u,\"Beat\":%d,\"Hears\":%u,\"Info\":\"%s\"}"),
+    char entry[ESPNOW_MESH_ENTRY_MAX];
+    int len = snprintf_P(entry, sizeof(entry), PSTR("%s{\"Id\":%u,\"State\":\"%s\",\"Rssi\":%d,\"TheirRssi\":%d,\"Lists\":%u,\"NoRadio\":%u,\"Age\":%u,\"Beat\":%d,\"Hears\":%u,\"Info\":\"%s\"}"),
       (i == first) ? PSTR("") : PSTR(","), n.id, EspNowMeshStateName(n.state), n.rssi, n.their_rssi, n.lists_me, n.no_radio, n.age_s,
       (0xFFFF == n.beat_s) ? -1 : (int)n.beat_s, n.hears, info);
+    if ((i > first) && !EspNowMeshPageRoom((len > 0) ? (size_t)len : sizeof(entry))) { break; }
+    ResponseAppend_P(PSTR("%s"), entry);
   }
+  uint32_t count = snap.neighbors;
   xSemaphoreGive(EspNowMeshDriver.lock);
-  ResponseAppend_P(PSTR("]}}"));
+  EspNowMeshPageClose(i, count);
+  ResponseAppend_P(PSTR("}}"));
 }
 
 // What the heartbeats of the neighbours say of the surroundings, two hops deep, and of each neighbour heard on the radio: how many of its
@@ -1936,7 +1963,8 @@ void CmndEspNowMeshNeighbors(void) {
 // list each other, or the same node, are one group). More than one group (Cut) says that if this device went away those neighbours would lose
 // each other unless by a way longer than two hops, which this device cannot see: a device that is a point of failure for the network always shows
 // it, and one that shows it is not always one (a ring of five or more devices shows it at each). SoleWays counts the neighbours that are the only
-// way this device has to some node, and Alone says it has one neighbour, which is then its point of failure. The neighbours six at a time
+// way this device has to some node, and Alone says it has one neighbour, which is then its point of failure. The neighbours as many as a message takes,
+// from the one asked for (Next says where the following page starts, when there is one)
 void CmndEspNowMeshHealth(void) {
   if (!EspNowMeshDriver.running || (nullptr == EspNowMeshDriver.snapshot) || (pdTRUE != xSemaphoreTake(EspNowMeshDriver.lock, pdMS_TO_TICKS(50)))) {
     ResponseCmndChar_P(PSTR("not running"));
@@ -1947,13 +1975,19 @@ void CmndEspNowMeshHealth(void) {
   uint32_t first = XdrvMailbox.data_len ? atoi(XdrvMailbox.data) : 0;
   Response_P(PSTR("{\"%s\":{\"Neighbors\":%u,\"Weak\":%u,\"TwoHop\":%u,\"Branches\":%u,\"Cut\":%u,\"SoleWays\":%u,\"Alone\":%u,\"Relays\":%u,\"Count\":%u,\"From\":%u,\"List\":["),
     XdrvMailbox.command, h.neighbors, h.weak, h.twoHop, h.branches, (h.branches > 1) ? 1 : 0, h.soleWays, (1 == h.neighbors) ? 1 : 0, h.relays, snap.health_links, first);
-  for (uint32_t i = first; (i < snap.health_links) && (i < first + 6); i++) {
+  uint32_t i = first;
+  for (; i < snap.health_links; i++) {
     const EspNowMesh::HealthLink& l = snap.link[i];
-    ResponseAppend_P(PSTR("%s{\"Id\":%u,\"Quality\":%d,\"Usable\":%u,\"Reach\":%u,\"Only\":%u,\"Branch\":%u,\"Chosen\":%u}"),
+    char entry[ESPNOW_MESH_ENTRY_MAX];
+    int len = snprintf_P(entry, sizeof(entry), PSTR("%s{\"Id\":%u,\"Quality\":%d,\"Usable\":%u,\"Reach\":%u,\"Only\":%u,\"Branch\":%u,\"Chosen\":%u}"),
       (i == first) ? PSTR("") : PSTR(","), l.id, (EspNowMesh::kQualityUnknown == l.quality) ? -1 : (int)l.quality, l.usable, l.reach, l.only, l.branch, l.chosen);
+    if ((i > first) && !EspNowMeshPageRoom((len > 0) ? (size_t)len : sizeof(entry))) { break; }
+    ResponseAppend_P(PSTR("%s"), entry);
   }
+  uint32_t count = snap.health_links;
   xSemaphoreGive(EspNowMeshDriver.lock);
-  ResponseAppend_P(PSTR("]}}"));
+  EspNowMeshPageClose(i, count);
+  ResponseAppend_P(PSTR("}}"));
 }
 
 // The clock the task made last, for the main loop: the point it described and the timelines taken. False when the task is not running or has not made one.
@@ -1971,7 +2005,7 @@ static bool EspNowMeshClockRead(EspNowMesh::ClockPoint* point, uint32_t* taken) 
 }
 
 // The mesh clock: what this device counts since it started and the timeline it counts on, whether it is synced, and the clocks of the neighbours its
-// heartbeats have shown, six at a time: the timeline of the last one (Seen 0 if it carried none, 1 another than this device's, 2 the same), its synced
+// heartbeats have shown, as many as a message takes from the one asked for (Next says where the following page starts, when there is one): the timeline of the last one (Seen 0 if it carried none, 1 another than this device's, 2 the same), its synced
 // bit, and how far its time was from this device's when it came, ms: negative by the wait of the frame in the queue, on the air and in the task that read it
 // when the two clocks agree, positive when the neighbour's was ahead and this device followed it. Mesh is the time in ms
 void CmndEspNowMeshClock(void) {
@@ -1993,16 +2027,21 @@ void CmndEspNowMeshClock(void) {
     const EspNowMeshSnapshot_t& snap = *EspNowMeshDriver.snapshot;
     uint32_t first = XdrvMailbox.data_len ? atoi(XdrvMailbox.data) : 0;
     ResponseAppend_P(PSTR(",\"Steps\":%u,\"EventsLost\":%u,\"Count\":%u,\"From\":%u,\"List\":["), snap.stats.clockSteps, snap.stats.clockEventsLost, snap.neighbors, first);
-    for (uint32_t i = first; (i < snap.neighbors) && (i < first + 6); i++) {
+    uint32_t i = first;
+    for (; i < snap.neighbors; i++) {
       const EspNowMeshNeighbor_t& n = snap.neighbor[i];
       bool carries = (n.info_len >= EspNowMesh::kInfoClockLen) && (EspNowMesh::kInfoLayout == n.info[0]);
       char theirs[11] = "";
       if (carries) { ToHex_P(n.info + EspNowMesh::kInfoTimelineAt, 5, theirs, sizeof(theirs)); }
-      ResponseAppend_P(PSTR("%s{\"Id\":%u,\"Seen\":%u,\"Sync\":%u,\"Skew\":%d,\"Timeline\":\"%s\"}"),
+      char entry[ESPNOW_MESH_ENTRY_MAX];
+      int len = snprintf_P(entry, sizeof(entry), PSTR("%s{\"Id\":%u,\"Seen\":%u,\"Sync\":%u,\"Skew\":%d,\"Timeline\":\"%s\"}"),
         (i == first) ? PSTR("") : PSTR(","), n.id, n.clock_seen, carries ? (n.info[EspNowMesh::kInfoFlagsAt] & EspNowMesh::kInfoSynced) : 0, n.clock_skew, theirs);
+      if ((i > first) && !EspNowMeshPageRoom((len > 0) ? (size_t)len : sizeof(entry))) { break; }
+      ResponseAppend_P(PSTR("%s"), entry);
     }
+    uint32_t count = snap.neighbors;
     xSemaphoreGive(EspNowMeshDriver.lock);
-    ResponseAppend_P(PSTR("]"));
+    EspNowMeshPageClose(i, count);
   }
   ResponseAppend_P(PSTR("}}"));
 }
