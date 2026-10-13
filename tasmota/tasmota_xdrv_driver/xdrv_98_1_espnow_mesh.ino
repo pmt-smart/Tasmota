@@ -102,6 +102,8 @@
  *                                radio's refusals, the late word of the radio, the peers given up), 1 the supervision, the sync, the
  *                                lists in pieces and the network. All count from the start of the node
  *   EspNowMeshNeighbors [<first>] - the neighbours the heartbeats have given, six at a time
+ *   EspNowMeshHealth [<first>] - what the heartbeats say of the surroundings, two hops deep: the neighbours that are counted on, how many of each one's
+ *                                heartbeats come, the groups the neighbours fall in, and which neighbour is the only way to some node; six at a time
  *
  * And, in Berry, without the trip through the command handler:
  *   espnow_mesh_send(dest, type, ack, data) - the ticket of the send, an integer above 0, or false when it was not taken; data is bytes
@@ -258,7 +260,10 @@ typedef struct {
   uint8_t silent[ESPNOW_MESH_NODES];
   uint16_t stack_free;
   bool net_up;
+  EspNowMesh::Health health;                 // what the heartbeats say of the surroundings, two hops deep
+  uint8_t health_links;
   EspNowMeshNeighbor_t neighbor[EspNowMesh::kMaxNeighbors];
+  EspNowMesh::HealthLink link[EspNowMesh::kMaxNeighbors];
 } EspNowMeshSnapshot_t;
 
 // What the main loop hands the task to apply: the nodes, the key of the network, how the network is used
@@ -1060,6 +1065,7 @@ static void EspNowMeshSnapshotMake(EspNowMesh::Node* node) {
       s->silent[s->silent_count++] = EspNowMeshTable[i].id;
     }
   }
+  s->health_links = node->HealthReport(&s->health, s->link, EspNowMesh::kMaxNeighbors, now);
   s->stack_free = stack_free;
   xSemaphoreGive(EspNowMeshDriver.lock);
 }
@@ -1777,6 +1783,31 @@ void CmndEspNowMeshNeighbors(void) {
   ResponseAppend_P(PSTR("]}}"));
 }
 
+// What the heartbeats of the neighbours say of the surroundings, two hops deep, and of each neighbour heard on the radio: how many of its
+// heartbeats come, how many nodes at two hops it lists and how many of those only it does, and the group it falls in (the neighbours that
+// list each other, or the same node, are one group). More than one group (Cut) says that if this device went away those neighbours would lose
+// each other unless by a way longer than two hops, which this device cannot see: a device that is a point of failure for the network always shows
+// it, and one that shows it is not always one (a ring of five or more devices shows it at each). SoleWays counts the neighbours that are the only
+// way this device has to some node, and Alone says it has one neighbour, which is then its point of failure. The neighbours six at a time
+void CmndEspNowMeshHealth(void) {
+  if (!EspNowMeshDriver.running || (nullptr == EspNowMeshDriver.snapshot) || (pdTRUE != xSemaphoreTake(EspNowMeshDriver.lock, pdMS_TO_TICKS(50)))) {
+    ResponseCmndChar_P(PSTR("not running"));
+    return;
+  }
+  const EspNowMeshSnapshot_t& snap = *EspNowMeshDriver.snapshot;
+  const EspNowMesh::Health& h = snap.health;
+  uint32_t first = XdrvMailbox.data_len ? atoi(XdrvMailbox.data) : 0;
+  Response_P(PSTR("{\"%s\":{\"Neighbors\":%u,\"Weak\":%u,\"TwoHop\":%u,\"Branches\":%u,\"Cut\":%u,\"SoleWays\":%u,\"Alone\":%u,\"Relays\":%u,\"Count\":%u,\"From\":%u,\"List\":["),
+    XdrvMailbox.command, h.neighbors, h.weak, h.twoHop, h.branches, (h.branches > 1) ? 1 : 0, h.soleWays, (1 == h.neighbors) ? 1 : 0, h.relays, snap.health_links, first);
+  for (uint32_t i = first; (i < snap.health_links) && (i < first + 6); i++) {
+    const EspNowMesh::HealthLink& l = snap.link[i];
+    ResponseAppend_P(PSTR("%s{\"Id\":%u,\"Quality\":%d,\"Usable\":%u,\"Reach\":%u,\"Only\":%u,\"Branch\":%u,\"Chosen\":%u}"),
+      (i == first) ? PSTR("") : PSTR(","), l.id, (EspNowMesh::kQualityUnknown == l.quality) ? -1 : (int)l.quality, l.usable, l.reach, l.only, l.branch, l.chosen);
+  }
+  xSemaphoreGive(EspNowMeshDriver.lock);
+  ResponseAppend_P(PSTR("]}}"));
+}
+
 #ifdef USE_BERRY
 // Going through the command handler costs a full dispatch on the main loop, about 8 ms even for a command that does nothing
 // (xdrv_98), and a script that sends often should not pay it. So Berry gets entry points of its own:
@@ -1790,6 +1821,8 @@ void CmndEspNowMeshNeighbors(void) {
 //   espnow_mesh_info(data)                   -> true when the task took it; the bytes (up to 32) every heartbeat carries. Also says the
 //                                               application is ready
 //   espnow_mesh_ready([ready])               -> true; says the application is ready (the default) or, with false, that it is not
+//   espnow_mesh_health()                     -> a map of what EspNowMeshHealth says of the surroundings (neighbors, weak, twohop, branches, cut,
+//                                               solewas, alone, relays), or false when the task is not running
 //
 // The frames for the application are not taken, and not answered, until it says it is ready: a script registers its rules and then
 // says so. What arrives, and what became of what was sent, comes to the rules, as the log and the header say.
@@ -1870,6 +1903,33 @@ int EspNowMeshBerryInfo(struct bvm *vm) {
   be_raise(vm, kTypeError, nullptr);
 }
 
+int EspNowMeshBerryHealth(struct bvm *vm);
+int EspNowMeshBerryHealth(struct bvm *vm) {
+  EspNowMesh::Health h;
+  bool have = false;
+  // Copied under the lock and the map made after it: Berry can raise an error, which must not leave the lock taken
+  if (EspNowMeshDriver.running && EspNowMeshDriver.snapshot && (pdTRUE == xSemaphoreTake(EspNowMeshDriver.lock, pdMS_TO_TICKS(50)))) {
+    h = EspNowMeshDriver.snapshot->health;
+    have = true;
+    xSemaphoreGive(EspNowMeshDriver.lock);
+  }
+  if (!have) {
+    be_pushbool(vm, false);
+    be_return(vm);
+  }
+  be_newobject(vm, "map");
+  be_map_insert_int(vm, "neighbors", h.neighbors);
+  be_map_insert_int(vm, "weak", h.weak);
+  be_map_insert_int(vm, "twohop", h.twoHop);
+  be_map_insert_int(vm, "branches", h.branches);
+  be_map_insert_int(vm, "cut", (h.branches > 1) ? 1 : 0);
+  be_map_insert_int(vm, "solewas", h.soleWays);
+  be_map_insert_int(vm, "alone", (1 == h.neighbors) ? 1 : 0);
+  be_map_insert_int(vm, "relays", h.relays);
+  be_pop(vm, 1);
+  be_return(vm);
+}
+
 static void EspNowMeshBerryRegister(void) {
   if (nullptr == berry.vm) { return; }
   be_pushntvfunction(berry.vm, EspNowMeshBerrySend);
@@ -1883,6 +1943,9 @@ static void EspNowMeshBerryRegister(void) {
   be_pop(berry.vm, 1);
   be_pushntvfunction(berry.vm, EspNowMeshBerryReady);
   be_setglobal(berry.vm, "espnow_mesh_ready");
+  be_pop(berry.vm, 1);
+  be_pushntvfunction(berry.vm, EspNowMeshBerryHealth);
+  be_setglobal(berry.vm, "espnow_mesh_health");
   be_pop(berry.vm, 1);
 }
 
@@ -1900,10 +1963,10 @@ static void EspNowMeshBerryCheck(void) {
 
 const char kEspNowMeshCommands[] PROGMEM = "|"
   "EspNowMeshEnable|EspNowMeshId|EspNowMeshChannel|EspNowMeshGroupKey|EspNowMeshNode|EspNowMeshPublic|EspNowMeshNetwork|"
-  "EspNowMeshInfo|EspNowMeshSend|EspNowMeshStatus|EspNowMeshNeighbors|EspNowMeshReady|EspNowMeshStats";
+  "EspNowMeshInfo|EspNowMeshSend|EspNowMeshStatus|EspNowMeshNeighbors|EspNowMeshReady|EspNowMeshStats|EspNowMeshHealth";
 void (* const kEspNowMeshCommand[])(void) PROGMEM = {
   &CmndEspNowMeshEnable, &CmndEspNowMeshId, &CmndEspNowMeshChannel, &CmndEspNowMeshGroupKey, &CmndEspNowMeshNode, &CmndEspNowMeshPublic,
-  &CmndEspNowMeshNetwork, &CmndEspNowMeshInfo, &CmndEspNowMeshSend, &CmndEspNowMeshStatus, &CmndEspNowMeshNeighbors, &CmndEspNowMeshReady, &CmndEspNowMeshStats };
+  &CmndEspNowMeshNetwork, &CmndEspNowMeshInfo, &CmndEspNowMeshSend, &CmndEspNowMeshStatus, &CmndEspNowMeshNeighbors, &CmndEspNowMeshReady, &CmndEspNowMeshStats, &CmndEspNowMeshHealth };
 
 /*********************************************************************************************\
  * Interface
