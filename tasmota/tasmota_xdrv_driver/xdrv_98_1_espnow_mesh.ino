@@ -138,6 +138,11 @@
  *   espnow_mesh_age(stamp)                  - a map of how old a stamp is by this device's clock now: age (ms, signed: negative for one from the future),
  *                                             tag (true when the stamp is of this device's timeline: the time of another has no meaning here) and
  *                                             synced; false when the bytes are not a stamp or the task is not running
+ *   espnow_mesh_neighbors()                 - a list with a map for each neighbour, as the task last saw them (up to half a second ago): id, state (0 alive,
+ *                                             1 suspect, 2 silent), rssi, age (ms since something of it got through), beat (ms since its last heartbeat, -1
+ *                                             if none), info (hex: the application's bytes of its last heartbeat, which are its to say), seen and skew (the
+ *                                             clock of its last heartbeat: 0 it carried none, 1 another timeline than this device's, 2 the same; and how
+ *                                             far its time was from this device's when it came, ms); false when the task is not running
 \*********************************************************************************************/
 
 #define XDRV_100                       100
@@ -281,6 +286,8 @@ typedef struct {
   int8_t their_rssi;
   uint16_t age_s;                            // since something of it got through
   uint16_t beat_s;                           // since its last heartbeat, 0xFFFF if none
+  uint32_t heard_at;                         // the millisecond counter when something of it last got through, and when its last heartbeat came (0 if none)
+  uint32_t beat_at;
   uint8_t hears;
   uint8_t info_len;
   uint8_t info[EspNowMesh::kMaxInfo];
@@ -1149,6 +1156,8 @@ static void EspNowMeshSnapshotMake(EspNowMesh::Node* node) {
     out.their_rssi = n->theirRssi;
     out.age_s = (now - n->lastHeard) / 1000;
     out.beat_s = n->beatAt ? (now - n->beatAt) / 1000 : 0xFFFF;
+    out.heard_at = n->lastHeard;
+    out.beat_at = n->beatAt;
     out.hears = n->hearsCount;
     out.info_len = n->infoLen;
     memcpy(out.info, n->info, n->infoLen);
@@ -2016,6 +2025,7 @@ void CmndEspNowMeshClock(void) {
 //   espnow_mesh_clock()                      -> a map of the mesh clock (synced, adopted, ticks10, ticks100, tag, timeline, taken, lo, hi), or false
 //   espnow_mesh_stamp()                      -> the 6 bytes that stamp a message with the mesh time and the tag of the timeline, or false when not synced
 //   espnow_mesh_age(stamp)                   -> a map (age in ms, tag, synced) of how old a stamp is, or false
+//   espnow_mesh_neighbors()                  -> a list of maps, one for each neighbour (id, state, rssi, age, beat, info, seen, skew), or false
 //
 // The frames for the application are not taken, and not answered, until it says it is ready: a script registers its rules and then
 // says so. What arrives, and what became of what was sent, comes to the rules, as the log and the header say.
@@ -2125,6 +2135,49 @@ int EspNowMeshBerryHealth(struct bvm *vm) {
 
 // The clock as a map: the mesh time as the task's clock has it, plus what the counter has gone on by since it was made. The numbers are integers of the
 // machine, 32 bits with their sign: a time in ticks wraps in 497 days (of 10 ms) or 13.6 years (of 100 ms), and two of them are compared by their difference
+// The neighbours the task has, as a list of maps, from the snapshot the task made last (up to half a second old, the commands' own): what each one's last heartbeat
+// carried, which is what the application of the mesh says of itself, and how long ago it, and the neighbour itself, were heard. The times are read from the counter
+// now, so that an age is exact when the snapshot is not. Copied under the lock and the list made after it, as Berry can raise an error
+int EspNowMeshBerryNeighbors(struct bvm *vm);
+int EspNowMeshBerryNeighbors(struct bvm *vm) {
+  EspNowMeshNeighbor_t* copy = nullptr;
+  uint32_t count = 0;
+  if (EspNowMeshDriver.running && EspNowMeshDriver.snapshot && (pdTRUE == xSemaphoreTake(EspNowMeshDriver.lock, pdMS_TO_TICKS(50)))) {
+    copy = new (std::nothrow) EspNowMeshNeighbor_t[EspNowMesh::kMaxNeighbors];
+    if (copy) {
+      count = EspNowMeshDriver.snapshot->neighbors;
+      memcpy(copy, EspNowMeshDriver.snapshot->neighbor, count * sizeof(EspNowMeshNeighbor_t));
+    }
+    xSemaphoreGive(EspNowMeshDriver.lock);
+  }
+  if (!copy) {
+    be_pushbool(vm, false);
+    be_return(vm);
+  }
+  uint32_t now = millis();
+  be_newobject(vm, "list");
+  for (uint32_t i = 0; i < count; i++) {
+    const EspNowMeshNeighbor_t& n = copy[i];
+    char info[2 * EspNowMesh::kMaxInfo + 1];
+    ToHex_P(n.info, n.info_len, info, sizeof(info));
+    be_newobject(vm, "map");
+    be_map_insert_int(vm, "id", n.id);
+    be_map_insert_int(vm, "state", n.state);
+    be_map_insert_int(vm, "rssi", n.rssi);
+    be_map_insert_int(vm, "age", (bint)(int32_t)(now - n.heard_at));
+    be_map_insert_int(vm, "beat", n.beat_at ? (bint)(int32_t)(now - n.beat_at) : -1);
+    be_map_insert_str(vm, "info", info);
+    be_map_insert_int(vm, "seen", n.clock_seen);
+    be_map_insert_int(vm, "skew", n.clock_skew);
+    be_pop(vm, 1);
+    be_data_push(vm, -2);
+    be_pop(vm, 1);
+  }
+  be_pop(vm, 1);
+  delete[] copy;
+  be_return(vm);
+}
+
 int EspNowMeshBerryClock(struct bvm *vm);
 int EspNowMeshBerryClock(struct bvm *vm) {
   EspNowMesh::ClockPoint point;
@@ -2211,6 +2264,9 @@ static void EspNowMeshBerryRegister(void) {
   be_pop(berry.vm, 1);
   be_pushntvfunction(berry.vm, EspNowMeshBerryAge);
   be_setglobal(berry.vm, "espnow_mesh_age");
+  be_pop(berry.vm, 1);
+  be_pushntvfunction(berry.vm, EspNowMeshBerryNeighbors);
+  be_setglobal(berry.vm, "espnow_mesh_neighbors");
   be_pop(berry.vm, 1);
 }
 
