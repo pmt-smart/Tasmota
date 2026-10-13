@@ -37,8 +37,9 @@
  *   origin   the number of the node that created the frame
  *   dest     the number of the node it is for, or 255 for all of them
  *   next     the number of the next hop of a routed frame; 0 in a flooded one
- *   hops     how many times the frame may still be repeated: it leaves the origin with 3,
- *            and a node that repeats it sends it on with one less; at 0 it is not repeated
+ *   hops     how many times the frame may still be repeated: it leaves the origin with kMaxHops (5 by default: the origin's own hop of radio
+ *            and five repeats, six in all), and a node that repeats it sends it on with one less; at 0 it is not repeated. It is the sender's
+ *            choice and it travels in the frame, which does not change with it: nodes built with different values interoperate
  *   epoch    rises at every start of the origin
  *   counter  numbers the frames of an epoch, one origin one writer
  *
@@ -177,7 +178,11 @@ constexpr uint8_t kPathRadio = 1;
 constexpr uint8_t kPathUdp = 2;
 constexpr uint8_t kBeatNoRadio = 1;          // a flag of the heartbeat: the node has no radio in use
 constexpr uint8_t kToAll = 255;
-constexpr uint8_t kMaxHops = 3;
+#ifndef ESPNOW_MESH_MAX_HOPS
+#define ESPNOW_MESH_MAX_HOPS 5                   // how many times a frame this node creates may be repeated: it goes this many hops of radio past its first
+#endif
+constexpr uint8_t kMaxHops = ESPNOW_MESH_MAX_HOPS;
+static_assert(kMaxHops >= 1 && kMaxHops <= 8, "ESPNOW_MESH_MAX_HOPS: from 1 to 8 repeats; the numbers a node remembers hearing (kSeenSize) cover the time a flood takes only for a few hops");
 constexpr unsigned kReplayWindow = 32;
 constexpr uint32_t kCounterRenew = 0xFFFF0000u;  // past this counter a node takes the next epoch
 constexpr uint32_t kCounterLast = 0xFFFFFFFEu;   // the last number a node gives: 0xFFFFFFFF and the wrap to 0 are never used
