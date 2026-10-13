@@ -53,6 +53,12 @@
  * waits 0 to 3 ms; a strong one waits 3 to 8 ms), and if it hears the same frame again while
  * it waits, it drops its own copy, the neighbours having covered what it would.
  *
+ * Who repeats: a node with enough neighbours chooses, from the lists in their heartbeats, a small set that between them hear every node at two hops (the
+ * multipoint relays of RFC 3626), and says whom in its heartbeat, after the list of its neighbours: a count and the numbers. A node that chooses none
+ * leaves the heartbeat as it was, and a node that reads none from a sender takes the sender as it did. A node that hears a flooded frame from a sender
+ * that did not choose it waits longer than the ones that were chosen, and drops its own copy only when it has heard one more than it takes of the others,
+ * or repeats it when it is the only way to one of its neighbours, so that a chosen relay whose copy is lost is made up for.
+ *
  * Routing back: of every number it hears for the first time, a node keeps who it heard it from,
  * which is the way back to the origin. A frame with a `next` goes that way, one neighbour at a
  * time, to a unicast address: each node that is not the destination sends it on to the neighbour
@@ -364,6 +370,7 @@ struct Stats {
   uint32_t noKey, cipherBad;
   uint32_t udpSent, udpHeard;
   uint32_t covered, syncShed, startAsks;
+  uint32_t relayHeld;
 };
 
 // How a neighbour stands: heard lately, not heard and being tried, or declared silent by this node
@@ -389,6 +396,7 @@ struct Neighbor {
   uint32_t udpAt;                              // and on the network; 0 if never
   uint32_t beatAt;                             // the last heartbeat; 0 before the first
   uint32_t suspectAt;
+  uint8_t selectsMe;                           // 0 not known, 1 its heartbeat names this node among the neighbours it has chosen to repeat for it, 2 it does not
   uint8_t beatSlots;                           // the heartbeat intervals the delivery below covers so far, up to kBeatWindow
   uint16_t beatBits;                           // one bit for each, the latest the lowest: set when a heartbeat of it came on the radio in that interval
   uint32_t beatRadioAt;                        // the last heartbeat of it that came on the radio; 0 before the first
@@ -414,6 +422,10 @@ struct IdSet {
 // What a neighbour is worth to this node as a peer of the radio's table, from the least to the most (Node::PeerRoleOf)
 enum PeerRole : uint8_t { kPeerGone = 0, kPeerWeak = 1, kPeerRedundant = 2, kPeerOnlyWay = 3 };
 
+// The repeaters a node chooses (Config::chooseRelays): a node that was not chosen by the sender waits this much longer than the ones that were
+// before it repeats, as a start, and drops its repeat when it has heard one copy more than the others need
+constexpr uint16_t kRelayBackupMs = 30;
+constexpr unsigned kRelayMinNeighbors = 10;  // a node with fewer neighbours than this counted on leaves the repeating to flooding: its neighbours overlap too little for a choice to save a frame
 
 // What the heartbeats of the neighbours tell a node of its surroundings, two hops deep
 struct HealthLink {
@@ -423,12 +435,14 @@ struct HealthLink {
   uint8_t reach;                               // the nodes at two hops that it lists
   uint8_t only;                                // of them, the ones no other neighbour lists: this node reaches them through it alone
   uint8_t branch;                              // the group, counted from 1, it falls in when the neighbours are joined by what they say of each other
+  uint8_t chosen;                              // 1 this node has chosen it to repeat for it
 };
 struct Health {
   uint8_t neighbors;                           // the usable neighbours
   uint8_t weak;                                // the ones heard and not counted on
   uint8_t twoHop;                              // the nodes at two hops
   uint8_t branches;                            // the groups of usable neighbours that do not hear of each other within two hops, 0 with no neighbour
+  uint8_t relays;                              // the neighbours chosen to repeat for this node
   uint8_t soleWays;                            // the usable neighbours that are the only way this node has to some node
 };
 
@@ -456,6 +470,10 @@ struct Config {
   uint16_t startSlotMs;                        // 0 for the default
   uint16_t startJitterMs;                      // 0 for the default
   uint8_t answersPerSecond;                    // 0 for the default; 255 for no limit
+  bool chooseRelays;                           // this node chooses the neighbours that repeat for it, says whom in its heartbeat, and repeats later when a sender did not choose it; false: every node that hears a flooded frame repeats it, as before
+  uint16_t relayBackupMs;                      // how much longer a node that the sender did not choose waits before it repeats; 0 for the default
+  uint8_t relayDropAt;                         // copies heard, the first included, that make a node that was not chosen drop its own; 0 for one more than suppressAt
+  uint8_t relayMinNeighbors;                   // the neighbours counted on that a node needs to choose repeaters; 0 for the default
 };
 
 class Node {
@@ -469,6 +487,9 @@ class Node {
     if (cfg_.startSlotMs == 0) cfg_.startSlotMs = kStartSlotMs;
     if (cfg_.startJitterMs == 0) cfg_.startJitterMs = kStartJitterMs;
     if (cfg_.answersPerSecond == 0) cfg_.answersPerSecond = kAnswersPerSecond;
+    if (cfg_.relayBackupMs == 0) cfg_.relayBackupMs = kRelayBackupMs;
+    if (cfg_.relayDropAt == 0) cfg_.relayDropAt = (uint8_t)(cfg_.suppressAt + 1);
+    if (cfg_.relayMinNeighbors == 0) cfg_.relayMinNeighbors = (uint8_t)kRelayMinNeighbors;
   }
 
   // The application hands over a frame for `dest` (kToAll for everyone), to be flooded. Returns its counter, or 0.
@@ -985,6 +1006,7 @@ class Node {
       l.reach = 0;
       l.only = 0;
       l.branch = 0;
+      l.chosen = relays_.Has(n.id) ? 1 : 0;
       if (!l.usable) continue;
       for (unsigned j = 0; j < n.hearsCount; j++) {
         uint8_t t = n.hears[j];
@@ -994,6 +1016,7 @@ class Node {
       }
       l.branch = branchOf[Find(parent, who[n.id] & 0x3f)];
       if (l.only > 0) h->soleWays++;
+      if (l.chosen) h->relays++;
     }
     return written;
   }
@@ -1026,6 +1049,9 @@ class Node {
     }
     return Usable(*peer, now) ? kPeerRedundant : kPeerWeak;
   }
+
+  // Whether this node has chosen the neighbour `id` to repeat for it
+  bool IsRelay(uint8_t id) const { return relays_.Has(id); }
 
   // Whether the network has been told that `node` is silent, by this node or by another
   bool IsSilent(uint8_t node) const {
@@ -1065,7 +1091,7 @@ class Node {
   struct Seen { bool used; bool hasFrom; uint8_t origin; uint8_t attempt; uint32_t epoch; uint32_t counter; uint8_t from[6]; };
   // `from` are the neighbours a flooded frame waiting to be repeated was heard from, for the first two copies;
   // `pingTarget` and `pingAsker` mark a ping: whom it tries, and for whom (0: for this node)
-  struct TxItem { bool used; bool own; bool unicast; uint8_t len; uint8_t prio; uint8_t heard; uint8_t tries; uint8_t to[6]; uint8_t from[2]; uint8_t fromCount; uint8_t pingTarget; uint8_t pingAsker; uint8_t paths; uint8_t udpTarget; uint32_t due; uint8_t data[kMaxFrame]; };
+  struct TxItem { bool used; bool own; bool unicast; bool wait; uint8_t len; uint8_t prio; uint8_t heard; uint8_t tries; uint8_t to[6]; uint8_t from[2]; uint8_t fromCount; uint8_t pingTarget; uint8_t pingAsker; uint8_t paths; uint8_t udpTarget; uint32_t due; uint8_t data[kMaxFrame]; };
   struct Pending { bool used; uint8_t dest; uint8_t attempt; uint8_t len; uint32_t counter; uint32_t due; uint8_t frame[kMaxFrame]; };
   struct SyncAsk { bool used; uint8_t target; uint32_t nonce; uint32_t until; };
   struct Mute { bool used; bool mine; uint8_t node; };
@@ -1108,6 +1134,7 @@ class Node {
   uint8_t loud_;                               // the windows in a row at or above the limit
   bool noisy_;
   uint8_t lossPercent_;
+  IdSet relays_;                               // the neighbours this node has chosen to repeat for it
 
   uint8_t NodeOf(const uint8_t mac[6]) const { return cfg_.nodeOf != nullptr ? cfg_.nodeOf(cfg_.nodeContext, mac) : 0; }
 
@@ -1353,7 +1380,7 @@ class Node {
       if (t.data[2] != origin || Get32(t.data + 6) != epoch || Get32(t.data + 10) != counter || (t.data[1] & 3) != attempt) continue;
       if (t.heard < 255) t.heard++;
       if (t.fromCount < 2) t.from[t.fromCount++] = from;
-      if (t.heard >= cfg_.suppressAt) {
+      if (t.heard >= (t.wait ? cfg_.relayDropAt : cfg_.suppressAt)) {
         if (SolePath(t, now)) stats_.keptAsOnlyWay++;
         else { t.used = false; stats_.suppressed++; }
       }
@@ -1390,6 +1417,84 @@ class Node {
     return false;
   }
 
+  // Whether the neighbour `sender` has chosen this node to repeat for it, by its last heartbeat: 1 yes, 2 no, 0 not known (it says nothing of it,
+  // or was not heard lately)
+  uint8_t ChosenBy(uint8_t sender, uint32_t now) const {
+    const Neighbor *s = NeighborOf(sender);
+    if (s == nullptr || s->beatAt == 0 || (int32_t)(now - s->beatAt) >= (int32_t)kHeardWindowMs) return 0;
+    return s->selectsMe;
+  }
+
+  // The neighbours that repeat for this node: a small set, of the ones counted on, that between them hear every node at two hops, which is
+  // the choice of multipoint relays of RFC 3626 made from the lists in the heartbeats. A neighbour that is the only one to list some node at
+  // two hops goes in first; then the one that covers the most of the nodes still left, the one chosen the time before winning a tie (so
+  // that the choice does not shift from one heartbeat to the next), then the better delivery, the stronger signal and the lower number.
+  // A node with fewer neighbours counted on than relayMinNeighbors chooses none and returns false: its heartbeat says nothing of repeaters
+  bool ChooseRelays(uint32_t now) {
+    IdSet direct, once, twice, chosen, covered;
+    direct.Clear();
+    once.Clear();
+    twice.Clear();
+    chosen.Clear();
+    covered.Clear();
+    unsigned usable = 0;
+    for (unsigned i = 0; i < kMaxNeighbors; i++) if (Usable(nbrs_[i], now)) { direct.Add(nbrs_[i].id); usable++; }
+    IdSet kept = relays_;
+    relays_.Clear();
+    if (usable < cfg_.relayMinNeighbors) return false;
+    for (unsigned i = 0; i < kMaxNeighbors; i++) {
+      const Neighbor &n = nbrs_[i];
+      if (!n.used || !direct.Has(n.id)) continue;
+      for (unsigned j = 0; j < n.hearsCount; j++) {
+        uint8_t t = n.hears[j];
+        if (t == 0 || t == kToAll || t == cfg_.id || direct.Has(t)) continue;
+        if (once.Has(t)) twice.Add(t); else once.Add(t);
+      }
+    }
+    for (unsigned i = 0; i < kMaxNeighbors; i++) {
+      const Neighbor &n = nbrs_[i];
+      if (!n.used || !direct.Has(n.id)) continue;
+      for (unsigned j = 0; j < n.hearsCount; j++) {
+        if (once.Has(n.hears[j]) && !twice.Has(n.hears[j])) { chosen.Add(n.id); break; }
+      }
+    }
+    for (unsigned i = 0; i < kMaxNeighbors; i++) {
+      const Neighbor &n = nbrs_[i];
+      if (!n.used || !chosen.Has(n.id)) continue;
+      for (unsigned j = 0; j < n.hearsCount; j++) if (once.Has(n.hears[j])) covered.Add(n.hears[j]);
+    }
+    for (;;) {
+      int best = -1;
+      unsigned bestGain = 0;
+      for (unsigned i = 0; i < kMaxNeighbors; i++) {
+        const Neighbor &n = nbrs_[i];
+        if (!n.used || !direct.Has(n.id) || chosen.Has(n.id)) continue;
+        unsigned gain = 0;
+        for (unsigned j = 0; j < n.hearsCount; j++) if (once.Has(n.hears[j]) && !covered.Has(n.hears[j])) gain++;
+        if (gain == 0) continue;
+        bool better = best < 0 || gain > bestGain;
+        if (!better && gain == bestGain) {
+          const Neighbor &b = nbrs_[best];
+          bool keptN = kept.Has(n.id), keptB = kept.Has(b.id);
+          unsigned qn = LinkQuality(n, now), qb = LinkQuality(b, now);
+          if (qn == kQualityUnknown) qn = 100;
+          if (qb == kQualityUnknown) qb = 100;
+          if (keptN != keptB) better = keptN;
+          else if (qn != qb) better = qn > qb;
+          else if (n.rssi != b.rssi) better = n.rssi > b.rssi;
+          else better = n.id < b.id;
+        }
+        if (better) { best = (int)i; bestGain = gain; }
+      }
+      if (best < 0) break;
+      const Neighbor &n = nbrs_[best];
+      chosen.Add(n.id);
+      for (unsigned j = 0; j < n.hearsCount; j++) if (once.Has(n.hears[j])) covered.Add(n.hears[j]);
+    }
+    relays_ = chosen;
+    return true;
+  }
+
   // What happens to a frame that is not for this node alone: a flooded one is repeated, a routed one goes on
   void Pass(const Frame &f, const uint8_t *data, size_t n, int8_t rssi, uint32_t now, uint8_t from = 0) {
     if (f.hops == 0 || f.dest == cfg_.id || cfg_.udpOnly) return;     // a node on the network alone repeats nothing: its neighbours have heard it all there
@@ -1397,6 +1502,9 @@ class Node {
   }
 
   void Schedule(const uint8_t *data, size_t n, int8_t rssi, uint32_t now, uint8_t from) {
+    // When the sender has chosen who repeats for it, and this node is not one of them, the chosen ones go first: this one waits, and repeats only
+    // if it has not heard enough copies by then, or is the only way to one of its neighbours
+    bool wait = cfg_.chooseRelays && ChosenBy(from, now) == 2;
     TxItem *slot = FreeSlot();
     if (slot == nullptr) { stats_.queueFull++; return; }
     memset(slot, 0, sizeof(*slot));
@@ -1415,6 +1523,11 @@ class Node {
     if (udpUp_ && cfg_.udpRelay && !cfg_.udpOnly) slot->paths |= kPathUdp;
     uint32_t r = cfg_.random != nullptr ? cfg_.random(cfg_.context) : 0;
     slot->due = now + (rssi < cfg_.weakDbm ? r % 4 : 3 + r % 6);
+    if (wait) {
+      slot->wait = true;
+      slot->due += cfg_.relayBackupMs + (r >> 8) % 8;
+      stats_.relayHeld++;
+    }
   }
 
   // A routed frame for someone else: to the neighbour this node keeps for its destination, with no wait
@@ -1786,6 +1899,15 @@ class Node {
       count++;
     }
     p[countAt] = count;
+    // a node that chooses who repeats for it says whom, after the neighbours; one that does not leaves the heartbeat as it was
+    if (cfg_.chooseRelays && ChooseRelays(now)) {
+      size_t chosenAt = at++;
+      uint8_t chosen = 0;
+      for (unsigned i = 0; i < kMaxNeighbors && at < kMaxPayload; i++) {
+        if (nbrs_[i].used && relays_.Has(nbrs_[i].id)) { p[at++] = nbrs_[i].id; chosen++; }
+      }
+      p[chosenAt] = chosen;
+    }
     if (Queue(kBeat, kToAll, p, at, false, 0, now) != 0) stats_.beatsSent++;
   }
 
@@ -1864,6 +1986,14 @@ class Node {
       uint8_t id = f.payload[at + 2 * i];
       if (id == cfg_.id) { n->listsMe = 1; n->theirRssi = (int8_t)f.payload[at + 2 * i + 1]; }
       if (n->hearsCount < kMaxNeighbors) n->hears[n->hearsCount++] = id;
+    }
+    // After the neighbours a node that chooses who repeats for it says whom: a count, and the numbers. One that does not leaves nothing there
+    n->selectsMe = 0;
+    size_t tail = at + 2 * count;
+    if (tail < f.len) {
+      size_t chosen = f.payload[tail];
+      n->selectsMe = 2;
+      for (size_t i = 0; i < chosen && tail + 1 + i < f.len; i++) if (f.payload[tail + 1 + i] == cfg_.id) n->selectsMe = 1;
     }
     // a neighbour that does not hear this node is no way back to anyone, whatever came by it before the first heartbeat told
     if (n->listsMe == 2) {
