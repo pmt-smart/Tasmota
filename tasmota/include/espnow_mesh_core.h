@@ -230,6 +230,7 @@ constexpr unsigned kInfoClockLen = 20;       // the bytes the application's part
 constexpr uint32_t kClockListenMs = 10000;   // a node that has taken no timeline is synced this long after it could first hear one: two heartbeats
 constexpr uint32_t kClockBandMs = 20;        // two timelines whose times differ by no more than this are of the same age, and the lower identity wins
 constexpr uint32_t kClockFollowMs = 3600000; // inside a timeline a node follows a greater time up to this much; more is not a drift
+constexpr uint64_t kClockMaxMs = (uint64_t)1 << 47;   // a time in a heartbeat from this on (4 400 years) is no time of a running node, and is not taken: the 48 bits it travels in must hold the sum of what a node is moved by
 constexpr unsigned kClockEventSize = 8;      // the things the clock tells the application, waiting to be read
 constexpr size_t kStampLen = 6;              // a stamp: the tag of the timeline (2 bytes), the mesh time in ticks of 10 ms (4), most significant first
 constexpr uint32_t kStampTickMs = 10;
@@ -2046,6 +2047,7 @@ class Node {
     const uint8_t *timeline = n.info + kInfoTimelineAt;
     uint64_t theirs = 0;
     for (unsigned i = 0; i < 6; i++) theirs = theirs << 8 | n.info[kInfoTimeAt + i];
+    if (theirs >= kClockMaxMs) { n.clockSeen = 0; return; }
     int64_t d = (int64_t)theirs - (int64_t)MeshTime(now);
     n.clockSkew = d > 32767 ? 32767 : (d < -32768 ? -32768 : (int16_t)d);
     int order = memcmp(timeline, timeline_, sizeof(timeline_));
