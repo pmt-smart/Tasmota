@@ -84,10 +84,13 @@
  *       core refused (no room, no key, too long) has an outcome with Ok 0, no attempts and Frame 0
  *   {"EspNowMesh":{"Notice":{"Kind":"Silent","Node":3,"By":2,"Value":0}}}
  *       Silent, Back, Noisy, Calm, BulkDone, BulkLost
- *   {"EspNowMesh":{"Timeline":{"Old":"0300000007","New":"0100000002","Ticks":-12,"Delta":"-1184","Synced":1}}}
+ *   {"EspNowMesh":{"Timeline":{"Old":"0300000007","New":"0100000002","Ticks":12,"Delta":"1184","Synced":1}}}
  *       the device took the timeline of the mesh clock (see EspNowMeshClock) that another one counts on: the one it left, the one it took, by how many
- *       ticks of 100 ms its mesh time moved (rounded, the low 32 bits of it, signed) and by how many ms (as text: it can pass 32 bits), for the
- *       application to move by whatever it marked in the timeline it left. espnow_mesh_clock() answers in the new timeline from the moment the device took it,
+ *       ticks of 100 ms its mesh time moved (rounded to the nearest, from half up, as the low 32 bits of it, signed) and by how many ms (as text: it can
+ *       pass 32 bits), for the application to move by whatever it marked in the timeline it left. A device takes a timeline whose time is greater than
+ *       its own, or within a few tens of ms of it when the timeline has the lower identity, so Ticks is never below 0 (except as the low 32 bits of a
+ *       move of more than 2^31 ticks: add it with a wrap of 32 bits) and Delta is below 0 only by those few ms, which round to 0 ticks.
+ *       espnow_mesh_clock() answers in the new timeline from the moment the device took it,
  *       before this reaches the rules, so what the application marks after reading the clock is in the new one, and what it marked before is for the
  *       ticks to move
  *   {"EspNowMesh":{"Synced":{"Value":1,"Timeline":"0100000002","Tag":258}}}
