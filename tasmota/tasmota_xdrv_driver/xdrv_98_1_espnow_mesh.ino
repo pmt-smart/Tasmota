@@ -76,7 +76,8 @@
  *
  * Reported to the rule engine, and in the log:
  *   {"EspNowMesh":{"From":3,"Type":0,"Dest":1,"Counter":12,"Epoch":7,"Rssi":-61,"Flags":0,"Part":0,"Joins":0,"Behind":0,"Data":"68656c6c6f"}}
- *       a frame for this device, Data in hex; Flags 1 asks for an answer, 2 marks a repeat of one already given;
+ *       a frame for this device, Data in hex; Flags 1 asks for an answer, 2 marks a repeat of one already given, 4 says it came under the tag of the
+ *       previous key of the network: its sender has not taken the last change of the key;
  *       Behind is how many numbers of its origin the frame was behind the newest heard, for the application to order by
  *   {"EspNowMesh":{"Outcome":{"Counter":5,"Frame":12,"Dest":3,"Ok":1,"Attempts":1}}}
  *       what became of a frame sent with an answer asked for. Counter is the ticket the send was given (what espnow_mesh_send returned,
@@ -101,12 +102,16 @@
  *   EspNowMeshEnable 0|1       - stop/start, reports the state when called bare
  *   EspNowMeshId <1..254>      - this device's number in the network
  *   EspNowMeshChannel <0..13>  - the channel the radio goes to when the station is not associated; 0 leaves it
- *   EspNowMeshGroupKey <64 hex>[,<version>] - the key of the network, never echoed back
+ *   EspNowMeshGroupKey <64 hex>[,<version>[,<revoke>]] - the key of the network, never echoed back. A key that is not the one the device has
+ *                                changes it: the key it had is kept as the previous key (see below), and the version has to be another. A second change
+ *                                while the first is open is refused, unless <revoke> is 1: a node was struck off with it
+ *   EspNowMeshKeyClose         - the change of the key is closed: the previous key is forgotten, in RAM and in flash
  *   EspNowMeshNode <id>,<mac>,<public key, 64 hex>[,<ip>] - a node of the network; <id>,0 forgets it; bare lists
  *   EspNowMeshPublic           - this device's public key
  *   EspNowMeshNetwork <bits>   - 1 also by the network (UDP), 2 no radio in use, 4 repeat on the network for the nodes with none
  *   EspNowMeshInfo <hex>       - up to 32 bytes that every heartbeat carries
- *   EspNowMeshSend <dest>,<type>,<ack 0|1>,<text or 0xHEX> - a frame; dest 255 is everyone; type 0 command, 2 state, 3 event; answers
+ *   EspNowMeshSend <dest>,<type>,<flags>,<text or 0xHEX> - a frame; dest 255 is everyone; type 0 command, 2 state, 3 event; flags 1 asks for an answer,
+ *                                2 makes its tag with the previous key (for the node that has not taken the change of the key); answers
  *                                {"Queued":1,"Counter":<ticket>}, or "busy" when the queue to the task is full, or "not running"
  *   EspNowMeshReady [0|1]      - whether the application is ready to take frames, as above
  *   EspNowMeshStatus           - the state of the task, and the counters that say how the frames fared
@@ -128,6 +133,14 @@
  * function of an IEEE 802.11 IBSS does. The time of a device never goes back. The real-time clock is never read.
  * The heartbeat's bytes of the application (EspNowMeshInfo) begin with a layout byte, 1; the device fills in bytes 0 to 11 (the layout, the timeline, the
  * time) and bit 0 of byte 19 (synced) as it sends, and the rest are the application's, up to 32. ESPNOW_MESH_CLOCK 0 leaves the heartbeat as it was.
+ * With a key set it also fills in bits 5 (it holds the previous key) and 6 (it needs the key) of byte 19 and the version of its key in byte 22.
+ *
+ * The change of the key: a device that takes a new key (EspNowMeshGroupKey) keeps the old one as the previous key, in flash, until EspNowMeshKeyClose, or 30
+ * days of running. It sends with the new one. For 120 s after it took the change a frame under the tag of the previous key is taken as one under the new
+ * key. After that the devices that have not taken the change are let through for no more than what brings them up to date (EspNowMeshStatus: PrevKeyHeard
+ * and PrevKeyDropped): their heartbeat, of which only the presence, the version of the key and whether it needs the key are taken, a sync exchange, and a frame
+ * of the membership (type 6) for this device alone, whose payload is sealed for it and which carries the new key. A device that hears frames whose tag it cannot
+ * check, and none that it can, for 15 s says in its heartbeat that it needs the key.
  *
  * And, in Berry, without the trip through the command handler:
  *   espnow_mesh_send(dest, type, ack, data) - the ticket of the send, an integer above 0, or false when it was not taken; data is bytes
@@ -163,7 +176,8 @@
 #include "espnow_mesh_core.h"
 #include "espnow_mesh_crypto.h"
 
-#define ESPNOW_MESH_SETTINGS_VERSION   3           // 2: the same record without the address of the chip; 1: and with room for 16 nodes. Both are taken as they are
+#define ESPNOW_MESH_SETTINGS_VERSION   4           // 3: the same record without the previous key; 2: and without the address of the chip; 1: and with room for 16 nodes. All are taken as they are
+#define ESPNOW_MESH_KEY_HOLD_HOURS     720         // the hours a device that holds the previous key of the network runs before it lets it go: 30 days
 #define ESPNOW_MESH_NVS_NAMESPACE      "espnowmesh"
 #define ESPNOW_MESH_NODES              48          // as many as the core keeps of origins and of neighbours
 #define ESPNOW_MESH_UDP_PORT           47474
@@ -217,14 +231,20 @@ struct {
   EspNowMeshNode_t node[ESPNOW_MESH_NODES];
   uint8_t mac[6];                            // the station address of the chip the identity was made on (since version 3)
   uint8_t spare_end[2];
+  uint8_t has_prev;                          // the key the network had before its last change is kept, until the change closes (since version 4)
+  uint8_t prev_version;
+  uint16_t prev_hours;                       // the hours the device has run holding it
+  uint8_t prev_key[32];
 } EspNowMeshSettings;
 
 // The sizes the record has had, which a record read is held to
 #define ESPNOW_MESH_RECORD_V1_SIZE     (offsetof(decltype(EspNowMeshSettings), node) + 16 * sizeof(EspNowMeshNode_t))
 #define ESPNOW_MESH_RECORD_V2_SIZE     offsetof(decltype(EspNowMeshSettings), mac)
+#define ESPNOW_MESH_RECORD_V3_SIZE     offsetof(decltype(EspNowMeshSettings), has_prev)
 static_assert(ESPNOW_MESH_RECORD_V1_SIZE == 768, "the record of version 1 is 768 bytes");
 static_assert(ESPNOW_MESH_RECORD_V2_SIZE == 2144, "the record of version 2 is 2144 bytes");
-static_assert(sizeof(EspNowMeshSettings) == 2152, "the record of version 3 is 2152 bytes");
+static_assert(ESPNOW_MESH_RECORD_V3_SIZE == 2152, "the record of version 3 is 2152 bytes");
+static_assert(sizeof(EspNowMeshSettings) == 2188, "the record of version 4 is 2188 bytes");
 
 // What the radio's callback hands the task
 typedef struct {
@@ -235,7 +255,7 @@ typedef struct {
 } EspNowMeshRx_t;
 
 // What the main loop asks of the core
-#define ESPNOW_MESH_CMD_SEND           1       // type, dest, flags 1 = answer asked, data
+#define ESPNOW_MESH_CMD_SEND           1       // type, dest, flags 1 = answer asked, 2 = tag with the previous key, data
 #define ESPNOW_MESH_CMD_INFO           2       // data
 typedef struct {
   uint8_t op;
@@ -300,6 +320,8 @@ typedef struct {
   uint8_t info[EspNowMesh::kMaxInfo];
   int16_t clock_skew;                        // its mesh time in its last heartbeat less this device's when it came, ms
   uint8_t clock_seen;                        // 0 its heartbeat carried no clock, 1 it did and it is in another timeline, 2 the same
+  uint8_t key_version;                       // the version of the network's key its heartbeat says it sends with, 0 if it does not say
+  uint8_t key_bits;                          // 1 it holds the previous key, 2 it needs the key, 4 its heartbeat came under the previous key's tag
 } EspNowMeshNeighbor_t;
 
 // What the task publishes for the status commands
@@ -312,6 +334,7 @@ typedef struct {
   uint8_t loss;
   uint8_t neighbors;
   uint8_t silent_count;
+  uint8_t needs_key;                         // this device hears frames whose tag it cannot check, and none that it can
   uint8_t silent[ESPNOW_MESH_NODES];
   uint16_t stack_free;
   bool net_up;
@@ -328,6 +351,10 @@ typedef struct {
   uint8_t has_group;
   uint8_t group_version;
   uint8_t group_key[32];
+  uint8_t has_prev;
+  uint8_t prev_version;
+  uint8_t key_change;                        // counts the changes of the key, to tell the task that one has just been taken
+  uint8_t prev_key[32];
   EspNowMeshNode_t node[ESPNOW_MESH_NODES];
 } EspNowMeshShared_t;
 
@@ -352,6 +379,9 @@ static struct {
   uint32_t epoch_ahead = 0;                  // an epoch saved by a start that failed after it: no frame went under it, and the next start takes it
   volatile bool app_ready = true;            // the application has its rules registered: until it says so the frames for it are not taken
   volatile bool epoch_renew = false;         // the counter of the core is near its end: the mesh starts again, under the next epoch
+  uint8_t key_change = 0;                    // the changes of the key of the network the main loop has made, and how many of them the task has taken
+  uint8_t key_applied = 0;
+  uint32_t prev_seconds = 0;                 // the seconds of the hour a device holding the previous key is running
   uint32_t ticket = 0;                       // the last a send was given, by the main loop alone
   volatile uint32_t dropped = 0;             // frames the callback had no room for
   uint8_t applied_channel = 0;
@@ -475,6 +505,7 @@ static void EspNowMeshSettingsLoad(void) {
         trouble = PSTR("could not be read");
       } else if (!(((1 == EspNowMeshSettings.version) && (ESPNOW_MESH_RECORD_V1_SIZE == size)) ||
                    ((2 == EspNowMeshSettings.version) && (ESPNOW_MESH_RECORD_V2_SIZE == size)) ||
+                   ((3 == EspNowMeshSettings.version) && (ESPNOW_MESH_RECORD_V3_SIZE == size)) ||
                    ((ESPNOW_MESH_SETTINGS_VERSION == EspNowMeshSettings.version) && (sizeof(EspNowMeshSettings) == size)))) {
         trouble = PSTR("has a size that does not go with its version");
       }
@@ -509,6 +540,7 @@ static void EspNowMeshSettingsLoad(void) {
     }
   }
   memcpy(EspNowMeshSettings.mac, own, 6);      // a record of version 1 or 2, or none, is taken to be this chip's
+  if (!EspNowMeshSettings.has_group) { EspNowMeshSettings.has_prev = 0; }
   EspNowMeshSettings.version = ESPNOW_MESH_SETTINGS_VERSION;
 }
 
@@ -962,7 +994,15 @@ static void EspNowMeshApplyShared(EspNowMesh::Node* node, EspNowMeshShared_t* sh
   EspNowMeshDriver.config_dirty = false;
   xSemaphoreGive(EspNowMeshDriver.lock);
 
-  if (fresh->has_group) { EspNowMeshDriver.crypto->SetGroupKey(fresh->group_key, fresh->group_version); }
+  if (fresh->has_group) {
+    EspNowMeshDriver.crypto->SetGroupKey(fresh->group_key, fresh->group_version);
+    if (fresh->has_prev) { EspNowMeshDriver.crypto->SetPreviousGroupKey(fresh->prev_key, fresh->prev_version); }
+    else { EspNowMeshDriver.crypto->ForgetPreviousGroupKey(); }
+    // a change just taken has its time to reach the other nodes; a start, or a key set for the first time, is no change
+    bool changed = fresh->key_change != EspNowMeshDriver.key_applied;
+    EspNowMeshDriver.key_applied = fresh->key_change;
+    node->SetKeyState(fresh->group_version, fresh->has_prev != 0, changed && fresh->has_prev, millis());
+  }
   // The keys of the nodes that left, or whose key changed, go first: a node that moved to another slot would otherwise have its
   // new key made and then forgotten
   for (uint32_t i = 0; i < ESPNOW_MESH_NODES; i++) {
@@ -1090,7 +1130,7 @@ static void EspNowMeshDrain(EspNowMesh::Node* node) {
     memset(&e, 0, sizeof(e));
     e.origin = d.origin;
     e.type = d.type;
-    e.flags = (d.ackRequested ? 1 : 0) | (d.retry ? 2 : 0);
+    e.flags = (d.ackRequested ? 1 : 0) | (d.retry ? 2 : 0) | (d.previousKey ? 4 : 0);
     e.part = d.part;
     e.attempt = d.attempt;
     e.behind = d.behind;
@@ -1110,7 +1150,7 @@ static void EspNowMeshDoCommand(EspNowMesh::Node* node, const EspNowMeshCmd_t* c
 static void EspNowMeshDoCommand(EspNowMesh::Node* node, const EspNowMeshCmd_t* cmd) {
   switch (cmd->op) {
     case ESPNOW_MESH_CMD_SEND: {
-      uint32_t frame = node->Send((EspNowMesh::Type)cmd->type, cmd->dest, cmd->data, cmd->len, cmd->flags & 1, millis());
+      uint32_t frame = node->Send((EspNowMesh::Type)cmd->type, cmd->dest, cmd->data, cmd->len, cmd->flags & 1, millis(), (cmd->flags & 2) != 0);
       if (0 == frame) {
         // The core has no room (8 frames waiting for an answer, 16 to send), no key for the destination, or the frame is too long. The
         // caller was given a ticket when the send was queued and is told here that nothing was sent, as it is told of a frame that went
@@ -1151,6 +1191,7 @@ static void EspNowMeshSnapshotMake(EspNowMesh::Node* node) {
   s->noisy = node->Noisy();
   s->loss = node->LossPercent();
   s->net_up = net_up;
+  s->needs_key = node->NeedsKey(now);
   for (uint32_t i = 0; i < EspNowMesh::kMaxNeighbors; i++) {
     const EspNowMesh::Neighbor* n = node->NeighborAt(i);
     if (nullptr == n) { continue; }
@@ -1170,6 +1211,8 @@ static void EspNowMeshSnapshotMake(EspNowMesh::Node* node) {
     memcpy(out.info, n->info, n->infoLen);
     out.clock_skew = n->clockSkew;
     out.clock_seen = n->clockSeen;
+    out.key_version = n->keyVersion;
+    out.key_bits = n->keyBits;
   }
   for (uint32_t i = 0; i < ESPNOW_MESH_NODES; i++) {
     if (EspNowMeshTable[i].id && node->IsSilent(EspNowMeshTable[i].id) && (s->silent_count < ESPNOW_MESH_NODES)) {
@@ -1265,6 +1308,10 @@ static void EspNowMeshPushShared(void) {
   EspNowMeshDriver.shared->has_group = EspNowMeshSettings.has_group;
   EspNowMeshDriver.shared->group_version = EspNowMeshSettings.group_version;
   memcpy(EspNowMeshDriver.shared->group_key, EspNowMeshSettings.group_key, sizeof(EspNowMeshSettings.group_key));
+  EspNowMeshDriver.shared->has_prev = EspNowMeshSettings.has_prev;
+  EspNowMeshDriver.shared->prev_version = EspNowMeshSettings.prev_version;
+  EspNowMeshDriver.shared->key_change = EspNowMeshDriver.key_change;
+  memcpy(EspNowMeshDriver.shared->prev_key, EspNowMeshSettings.prev_key, sizeof(EspNowMeshSettings.prev_key));
   memcpy(EspNowMeshDriver.shared->node, EspNowMeshSettings.node, sizeof(EspNowMeshSettings.node));
   EspNowMeshDriver.config_dirty = true;
   xSemaphoreGive(EspNowMeshDriver.lock);
@@ -1370,6 +1417,8 @@ static bool EspNowMeshStartAttempt(void) {
     return false;
   }
   EspNowMeshDriver.crypto->SetGroupKey(EspNowMeshSettings.group_key, EspNowMeshSettings.group_version);
+  if (EspNowMeshSettings.has_prev) { EspNowMeshDriver.crypto->SetPreviousGroupKey(EspNowMeshSettings.prev_key, EspNowMeshSettings.prev_version); }
+  EspNowMeshDriver.key_applied = EspNowMeshDriver.key_change;
 
   EspNowMesh::Config config;
   memset(&config, 0, sizeof(config));
@@ -1378,6 +1427,7 @@ static bool EspNowMeshStartAttempt(void) {
   config.random = EspNowMeshRandom;
   config.tag = EspNowMesh::Crypto::Tag;
   config.tagContext = EspNowMeshDriver.crypto;
+  config.tagPrevious = EspNowMesh::Crypto::TagPrevious;
   config.proof = EspNowMesh::Crypto::Proof;
   config.proofContext = EspNowMeshDriver.crypto;
   config.seal = EspNowMesh::Crypto::Seal;
@@ -1471,10 +1521,23 @@ void EspNowMeshWifiEvent(arduino_event_t *event) {
 static void EspNowMeshBerryCheck(void);
 #endif
 
+static bool EspNowMeshKeyClose(void);
 static void EspNowMeshEverySecond(void) {
 #ifdef USE_BERRY
   EspNowMeshBerryCheck();
 #endif
+  // The previous key is held for the hours the device runs, not for the time since the change: a device off for a month has not given the others the time to
+  // reach it. At the end of them it is let go, and a node that never took the change is left to the button
+  if (EspNowMeshSettings.has_prev && (++EspNowMeshDriver.prev_seconds >= 3600)) {
+    EspNowMeshDriver.prev_seconds = 0;
+    if (EspNowMeshSettings.prev_hours < 0xFFFF) { EspNowMeshSettings.prev_hours++; }
+    if (EspNowMeshSettings.prev_hours >= ESPNOW_MESH_KEY_HOLD_HOURS) {
+      AddLog(LOG_LEVEL_INFO, PSTR("EMH: The previous key of the network has been held for %u hours: it is let go"), EspNowMeshSettings.prev_hours);
+      EspNowMeshKeyClose();
+    } else if (!EspNowMeshSettingsCommit()) {
+      AddLog(LOG_LEVEL_ERROR, PSTR("EMH: The hours of the previous key were not saved"));
+    }
+  }
   if (EspNowMeshDriver.running && EspNowMeshDriver.exited) { EspNowMeshReap(); }       // a task that was slow to end
   if (EspNowMeshDriver.running && EspNowMeshDriver.epoch_renew) {
     // The number of a frame is the nonce of its cipher and is never used twice: the counter of the core is near the end of its 32 bits, and a start
@@ -1623,20 +1686,76 @@ void CmndEspNowMeshGroupKey(void) {
     snprintf(text, sizeof(text), "%s", XdrvMailbox.data);
     char* comma = strchr(text, ',');
     uint32_t version = 1;
-    if (comma) { *comma = '\0'; version = atoi(comma + 1); }
-    if ((version < 1) || (version > 255) || !EspNowMeshHex(text, EspNowMeshSettings.group_key, sizeof(EspNowMeshSettings.group_key))) {
-      ResponseCmndError();
-      EspNowMeshWipe(text, sizeof(text));
-      return;
+    bool revoke = false;
+    if (comma) {
+      *comma = '\0';
+      char* third = strchr(comma + 1, ',');
+      if (third) { *third = '\0'; revoke = (1 == atoi(third + 1)); }
+      version = atoi(comma + 1);
     }
+    uint8_t key[32];
+    bool valid = (version >= 1) && (version <= 255) && EspNowMeshHex(text, key, sizeof(key));
     EspNowMeshWipe(text, sizeof(text));
     memset(XdrvMailbox.data, '*', XdrvMailbox.data_len);       // the key is not left in the command's own buffer
+    if (!valid) {
+      EspNowMeshWipe(key, sizeof(key));
+      ResponseCmndError();
+      return;
+    }
+    // A key that is not the one the device has is a change of the network's key: the one it has becomes the previous key, so that the nodes that have not
+    // taken the change are still recognised. The same key, with another version, only renames it
+    bool change = EspNowMeshSettings.has_group && memcmp(key, EspNowMeshSettings.group_key, sizeof(key));
+    if (change && (version == EspNowMeshSettings.group_version)) {
+      EspNowMeshWipe(key, sizeof(key));
+      ResponseCmndChar_P(PSTR("the version must change with the key"));
+      return;
+    }
+    if (change && EspNowMeshSettings.has_prev && !revoke) {
+      EspNowMeshWipe(key, sizeof(key));
+      ResponseCmndChar_P(PSTR("the last change is not closed"));
+      return;
+    }
+    if (change) {
+      memcpy(EspNowMeshSettings.prev_key, EspNowMeshSettings.group_key, sizeof(EspNowMeshSettings.prev_key));
+      EspNowMeshSettings.prev_version = EspNowMeshSettings.group_version;
+      EspNowMeshSettings.prev_hours = 0;
+      EspNowMeshSettings.has_prev = 1;
+      EspNowMeshDriver.prev_seconds = 0;
+      EspNowMeshDriver.key_change++;
+    }
+    memcpy(EspNowMeshSettings.group_key, key, sizeof(key));
+    EspNowMeshWipe(key, sizeof(key));
     EspNowMeshSettings.group_version = version;
     EspNowMeshSettings.has_group = 1;
-    if (!EspNowMeshSettingsCommit()) { ResponseCmndChar_P(PSTR("flash write failed")); return; }
+    if (!EspNowMeshSettingsCommit()) {
+      if (change) { EspNowMeshDriver.key_change--; }
+      ResponseCmndChar_P(PSTR("flash write failed"));
+      return;
+    }
     EspNowMeshPushShared();
   }
-  Response_P(PSTR("{\"%s\":{\"Set\":%u,\"Version\":%u}}"), XdrvMailbox.command, EspNowMeshSettings.has_group, EspNowMeshSettings.group_version);
+  Response_P(PSTR("{\"%s\":{\"Set\":%u,\"Version\":%u,\"Previous\":%u}}"), XdrvMailbox.command, EspNowMeshSettings.has_group, EspNowMeshSettings.group_version,
+    EspNowMeshSettings.has_prev ? EspNowMeshSettings.prev_version : 0);
+}
+
+// The previous key is let go: the change of the key has reached every node, or the time for it has run out
+static bool EspNowMeshKeyClose(void);
+static bool EspNowMeshKeyClose(void) {
+  if (!EspNowMeshSettings.has_prev) { return true; }
+  EspNowMeshWipe(EspNowMeshSettings.prev_key, sizeof(EspNowMeshSettings.prev_key));
+  EspNowMeshSettings.prev_version = 0;
+  EspNowMeshSettings.prev_hours = 0;
+  EspNowMeshSettings.has_prev = 0;
+  EspNowMeshDriver.prev_seconds = 0;
+  if (!EspNowMeshSettingsCommit()) { return false; }
+  EspNowMeshPushShared();
+  return true;
+}
+
+void CmndEspNowMeshKeyClose(void) {
+  bool was = EspNowMeshSettings.has_prev != 0;
+  if (!EspNowMeshKeyClose()) { ResponseCmndChar_P(PSTR("flash write failed")); return; }
+  Response_P(PSTR("{\"%s\":{\"Closed\":%u}}"), XdrvMailbox.command, was ? 1 : 0);
 }
 
 void CmndEspNowMeshNode(void) {
@@ -1794,14 +1913,14 @@ void CmndEspNowMeshSend(void) {
   for (char* p = XdrvMailbox.data; *p && (count < 4); p++) {
     if (',' == *p) { *p = '\0'; fields[count++] = p + 1; }
   }
-  if (4 != count) { ResponseCmndChar_P(PSTR("dest,type,ack,payload")); return; }
+  if (4 != count) { ResponseCmndChar_P(PSTR("dest,type,flags,payload")); return; }
   EspNowMeshCmd_t cmd;
   memset(&cmd, 0, sizeof(cmd));
   cmd.op = ESPNOW_MESH_CMD_SEND;
   long dest = strtol(fields[0], nullptr, 10);
   long type = strtol(fields[1], nullptr, 10);
   long ack = strtol(fields[2], nullptr, 10);
-  if ((dest < 0) || (dest > 255) || (type < 0) || (type > 7) || (ack < 0) || (ack > 1)) { ResponseCmndChar_P(PSTR("dest 0..255, type 0..7, ack 0|1")); return; }
+  if ((dest < 0) || (dest > 255) || (type < 0) || (type > 7) || (ack < 0) || (ack > 3)) { ResponseCmndChar_P(PSTR("dest 0..255, type 0..7, flags 0..3")); return; }
   cmd.dest = dest;
   cmd.type = type;
   cmd.flags = ack;
@@ -1847,8 +1966,9 @@ void CmndEspNowMeshStatus(void) {
   esp_wifi_get_channel(&channel, &second);
   esp_now_peer_num_t peers = {0, 0};
   esp_now_get_peer_num(&peers);
-  Response_P(PSTR("{\"EspNowMeshStatus\":{\"Running\":%u,\"Id\":%u,\"Epoch\":%u,\"Mac\":\"%s\",\"Channel\":%u,\"Group\":%u,\"GroupVersion\":%u,\"Network\":%u,\"Radio\":%u,\"Ready\":%u,\"Dropped\":%u,\"Peers\":%d,\"Heap\":%u"),
+  Response_P(PSTR("{\"EspNowMeshStatus\":{\"Running\":%u,\"Id\":%u,\"Epoch\":%u,\"Mac\":\"%s\",\"Channel\":%u,\"Group\":%u,\"GroupVersion\":%u,\"PrevVersion\":%u,\"PrevHours\":%u,\"Network\":%u,\"Radio\":%u,\"Ready\":%u,\"Dropped\":%u,\"Peers\":%d,\"Heap\":%u"),
     EspNowMeshDriver.running, EspNowMeshSettings.id, EspNowMeshSettings.epoch, mac, channel, EspNowMeshSettings.has_group, EspNowMeshSettings.group_version,
+    EspNowMeshSettings.has_prev ? EspNowMeshSettings.prev_version : 0, EspNowMeshSettings.prev_hours,
     EspNowMeshSettings.network, EspNowMeshDriver.radio, EspNowMeshDriver.app_ready, EspNowMeshDriver.dropped, peers.total_num, ESP_getFreeHeap());
   if (!EspNowMeshDriver.running) {
     const char* why = EspNowMeshWhyNot();
@@ -1856,6 +1976,7 @@ void CmndEspNowMeshStatus(void) {
   }
   if (snap) {
     const EspNowMesh::Stats& s = snap->stats;
+    ResponseAppend_P(PSTR(",\"NeedsKey\":%u,\"PrevKeyHeard\":%u,\"PrevKeyDropped\":%u"), snap->needs_key, s.prevKeyHeard, s.prevKeyDropped);
     ResponseAppend_P(PSTR(",\"Neighbors\":%u,\"Queued\":%u,\"Waiting\":%u,\"Noisy\":%u,\"Loss\":%u,\"NetUp\":%u,\"Stack\":%u,\"Silent\":%u,"
                           "\"Heard\":%u,\"Bad\":%u,\"Repeated\":%u,\"Replayed\":%u,\"Stale\":%u,\"Unsynced\":%u,\"Covered\":%u,\"Delivered\":%u,\"InboxFull\":%u,"
                           "\"SentOwn\":%u,\"SentRelay\":%u,\"Suppressed\":%u,\"QueueFull\":%u,\"NoRoute\":%u,\"NoKey\":%u,"
@@ -1951,9 +2072,9 @@ void CmndEspNowMeshNeighbors(void) {
     char info[2 * EspNowMesh::kMaxInfo + 1];
     ToHex_P(n.info, n.info_len, info, sizeof(info));
     char entry[ESPNOW_MESH_ENTRY_MAX];
-    int len = snprintf_P(entry, sizeof(entry), PSTR("%s{\"Id\":%u,\"State\":\"%s\",\"Rssi\":%d,\"TheirRssi\":%d,\"Lists\":%u,\"NoRadio\":%u,\"Age\":%u,\"Beat\":%d,\"Hears\":%u,\"Info\":\"%s\"}"),
+    int len = snprintf_P(entry, sizeof(entry), PSTR("%s{\"Id\":%u,\"State\":\"%s\",\"Rssi\":%d,\"TheirRssi\":%d,\"Lists\":%u,\"NoRadio\":%u,\"Age\":%u,\"Beat\":%d,\"Hears\":%u,\"Key\":%u,\"KeyBits\":%u,\"Info\":\"%s\"}"),
       (i == first) ? PSTR("") : PSTR(","), n.id, EspNowMeshStateName(n.state), n.rssi, n.their_rssi, n.lists_me, n.no_radio, n.age_s,
-      (0xFFFF == n.beat_s) ? -1 : (int)n.beat_s, n.hears, info);
+      (0xFFFF == n.beat_s) ? -1 : (int)n.beat_s, n.hears, n.key_version, n.key_bits, info);
     if ((i > first) && !EspNowMeshPageRoom((len > 0) ? (size_t)len : sizeof(entry))) { break; }
     ResponseAppend_P(PSTR("%s"), entry);
   }
@@ -2055,11 +2176,12 @@ void CmndEspNowMeshClock(void) {
 // Going through the command handler costs a full dispatch on the main loop, about 8 ms even for a command that does nothing
 // (xdrv_98), and a script that sends often should not pay it. So Berry gets entry points of its own:
 //
-//   espnow_mesh_send(dest, type, ack, data)  -> the ticket of the send, an integer above 0, or false when it was not taken (the task is not
+//   espnow_mesh_send(dest, type, ack, data[, previous]) -> the ticket of the send, an integer above 0, or false when it was not taken (the task is not
 //                                               running, its queue is full, the destination or the type is out of range, or the data is more
 //                                               than espnow_mesh_max_payload(dest)); data is bytes or a string. The outcome of a frame sent
 //                                               with an answer asked carries the ticket as its Counter, and so does one the core refused, with
-//                                               Ok 0 and no attempts
+//                                               Ok 0 and no attempts. `previous` (true) makes the tag of the frame with the previous key of the network,
+//                                               for the node that has not taken the change of the key; the usual one when there is none
 //   espnow_mesh_max_payload(dest)            -> the most bytes a payload to dest can be
 //   espnow_mesh_info(data)                   -> true when the task took it; the bytes (up to 32) every heartbeat carries. Also says the
 //                                               application is ready
@@ -2069,7 +2191,9 @@ void CmndEspNowMeshClock(void) {
 //   espnow_mesh_clock()                      -> a map of the mesh clock (synced, adopted, ticks10, ticks100, tag, timeline, taken, lo, hi), or false
 //   espnow_mesh_stamp()                      -> the 6 bytes that stamp a message with the mesh time and the tag of the timeline, or false when not synced
 //   espnow_mesh_age(stamp)                   -> a map (age in ms, tag, synced) of how old a stamp is, or false
-//   espnow_mesh_neighbors()                  -> a list of maps, one for each neighbour (id, state, rssi, age, beat, info, seen, skew), or false
+//   espnow_mesh_neighbors()                  -> a list of maps, one for each neighbour (id, state, rssi, age, beat, info, seen, skew, key, keybits), or false.
+//                                               key is the version of the network's key its heartbeat says it sends with (0: it does not say), and keybits has
+//                                               1 it holds the previous key, 2 it needs the key, 4 its heartbeat came under the previous key's tag
 //
 // The frames for the application are not taken, and not answered, until it says it is ready: a script registers its rules and then
 // says so. What arrives, and what became of what was sent, comes to the rules, as the log and the header say.
@@ -2095,7 +2219,7 @@ int EspNowMeshBerrySend(struct bvm *vm) {
       cmd.op = ESPNOW_MESH_CMD_SEND;
       cmd.dest = dest;
       cmd.type = type;
-      cmd.flags = ack ? 1 : 0;
+      cmd.flags = (ack ? 1 : 0) | ((argc >= 5 && be_tobool(vm, 5)) ? 2 : 0);
       cmd.len = len;
       if (len) { memcpy(cmd.data, data, len); }
       if (ESPNOW_MESH_QUEUED == EspNowMeshQueueCommand(&cmd)) { ticket = cmd.ticket; }
@@ -2213,6 +2337,8 @@ int EspNowMeshBerryNeighbors(struct bvm *vm) {
     be_map_insert_str(vm, "info", info);
     be_map_insert_int(vm, "seen", n.clock_seen);
     be_map_insert_int(vm, "skew", n.clock_skew);
+    be_map_insert_int(vm, "key", n.key_version);
+    be_map_insert_int(vm, "keybits", n.key_bits);
     be_pop(vm, 1);
     be_data_push(vm, -2);
     be_pop(vm, 1);
@@ -2328,11 +2454,11 @@ static void EspNowMeshBerryCheck(void) {
 
 const char kEspNowMeshCommands[] PROGMEM = "|"
   "EspNowMeshEnable|EspNowMeshId|EspNowMeshChannel|EspNowMeshGroupKey|EspNowMeshNode|EspNowMeshPublic|EspNowMeshNetwork|"
-  "EspNowMeshInfo|EspNowMeshSend|EspNowMeshStatus|EspNowMeshNeighbors|EspNowMeshReady|EspNowMeshStats|EspNowMeshHealth|EspNowMeshClock";
+  "EspNowMeshInfo|EspNowMeshSend|EspNowMeshStatus|EspNowMeshNeighbors|EspNowMeshReady|EspNowMeshStats|EspNowMeshHealth|EspNowMeshClock|EspNowMeshKeyClose";
 void (* const kEspNowMeshCommand[])(void) PROGMEM = {
   &CmndEspNowMeshEnable, &CmndEspNowMeshId, &CmndEspNowMeshChannel, &CmndEspNowMeshGroupKey, &CmndEspNowMeshNode, &CmndEspNowMeshPublic,
   &CmndEspNowMeshNetwork, &CmndEspNowMeshInfo, &CmndEspNowMeshSend, &CmndEspNowMeshStatus, &CmndEspNowMeshNeighbors, &CmndEspNowMeshReady, &CmndEspNowMeshStats, &CmndEspNowMeshHealth,
-  &CmndEspNowMeshClock };
+  &CmndEspNowMeshClock, &CmndEspNowMeshKeyClose };
 
 /*********************************************************************************************\
  * Interface

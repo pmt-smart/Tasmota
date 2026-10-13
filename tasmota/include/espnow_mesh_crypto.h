@@ -29,7 +29,10 @@
  *              HKDF-SHA256 with the two public keys, the lower first, as its salt; an AES-128 key
  *              for the payload and a 32-byte key for the proofs. Cached, at most one per node
  *   group key  of the whole network, 32 bytes with a version number, through HKDF into an AES-128
- *              key for the payload and an HMAC key for the tag of a frame
+ *              key for the payload and an HMAC key for the tag of a frame. A node holds two: the one it
+ *              sends with and, after the network's key has changed and until the change has reached every
+ *              node, the one the network had before, to recognise and open what the nodes that have not
+ *              taken the change yet still send
  *   Tag        HMAC-SHA256 under the network's key, the first 8 bytes: what every node that
  *              repeats a frame checks, and that nobody outside the network can make
  *   Seal       a frame for one node alone: AES-128-CCM, a nonce of 9 bytes (the origin, the epoch
@@ -70,20 +73,26 @@ class Crypto {
 
   const uint8_t *PublicKey() const { return pub_; }
 
-  // The key of the whole network, 32 bytes, and its version
-  void SetGroupKey(const uint8_t key[32], uint8_t version) {
-    static const char salt[] = "mesh group";
-    uint8_t mac[32];
-    Hkdf((const uint8_t *)salt, sizeof(salt) - 1, key, 32, (const uint8_t *)"enc", 3, groupEnc_, sizeof(groupEnc_));
-    Hkdf((const uint8_t *)salt, sizeof(salt) - 1, key, 32, (const uint8_t *)"mac", 3, mac, sizeof(mac));
-    br_hmac_key_init(&groupMac_, &br_sha256_vtable, mac, sizeof(mac));
-    Wipe(mac, sizeof(mac));
-    groupVersion_ = version;
-    hasGroup_ = true;
+  // The key of the whole network, 32 bytes, and its version: the one a node sends with, and checks and opens what it hears with first
+  void SetGroupKey(const uint8_t key[32], uint8_t version) { Derive(group_, key, version); }
+
+  uint8_t GroupVersion() const { return group_.has ? group_.version : 0; }
+  bool HasGroupKey() const { return group_.has; }
+
+  // The network's key changes: the one this node had becomes the previous key, the one before it is let go, and this is the key it sends with
+  void ChangeGroupKey(const uint8_t key[32], uint8_t version) {
+    if (group_.has) previous_ = group_;
+    Derive(group_, key, version);
   }
 
-  uint8_t GroupVersion() const { return hasGroup_ ? groupVersion_ : 0; }
-  bool HasGroupKey() const { return hasGroup_; }
+  // The key the network had before its last change, which a node holds until the change has reached them all: the frames of a node that has
+  // not taken the change yet are checked, and the ones the core lets through are opened, with it
+  void SetPreviousGroupKey(const uint8_t key[32], uint8_t version) { Derive(previous_, key, version); }
+
+  void ForgetPreviousGroupKey() { Wipe(&previous_, sizeof(previous_)); }
+
+  uint8_t PreviousGroupVersion() const { return previous_.has ? previous_.version : 0; }
+  bool HasPreviousGroupKey() const { return previous_.has; }
 
   // The node `node`, whose public key is `pub`: the keys of the pair are derived and kept. False for a key of small order, or
   // when there is no room for another node
@@ -122,11 +131,16 @@ class Crypto {
 
   static void Tag(const uint8_t *data, size_t len, uint8_t tag[kTagLen], void *context) {
     Crypto *c = (Crypto *)context;
-    if (!c->hasGroup_) { memset(tag, 0, kTagLen); return; }
-    br_hmac_context hc;
-    br_hmac_init(&hc, &c->groupMac_, kTagLen);
-    br_hmac_update(&hc, data, len);
-    br_hmac_out(&hc, tag);
+    if (!c->group_.has) { memset(tag, 0, kTagLen); return; }
+    TagWith(c->group_, data, len, tag);
+  }
+
+  // The same under the previous key. False, and the tag left as it was, when there is none: a frame must never be taken for the tag of a key that is not held
+  static bool TagPrevious(const uint8_t *data, size_t len, uint8_t tag[kTagLen], void *context) {
+    Crypto *c = (Crypto *)context;
+    if (!c->previous_.has) return false;
+    TagWith(c->previous_, data, len, tag);
+    return true;
   }
 
   static void Proof(void *context, uint8_t peer, uint32_t nonce, uint32_t epoch, uint32_t counter, uint8_t proof[8]) {
@@ -147,11 +161,12 @@ class Crypto {
     uint8_t nonce[9];
     NonceOf(header, nonce);
     if (peer == 0) {
-      if (!c->hasGroup_) return 0;
+      if (!c->group_.has) return 0;
       memcpy(out, in, len);
-      Ctr(c->groupEnc_, nonce, out, len);
+      Ctr(c->group_.enc, nonce, out, len);
       return len;
     }
+    if (peer == kGroupPrevious) return 0;      // a node sends with the key it has now
     const Peer *p = c->FindPeer(peer);
     if (p == nullptr) return 0;
     memcpy(out, in, len);
@@ -163,10 +178,11 @@ class Crypto {
     Crypto *c = (Crypto *)context;
     uint8_t nonce[9];
     NonceOf(header, nonce);
-    if (peer == 0) {
-      if (!c->hasGroup_) return -1;
+    if (peer == 0 || peer == kGroupPrevious) {
+      const GroupKey &k = peer == 0 ? c->group_ : c->previous_;
+      if (!k.has) return -1;
       memcpy(out, in, len);
-      Ctr(c->groupEnc_, nonce, out, len);
+      Ctr(k.enc, nonce, out, len);
       return (int)len;
     }
     const Peer *p = c->FindPeer(peer);
@@ -254,13 +270,32 @@ class Crypto {
  private:
   struct Peer { bool used; uint8_t node; uint8_t enc[16]; uint8_t proof[32]; };
 
+  // A key of the whole network, as it is used: the cipher key for the payload and the keyed hash for the tag, and the version that names it
+  struct GroupKey { bool has; uint8_t version; uint8_t enc[16]; br_hmac_key_context mac; };
+
   uint8_t secret_[32];
   uint8_t pub_[32];
-  bool hasGroup_;
-  uint8_t groupVersion_;
-  uint8_t groupEnc_[16];
-  br_hmac_key_context groupMac_;
+  GroupKey group_;
+  GroupKey previous_;
   Peer peers_[kCryptoPeers];
+
+  static void Derive(GroupKey &k, const uint8_t key[32], uint8_t version) {
+    static const char salt[] = "mesh group";
+    uint8_t mac[32];
+    Hkdf((const uint8_t *)salt, sizeof(salt) - 1, key, 32, (const uint8_t *)"enc", 3, k.enc, sizeof(k.enc));
+    Hkdf((const uint8_t *)salt, sizeof(salt) - 1, key, 32, (const uint8_t *)"mac", 3, mac, sizeof(mac));
+    br_hmac_key_init(&k.mac, &br_sha256_vtable, mac, sizeof(mac));
+    Wipe(mac, sizeof(mac));
+    k.version = version;
+    k.has = true;
+  }
+
+  static void TagWith(const GroupKey &k, const uint8_t *data, size_t len, uint8_t tag[kTagLen]) {
+    br_hmac_context hc;
+    br_hmac_init(&hc, &k.mac, kTagLen);
+    br_hmac_update(&hc, data, len);
+    br_hmac_out(&hc, tag);
+  }
 
   const Peer *FindPeer(uint8_t node) const {
     for (unsigned i = 0; i < kCryptoPeers; i++) if (peers_[i].used && peers_[i].node == node) return &peers_[i];
