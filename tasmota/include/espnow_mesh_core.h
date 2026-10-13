@@ -105,6 +105,11 @@
  * on the radio says how many of its frames arrive, where the signal says only how strongly the ones that do are heard. A neighbour that delivers fewer
  * than half of them is heard, and not counted on as a way to anywhere.
  *
+ * From the same lists a node can tell the groups its neighbours fall in when they are joined by what they hear of each other and of the nodes at two hops,
+ * and which of them is its only way to some node (HealthReport): more than one group says that those neighbours would lose each other if this node
+ * went away, unless by a way longer than two hops, which it cannot see. And the lists say which neighbour to give up when the radio's table of peers is
+ * full (PeerRoleOf).
+ *
  * Messages longer than a frame: one that does not fit goes in two, each with a number of its own, the
  * second carrying the number of the first ahead of the rest, and the destination's application gets
  * the two, the second marked with the first's number, to join. A list that is longer still goes as a
@@ -396,6 +401,35 @@ struct Notice {
   uint8_t kind;                                // a NoticeKind
   uint8_t by;                                  // the node that said so, this node's own number when it found out itself
   uint32_t value;                              // of a bulk transfer, its id; the node it is about is the one that sent it
+};
+
+// A set of node numbers, one bit each
+struct IdSet {
+  uint8_t bits[32];
+  void Clear() { memset(bits, 0, sizeof(bits)); }
+  bool Has(uint8_t id) const { return ((bits[id >> 3] >> (id & 7)) & 1) != 0; }
+  void Add(uint8_t id) { bits[id >> 3] = (uint8_t)(bits[id >> 3] | (1u << (id & 7))); }
+};
+
+// What a neighbour is worth to this node as a peer of the radio's table, from the least to the most (Node::PeerRoleOf)
+enum PeerRole : uint8_t { kPeerGone = 0, kPeerWeak = 1, kPeerRedundant = 2, kPeerOnlyWay = 3 };
+
+
+// What the heartbeats of the neighbours tell a node of its surroundings, two hops deep
+struct HealthLink {
+  uint8_t id;                                  // a neighbour
+  uint8_t quality;                             // the percent of its heartbeats that came, kQualityUnknown while there are too few to say
+  uint8_t usable;                              // 1 counted on as a way, 0 heard but not counted on: it does not hear this node, or delivers too little, or is not on the radio
+  uint8_t reach;                               // the nodes at two hops that it lists
+  uint8_t only;                                // of them, the ones no other neighbour lists: this node reaches them through it alone
+  uint8_t branch;                              // the group, counted from 1, it falls in when the neighbours are joined by what they say of each other
+};
+struct Health {
+  uint8_t neighbors;                           // the usable neighbours
+  uint8_t weak;                                // the ones heard and not counted on
+  uint8_t twoHop;                              // the nodes at two hops
+  uint8_t branches;                            // the groups of usable neighbours that do not hear of each other within two hops, 0 with no neighbour
+  uint8_t soleWays;                            // the usable neighbours that are the only way this node has to some node
 };
 
 struct Config {
@@ -894,6 +928,105 @@ class Node {
     return q == kQualityUnknown || q >= kLinkGoodPercent;
   }
 
+  // What this node can say of its surroundings from the lists in its neighbours' heartbeats, which see two hops: the neighbours it counts
+  // on, how many nodes lie at two hops, and the groups the neighbours fall in when they are joined by what they list of each other and of
+  // the nodes at two hops. More than one group says that if this node went away those neighbours would lose each other unless by a way
+  // longer than this node can see: a node that is a point of failure for the network always shows more than one, and one that shows more
+  // than one is not always (a ring of five or more nodes shows two at every node). A neighbour that is the only one to list some node at
+  // two hops is this node's only way to it. `links` gets one entry for each neighbour heard on the radio, up to `max`; returns how many.
+  // Nothing here is sent: it is worked out from what the heartbeats left
+  unsigned HealthReport(Health *h, HealthLink *links, unsigned max, uint32_t now) const {
+    memset(h, 0, sizeof(*h));
+    uint8_t who[256];                          // by node number: 0 not known, 0x40 | k the k-th neighbour counted on, 0x80 | k a node at two hops that neighbour k listed first
+    memset(who, 0, sizeof(who));
+    uint8_t slot[kMaxNeighbors];               // the slot of the k-th (from 1) neighbour counted on
+    uint8_t parent[kMaxNeighbors + 1];
+    unsigned count = 0;
+    for (unsigned i = 0; i < kMaxNeighbors; i++) {
+      const Neighbor &n = nbrs_[i];
+      if (!n.used) continue;
+      if (Usable(n, now)) {
+        slot[count++] = (uint8_t)i;
+        who[n.id] = (uint8_t)(0x40 | count);
+        parent[count] = (uint8_t)count;
+      } else if (Heard(n, now)) {
+        h->weak++;
+      }
+    }
+    h->neighbors = (uint8_t)count;
+    IdSet once, twice;
+    once.Clear();
+    twice.Clear();
+    for (unsigned k = 1; k <= count; k++) {
+      const Neighbor &n = nbrs_[slot[k - 1]];
+      for (unsigned j = 0; j < n.hearsCount; j++) {
+        uint8_t t = n.hears[j];
+        if (t == 0 || t == kToAll || t == cfg_.id) continue;
+        if ((who[t] & 0xc0) == 0x40) { Join(parent, k, who[t] & 0x3f); continue; }
+        if (once.Has(t)) twice.Add(t); else once.Add(t);
+        if ((who[t] & 0xc0) == 0x80) Join(parent, k, who[t] & 0x3f);
+        else { who[t] = (uint8_t)(0x80 | k); h->twoHop++; }
+      }
+    }
+    uint8_t branchOf[kMaxNeighbors + 1];
+    memset(branchOf, 0, sizeof(branchOf));
+    for (unsigned k = 1; k <= count; k++) {
+      unsigned root = Find(parent, k);
+      if (branchOf[root] == 0) branchOf[root] = ++h->branches;
+    }
+    unsigned written = 0;
+    for (unsigned i = 0; i < kMaxNeighbors && written < max; i++) {
+      const Neighbor &n = nbrs_[i];
+      if (!n.used || !Heard(n, now)) continue;
+      HealthLink &l = links[written++];
+      l.id = n.id;
+      l.quality = LinkQuality(n, now);
+      l.usable = (who[n.id] & 0xc0) == 0x40;
+      l.reach = 0;
+      l.only = 0;
+      l.branch = 0;
+      if (!l.usable) continue;
+      for (unsigned j = 0; j < n.hearsCount; j++) {
+        uint8_t t = n.hears[j];
+        if ((who[t] & 0xc0) != 0x80) continue;
+        l.reach++;
+        if (!twice.Has(t)) l.only++;
+      }
+      l.branch = branchOf[Find(parent, who[n.id] & 0x3f)];
+      if (l.only > 0) h->soleWays++;
+    }
+    return written;
+  }
+
+  // What a neighbour is worth to this node as the peer of a radio table that is full, by its address, when one has to go: a node it does
+  // not hear, or that was declared silent (kPeerGone); one it hears and does not count on (kPeerWeak); one whose absence leaves every
+  // node at two hops listed by another (kPeerRedundant); and one that is the only neighbour to list some node at two hops (kPeerOnlyWay),
+  // which this node would have no way to without it. Of an address that is no neighbour at all, nothing is known and nothing is lost
+  uint8_t PeerRoleOf(const uint8_t mac[6], uint32_t now) const {
+    const Neighbor *peer = nullptr;
+    for (unsigned i = 0; i < kMaxNeighbors; i++) if (nbrs_[i].used && memcmp(nbrs_[i].mac, mac, 6) == 0) peer = &nbrs_[i];
+    if (peer == nullptr || !Heard(*peer, now)) return kPeerGone;
+    IdSet direct, once, twice;
+    direct.Clear();
+    once.Clear();
+    twice.Clear();
+    for (unsigned i = 0; i < kMaxNeighbors; i++) if (Heard(nbrs_[i], now)) direct.Add(nbrs_[i].id);
+    for (unsigned i = 0; i < kMaxNeighbors; i++) {
+      const Neighbor &n = nbrs_[i];
+      if (!Heard(n, now)) continue;
+      for (unsigned j = 0; j < n.hearsCount; j++) {
+        uint8_t t = n.hears[j];
+        if (t == 0 || t == kToAll || t == cfg_.id || direct.Has(t)) continue;
+        if (once.Has(t)) twice.Add(t); else once.Add(t);
+      }
+    }
+    for (unsigned j = 0; j < peer->hearsCount; j++) {
+      uint8_t t = peer->hears[j];
+      if (t != 0 && t != kToAll && t != cfg_.id && once.Has(t) && !twice.Has(t)) return kPeerOnlyWay;
+    }
+    return Usable(*peer, now) ? kPeerRedundant : kPeerWeak;
+  }
+
   // Whether the network has been told that `node` is silent, by this node or by another
   bool IsSilent(uint8_t node) const {
     for (unsigned i = 0; i < kMaxOrigins; i++) if (mutes_[i].used && mutes_[i].node == node) return true;
@@ -986,6 +1119,15 @@ class Node {
     return n.used && n.state == kAlive && n.rssi != 0 && (int32_t)(now - n.lastHeard) < (int32_t)kHeardWindowMs;
   }
 
+  // The groups of a set of neighbours, by the smallest of each: the ones that two neighbours listing each other or the same node make one
+  static unsigned Find(uint8_t *parent, unsigned k) {
+    while (parent[k] != k) { parent[k] = parent[parent[k]]; k = parent[k]; }
+    return k;
+  }
+  static void Join(uint8_t *parent, unsigned a, unsigned b) {
+    unsigned x = Find(parent, a), y = Find(parent, b);
+    if (x < y) parent[y] = (uint8_t)x; else if (y < x) parent[x] = (uint8_t)y;
+  }
 
   // A heartbeat from `id` came on the radio just now: its interval is counted, with the ones that went by without one
   void NoteBeat(uint8_t id, uint32_t now) {
