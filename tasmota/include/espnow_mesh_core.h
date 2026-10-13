@@ -47,6 +47,11 @@
  * payload, so that it holds from the origin to the destination and whoever repeats a frame
  * does not recompute it. The function that computes it belongs to the user of this file.
  *
+ * The number is also the nonce of the cipher, so a number is never used twice. The counter has 32 bits: a node whose counter passes kCounterRenew
+ * takes the next epoch and numbers from 1 again under it, as a start would, which the others learn as they learn of a start; the application keeps the
+ * epoch before it says yes (Config::renewEpoch). When it cannot have one the node goes on until the number before the last, and then it has no number to
+ * give and sends nothing, until it is started again.
+ *
  * Flooding: a frame that is not for this node alone, with hops left and a number not yet
  * heard, is repeated once. It waits first, a random time that depends on how strongly it was
  * heard (a weak one comes from far away, so this node covers more than the senders do, and
@@ -162,6 +167,8 @@ constexpr uint8_t kBeatNoRadio = 1;          // a flag of the heartbeat: the nod
 constexpr uint8_t kToAll = 255;
 constexpr uint8_t kMaxHops = 3;
 constexpr unsigned kReplayWindow = 32;
+constexpr uint32_t kCounterRenew = 0xFFFF0000u;  // past this counter a node takes the next epoch
+constexpr uint32_t kCounterLast = 0xFFFFFFFEu;   // the last number a node gives: 0xFFFFFFFF and the wrap to 0 are never used
 
 constexpr unsigned kMaxOrigins = 48;         // the origins a node keeps a window and a way back for: a network of up to 32 nodes, with room beyond
 constexpr unsigned kSeenSize = 64;           // the numbers a node remembers hearing
@@ -371,6 +378,7 @@ struct Stats {
   uint32_t udpSent, udpHeard;
   uint32_t covered, syncShed, startAsks;
   uint32_t relayHeld;
+  uint32_t counterOut, epochRenewed;
 };
 
 // How a neighbour stands: heard lately, not heard and being tried, or declared silent by this node
@@ -474,6 +482,8 @@ struct Config {
   uint16_t relayBackupMs;                      // how much longer a node that the sender did not choose waits before it repeats; 0 for the default
   uint8_t relayDropAt;                         // copies heard, the first included, that make a node that was not chosen drop its own; 0 for one more than suppressAt
   uint8_t relayMinNeighbors;                   // the neighbours counted on that a node needs to choose repeaters; 0 for the default
+  bool (*renewEpoch)(void *, uint32_t);        // asked when the counter passes kCounterRenew, with the epoch above this node's: the application keeps it, so that the next start is above it, and says yes; nullptr: yes
+  void *renewContext;
 };
 
 class Node {
@@ -510,6 +520,7 @@ class Node {
     TxItem *slot = FreeSlot();
     if (slot == nullptr) { stats_.queueFull++; return 0; }
     Frame f = Header(type, dest, next, kMaxHops, false);
+    if (f.counter == 0) return 0;
     f.payload = payload;
     f.len = len;
     if (!BuildOwn(slot, f, now)) return 0;
@@ -1080,6 +1091,11 @@ class Node {
   const Stats &stats() const { return stats_; }
   uint8_t id() const { return cfg_.id; }
   uint32_t epoch() const { return cfg_.epoch; }
+  uint32_t counter() const { return counter_; }
+
+  // Numbers the frames from `counter` on, as if the ones up to it had been sent: for an application that knows they were, and for a test of the end of the
+  // counter. Never moves it back
+  void AdvanceCounter(uint32_t counter) { if (counter > counter_) counter_ = counter; }
   unsigned queued() const { unsigned n = 0; for (unsigned i = 0; i < kTxQueue; i++) n += txq_[i].used; return n + (inflightValid_ ? 1 : 0); }
   unsigned waiting() const { unsigned n = 0; for (unsigned i = 0; i < kPendingSize; i++) n += pending_[i].used; return n; }
 
@@ -1226,7 +1242,9 @@ class Node {
     return nullptr;
   }
 
-  // The header of a frame of this node's, with the next number
+  // The header of a frame of this node's, with the next number, or with the counter 0 when there is none (the first number is 1). With the epoch the
+  // number is the nonce of the cipher and is never used twice: past kCounterRenew the node asks for the next epoch and numbers from 1 under it; when it
+  // cannot, it goes on to kCounterLast, and after that it has no number to give until it is started again
   Frame Header(Type type, uint8_t dest, uint8_t next, uint8_t hops, bool ackRequested, uint8_t part = 0) {
     Frame f;
     f.kind = PackKind(type, ackRequested, part, 0);
@@ -1234,11 +1252,24 @@ class Node {
     f.dest = dest;
     f.next = next;
     f.hops = hops;
+    if (counter_ >= kCounterRenew) RenewEpoch();
     f.epoch = cfg_.epoch;
-    f.counter = ++counter_;
+    f.counter = 0;
+    if (counter_ < kCounterLast) f.counter = ++counter_; else stats_.counterOut++;
     f.payload = nullptr;
     f.len = 0;
     return f;
+  }
+
+  // The next epoch, if the application has it kept: numbering starts again from 1
+  bool RenewEpoch() {
+    uint32_t next = cfg_.epoch + 1;
+    if (next == 0) return false;                 // there is none above this one
+    if (cfg_.renewEpoch != nullptr && !cfg_.renewEpoch(cfg_.renewContext, next)) return false;
+    cfg_.epoch = next;
+    counter_ = 0;
+    stats_.epochRenewed++;
+    return true;
   }
 
   // What fits in a frame for `dest`: a frame for one node alone loses the tag of its seal
@@ -1333,6 +1364,7 @@ class Node {
     TxItem *slot = FreeSlot();
     if (slot == nullptr) { stats_.queueFull++; return 0; }
     Frame f = Header(type, dest, 0, hops, ackRequested, part);
+    if (f.counter == 0) return 0;
     f.payload = payload;
     f.len = len;
     if (!BuildOwn(slot, f, now)) return 0;
@@ -1916,6 +1948,7 @@ class Node {
     TxItem *slot = FreeSlot();
     if (slot == nullptr) { stats_.queueFull++; return 0; }
     Frame f = Header(kBeat, to.id, to.id, 0, false);
+    if (f.counter == 0) return 0;
     f.payload = payload;
     f.len = len;
     if (!BuildOwn(slot, f, now)) return 0;
