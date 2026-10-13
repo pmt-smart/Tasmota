@@ -101,6 +101,10 @@
  * frames nobody answers are counted, and a minute of too many of them, twice running, is a noisy
  * channel, said to everyone.
  *
+ * How well a neighbour's heartbeats get here is counted as well, over the last 16 intervals (about a minute and a half): the share of them that came
+ * on the radio says how many of its frames arrive, where the signal says only how strongly the ones that do are heard. A neighbour that delivers fewer
+ * than half of them is heard, and not counted on as a way to anywhere.
+ *
  * Messages longer than a frame: one that does not fit goes in two, each with a number of its own, the
  * second carrying the number of the first ahead of the rest, and the destination's application gets
  * the two, the second marked with the first's number, to join. A list that is longer still goes as a
@@ -179,6 +183,10 @@ constexpr uint32_t kHeardWindowMs = 15000;   // the neighbours a heartbeat lists
 constexpr unsigned kProbeHelpers = 2;        // the neighbours asked to try a suspect
 constexpr uint32_t kNoiseWindowMs = 60000;   // the span the noise is counted over
 constexpr uint8_t kNoiseLimit = 35;          // the percent of what should have got through, in a window, that makes it a noisy one, when the configuration gives none
+constexpr unsigned kBeatWindow = 16;         // the heartbeat intervals the delivery of a neighbour is judged over: some minute and a half
+constexpr unsigned kLinkMinSlots = 4;        // fewer intervals than this are too few to say anything of a link
+constexpr uint8_t kLinkGoodPercent = 50;     // a neighbour that delivers fewer of its heartbeats than this is heard, but not counted on as a way
+constexpr uint8_t kQualityUnknown = 255;     // the delivery of a neighbour not yet judged
 
 enum Type : uint8_t { kCommand = 0, kAck = 1, kState = 2, kEvent = 3, kBeat = 4, kBulk = 5, kMembership = 6, kSync = 7 };
 
@@ -376,6 +384,9 @@ struct Neighbor {
   uint32_t udpAt;                              // and on the network; 0 if never
   uint32_t beatAt;                             // the last heartbeat; 0 before the first
   uint32_t suspectAt;
+  uint8_t beatSlots;                           // the heartbeat intervals the delivery below covers so far, up to kBeatWindow
+  uint16_t beatBits;                           // one bit for each, the latest the lowest: set when a heartbeat of it came on the radio in that interval
+  uint32_t beatRadioAt;                        // the last heartbeat of it that came on the radio; 0 before the first
 };
 
 // What the supervision has to tell the application
@@ -510,6 +521,8 @@ class Node {
     if (f.routed() && f.next != cfg_.id) return kIgnored;
     stats_.heard++;
     if (udp) stats_.udpHeard++;
+    // the delivery of a neighbour is judged by what came on the radio, whichever way the heartbeat was heard first
+    if (!udp && IsBeatShape(f)) NoteBeat(f.origin, now);
     // a copy of what is in hand, or of what was handled: counted for the suppression, when it came by the radio, and no more
     if (SeenBefore(f.origin, f.epoch, f.counter, f.attempt())) {
       stats_.repeated++;
@@ -587,6 +600,7 @@ class Node {
     uint8_t sender = NodeOf(src);
     if (sender == 0 && f.type() == kBeat) sender = f.origin;
     Touch(sender, src, rssi, now, udp);
+    if (!udp && IsBeatShape(f)) NoteBeat(f.origin, now);   // the first heartbeat of a neighbour made known by this frame
     if (f.origin != sender) NodeIsAlive(f.origin, now);
     if (f.type() == kBeat) {
       OnSupervision(g, sender, now);
@@ -853,6 +867,33 @@ class Node {
     return nullptr;
   }
 
+  // How well a neighbour's heartbeats get here on the radio: the percent of the last kBeatWindow intervals in which one of them came.
+  // An interval in which one is overdue counts against it, so a neighbour that has gone quiet falls as the intervals pass. The signal
+  // says how strongly a frame is heard and not how many of them are: a strong link that loses frames reads high there and low here.
+  // kQualityUnknown while fewer than kLinkMinSlots intervals have been judged, or with no heartbeats
+  uint8_t LinkQuality(const Neighbor &n, uint32_t now) const {
+    if (cfg_.beatEveryMs == 0 || n.beatRadioAt == 0) return kQualityUnknown;
+    uint32_t period = BeatPeriod();
+    uint32_t due = (now - n.beatRadioAt + period / 2) / period;
+    unsigned missed = due > 1 ? (due - 1 > kBeatWindow ? kBeatWindow : (unsigned)(due - 1)) : 0;
+    unsigned span = n.beatSlots + missed;
+    if (span > kBeatWindow) span = kBeatWindow;
+    if (span < kLinkMinSlots) return kQualityUnknown;
+    uint32_t bits = missed >= kBeatWindow ? 0 : (((uint32_t)n.beatBits << missed) & 0xffff);
+    uint32_t mask = span >= kBeatWindow ? 0xffff : (((uint32_t)1 << span) - 1);
+    uint32_t ones = 0;
+    for (uint32_t b = bits & mask; b != 0; b &= b - 1) ones++;
+    return (uint8_t)(ones * 100 / span);
+  }
+
+  // Whether this node counts on a neighbour as a way to others: heard lately on the radio, hearing this node back, and delivering enough
+  // of its heartbeats. A neighbour not yet judged is counted on
+  bool Usable(const Neighbor &n, uint32_t now) const {
+    if (!Heard(n, now) || n.listsMe == 2) return false;
+    uint8_t q = LinkQuality(n, now);
+    return q == kQualityUnknown || q >= kLinkGoodPercent;
+  }
+
   // Whether the network has been told that `node` is silent, by this node or by another
   bool IsSilent(uint8_t node) const {
     for (unsigned i = 0; i < kMaxOrigins; i++) if (mutes_[i].used && mutes_[i].node == node) return true;
@@ -936,6 +977,35 @@ class Node {
   uint8_t lossPercent_;
 
   uint8_t NodeOf(const uint8_t mac[6]) const { return cfg_.nodeOf != nullptr ? cfg_.nodeOf(cfg_.nodeContext, mac) : 0; }
+
+  // The time a heartbeat takes to come round: the interval and the middle of the draw added to it
+  uint32_t BeatPeriod() const { return cfg_.beatEveryMs + kBeatJitterMs / 2; }
+
+  // A neighbour heard on the radio lately and not under suspicion
+  bool Heard(const Neighbor &n, uint32_t now) const {
+    return n.used && n.state == kAlive && n.rssi != 0 && (int32_t)(now - n.lastHeard) < (int32_t)kHeardWindowMs;
+  }
+
+
+  // A heartbeat from `id` came on the radio just now: its interval is counted, with the ones that went by without one
+  void NoteBeat(uint8_t id, uint32_t now) {
+    Neighbor *n = FindNeighbor(id, false);
+    if (n == nullptr || n->beatRadioAt == now) return;
+    if (n->beatRadioAt == 0) {
+      n->beatBits = 1;
+      n->beatSlots = 1;
+    } else {
+      uint32_t period = BeatPeriod();
+      uint32_t k = (now - n->beatRadioAt + period / 2) / period;
+      if (k == 0) k = 1;
+      n->beatBits = k >= kBeatWindow ? 1 : (uint16_t)(((uint32_t)n->beatBits << k | 1) & 0xffff);
+      n->beatSlots = (uint8_t)(n->beatSlots + k > kBeatWindow ? kBeatWindow : n->beatSlots + k);
+    }
+    n->beatRadioAt = now;
+  }
+
+  // What a heartbeat looks like before it is opened: a frame for everyone of the supervision's type that is not repeated
+  static bool IsBeatShape(const Frame &f) { return f.type() == kBeat && f.dest == kToAll && f.hops == 0; }
 
   // Whether the neighbour at this address has said it does not hear this node: nothing sent to it would get there, so it is no way
   bool OneWay(const uint8_t mac[6]) const {
