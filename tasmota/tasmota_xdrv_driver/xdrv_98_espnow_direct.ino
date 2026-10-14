@@ -86,6 +86,16 @@
  *   - An announcing device that was paired with a third one tells it, over the
  *     link they still share, before the key changes, and that device reports
  *     Taken.
+ *   - A pairing as a guest: a scanning device that already has a pair can pair
+ *     with a window without giving that pair up. The exchange is the same, with
+ *     the request saying it is a guest, and bound into the transcript, so that
+ *     nobody can turn one into the other. Neither side saves anything: both bring
+ *     the link up on the new key, in memory only, for the rest of the pairing and
+ *     for ESPNOW_DIRECT_GUEST_MS at most, and when it ends, or the device
+ *     restarts, each is back on the record it had, which was never written over.
+ *     A window says in its announcement that it takes guests, and a device that
+ *     does not is never asked to. While a guest holds the link, the commands that
+ *     set the record answer "Guest" and change nothing.
  * With no code to compare between the two, the pairing relies on the window
  * being short and opened on purpose, and on the identification being seen: a
  * device in radio range that answers first during the window could take the
@@ -126,7 +136,11 @@
  *             "Paired":"<mac>","Epoch":<n>,
  *             "Failed":"Busy"|"NoAnswer"|"Timeout"|"NotConfirmed"|"Proof"|"Key",
  *             "Ended":"Timeout"
- *     either: "Failed":"Radio", when the WiFi Manager took the radio
+ *     either: "Failed":"Radio", when the WiFi Manager took the radio,
+ *             "Failed":"Memory", when a guest pairing found none for its record,
+ *             "Paired":"<mac>","Epoch":<n>,"Guest":1, for a pairing as a guest, which
+ *             changed no record, and "Guest":"Ended", when it is over and the record
+ *             the device had is the link's again
  *
  * Build option USE_ESPNOW_DIRECT_EVENTS_ONLY: the device takes events from its
  * peer and runs no command it receives. A command frame, however well signed,
@@ -169,7 +183,8 @@
  *   EspNowSend        - send a command line to the peer, run there on arrival
  *                       unless the peer is built with USE_ESPNOW_DIRECT_EVENTS_ONLY
  *   EspNowEvent       - send a JSON event to the peer, fed to its rule engine
- *   EspNowStatus      - report link state, session, peer and pairing
+ *   EspNowStatus      - report link state, session, peer and pairing, and whether a
+ *                       guest holds the link
  *   EspNowPing        - send a signed ping, RTT is logged when the pong lands
  *   EspNowForge       - send a deliberately mis-signed ping to check rejection
  *   EspNowReplay      - resend the previous ping to check replay rejection
@@ -185,7 +200,8 @@
  *                       away, without listening on the current one first
  *   EspNowPairHeard   - the devices the scan heard, strongest first
  *   EspNowPairBlink <id> - ask a device heard to identify itself
- *   EspNowPairWith <id> - pair with the device that identifies itself
+ *   EspNowPairWith <id>[,guest] - pair with the device that identifies itself, as a
+ *                       guest with ",guest": "No guest" when its window does not take them
  *   EspNowPairStop    - end the window or the scan, with the WiFi as it was
 \*********************************************************************************************/
 
@@ -232,6 +248,7 @@ void EspNowMeshDirectRadio(bool up);
 #define ESPNOW_DIRECT_TYPE_PAIR_PROOF  0x15
 #define ESPNOW_DIRECT_TYPE_RECORDED    0x16
 #define ESPNOW_DIRECT_TYPE_PAIR_STATUS 0x17
+#define ESPNOW_DIRECT_PAIR_BODY_MAX    81     // the most a pairing frame's body holds: PAIR_REQ's, with the byte that says it is a guest
 
 // A HELLO's payload: version(1) | challenge(4) | the peer's challenge as last
 // heard(4) | whether the sender holds the receiver's session(1). Protocol 1
@@ -257,6 +274,7 @@ struct {
   uint8_t mode;                            // EspNowPeerMode, the application's
   uint8_t spare[3];
 } EspNowDirectSettings;
+typedef decltype(EspNowDirectSettings) EspNowDirectRecord_t;
 
 struct {
   bool enabled = false;                    // requested state, see CmndEspNowEnable
@@ -329,12 +347,14 @@ static void EspNowDirectWipe(void* buffer, size_t len) {
 #ifdef USE_ESPNOW_DIRECT_PAIRING
 static bool EspNowDirectPairing(void);
 static bool EspNowDirectPairKeepsLink(void);
+static bool EspNowDirectGuesting(void);
 static void EspNowDirectPairAddBroadcast(void);
 static uint8_t EspNowDirectPairBit(uint8_t type);
 static volatile uint8_t EspNowDirectPairAccept = 0;   // the pairing frame types the receive callback takes, a bit each
 #else
 static bool EspNowDirectPairing(void) { return false; }
 static bool EspNowDirectPairKeepsLink(void) { return false; }
+static bool EspNowDirectGuesting(void) { return false; }
 #endif
 
 #ifdef USE_WIFI_STATION_CONTROL
@@ -351,7 +371,9 @@ static bool EspNowDirectWanted(void) {
  * Settings
 \*********************************************************************************************/
 
+// Nothing is written while a guest holds the link: the record in memory is the guest's, and the one in the flash is the device's own
 static void EspNowDirectSettingsSave(void) {
+  if (EspNowDirectGuesting()) { return; }
   NvmSave(ESPNOW_DIRECT_NVS_NAMESPACE, "settings", &EspNowDirectSettings, sizeof(EspNowDirectSettings));
 }
 
@@ -619,7 +641,7 @@ void EspNowDirectRecvCb(const esp_now_recv_info_t* info, const uint8_t* frame, i
   // sender, for the main loop to check: version | to | body.
   uint8_t bit = EspNowDirectPairBit(frame[0]);
   if (bit) {
-    if ((EspNowDirectPairAccept & bit) && (len >= 8) && (len <= 8 + 80)) {
+    if ((EspNowDirectPairAccept & bit) && (len >= 8) && (len <= 8 + ESPNOW_DIRECT_PAIR_BODY_MAX)) {
       EspNowDirectQueueFrom(frame[0], info, &frame[1], len - 1);
     }
     return;
@@ -1062,7 +1084,7 @@ static void EspNowDirectEverySecond(void) {
  *   ANNOUNCE     window -> all      flags(1) | channel(1) | zigbee(1) | key(32) | name(0..32)
  *   BLINK        scan -> window     window key(32)
  *   PAIR_STATUS  window -> scan     window key(32) | code(1)
- *   PAIR_REQ     scan -> window     window key(32) | scan key(32) | scan nonce(16)
+ *   PAIR_REQ     scan -> window     window key(32) | scan key(32) | scan nonce(16) | guest(1, only from a guest)
  *   PAIR_ACK     window -> scan     window nonce(16) | window proof(16)
  *   PAIR_PROOF   scan -> window     scan proof(16)
  *   RECORDED     window -> scan     recorded proof(16)
@@ -1075,7 +1097,7 @@ static void EspNowDirectEverySecond(void) {
  * The keys come from the X25519 result Z and the exchange's transcript T, by
  * HKDF (RFC 5869) over HMAC-SHA256, with the two nonces as its salt:
  *   T   = version | scan address | window address | scan key | window key |
- *         scan nonce | window nonce
+ *         scan nonce | window nonce, the version byte with 0x80 added for a guest
  *   PRK = HMAC(scan nonce | window nonce, Z)
  *   the confirmation key = HMAC(PRK, "ESP-NOW direct confirm" | 1)
  *   the pair's key       = HMAC(PRK, "ESP-NOW direct key" | T | 1)
@@ -1085,7 +1107,6 @@ static void EspNowDirectEverySecond(void) {
 \*********************************************************************************************/
 
 #define ESPNOW_DIRECT_PAIR_HEADER      8      // type | version | to
-#define ESPNOW_DIRECT_PAIR_BODY_MAX    80     // PAIR_REQ's
 #define ESPNOW_DIRECT_NONCE_SIZE       16
 #define ESPNOW_DIRECT_PROOF_SIZE       16
 #define ESPNOW_DIRECT_TRANSCRIPT_SIZE  109    // 1 + 6 + 6 + 32 + 32 + 16 + 16
@@ -1102,9 +1123,12 @@ static void EspNowDirectEverySecond(void) {
 #define ESPNOW_DIRECT_RECONFIRM_MS     30000  // the window repeats its confirmation this long
 #define ESPNOW_DIRECT_RECORDED_EVERY_MS 1000
 #define ESPNOW_DIRECT_LINGER_MS        120000 // a scan that is over, or paired, ends this long after
+#define ESPNOW_DIRECT_GUEST_MS         45000  // a guest holds the link this long at most: the pair it leaves alone is quiet meanwhile, and silent for 65 s starts over
 
 #define ESPNOW_DIRECT_ANNOUNCE_NETWORK 0x01   // the window is on an access point
 #define ESPNOW_DIRECT_ANNOUNCE_BUSY    0x02   // the window is in a session with a device
+#define ESPNOW_DIRECT_ANNOUNCE_GUEST   0x04   // the window takes a guest: a pairing that leaves the device's own record alone
+#define ESPNOW_DIRECT_REQUEST_GUEST    0x01   // PAIR_REQ's last byte, from a guest
 #define ESPNOW_DIRECT_STATUS_OK        0      // the window identifies itself
 #define ESPNOW_DIRECT_STATUS_BUSY      1      // the window is in a session with another device
 
@@ -1142,6 +1166,7 @@ typedef struct {
   bool blinking;                           // the device picked said it identifies itself
   bool saved;                              // the window saved the session's pairing
   bool told;                               // the window told the device paired before
+  bool guest;                              // the session is a guest's: nothing is saved, on either side
   uint8_t tries;
   uint8_t zigbee;                          // what the window announces
   uint8_t sweep;                           // the channel a sweep listens on, 0 before it starts
@@ -1295,7 +1320,7 @@ static bool EspNowDirectPairDerive(const uint8_t* scan_mac, const uint8_t* windo
                                    const uint8_t* scan_nonce, const uint8_t* window_nonce, const uint8_t* other_key) {
   EspNowDirectPair_t* p = EspNowPair;
   uint8_t* t = p->transcript;
-  t[0] = ESPNOW_DIRECT_PROTOCOL;
+  t[0] = ESPNOW_DIRECT_PROTOCOL | (p->guest ? 0x80 : 0);
   memcpy(&t[1], scan_mac, 6);
   memcpy(&t[7], window_mac, 6);
   memcpy(&t[13], scan_key, 32);
@@ -1331,6 +1356,7 @@ static void EspNowDirectPairForget(void) {
   p->blinking = false;
   p->saved = false;
   p->told = false;
+  p->guest = false;
   EspNowDirectWipe(p->other_public, sizeof(p->other_public));
   EspNowDirectWipe(p->other_nonce, sizeof(p->other_nonce));
   EspNowDirectWipe(p->transcript, sizeof(p->transcript));
@@ -1388,6 +1414,59 @@ static void EspNowDirectPairSave(const uint8_t* mac) {
   XdrvRulesProcess(0);
 }
 
+// What a guest holds: the record the device had, kept while the link runs on the exchange's key, and when to give the link back. On the heap only while a guest
+// holds the link.
+typedef struct {
+  EspNowDirectRecord_t saved;
+  uint32_t until;
+} EspNowDirectGuest_t;
+
+static EspNowDirectGuest_t* EspNowDirectGuest = nullptr;
+
+static bool EspNowDirectGuesting(void) {
+  return (nullptr != EspNowDirectGuest);
+}
+
+// The pairing as a guest, once both sides have proved the exchange: the link comes up on its key as in EspNowDirectPairSave, in memory only. The record the device had is
+// kept to put back, and nothing is written to the flash, now or by anything that runs while the guest holds the link. False when there was no memory for it.
+static bool EspNowDirectGuestApply(const uint8_t* mac) {
+  EspNowDirectGuest_t* guest = (EspNowDirectGuest_t*)calloc(1, sizeof(EspNowDirectGuest_t));
+  if (!guest) { return false; }
+  EspNowDirectStop();
+  guest->saved = EspNowDirectSettings;
+  guest->until = millis() + ESPNOW_DIRECT_GUEST_MS;
+  EspNowDirectGuest = guest;
+  memcpy(EspNowDirectSettings.peer_mac, mac, 6);
+  memcpy(EspNowDirectSettings.key, EspNowPair->link_key, ESPNOW_DIRECT_KEY_SIZE);
+  EspNowDirectSettings.key_len = ESPNOW_DIRECT_KEY_SIZE;
+  EspNowDirectSettings.mode = 0;
+  EspNowDirectSettings.config = 0;
+  EspNowPair->recorded = true;
+  EspNowDirectStart();
+
+  char text[18];
+  EspNowDirectMacText(mac, text);
+  AddLog(LOG_LEVEL_INFO, PSTR("ENW: Paired with %s as a guest"), text);
+  Response_P(PSTR("{\"EspNowPair\":{\"Paired\":\"%s\",\"Epoch\":%u,\"Guest\":1}}"), text, EspNowDirectSettings.epoch);
+  XdrvRulesProcess(0);
+  return true;
+}
+
+// The guest's link goes, and the record the device had is the link's again: the guest's key is wiped. The link of that record starts at once when `restart`, and
+// otherwise by the usual rules, once the pairing is over.
+static void EspNowDirectGuestEnd(bool restart) {
+  if (!EspNowDirectGuest) { return; }
+  EspNowDirectStop();
+  EspNowDirectSettings = EspNowDirectGuest->saved;
+  EspNowDirectWipe(EspNowDirectGuest, sizeof(EspNowDirectGuest_t));
+  free(EspNowDirectGuest);
+  EspNowDirectGuest = nullptr;
+  if (EspNowPair) { EspNowPair->recorded = false; }
+  AddLog(LOG_LEVEL_INFO, PSTR("ENW: Guest over, the link is the record's again"));
+  EspNowDirectPairReport(PSTR("Guest"), PSTR("Ended"));
+  if (restart && EspNowDirectWanted() && EspNowDirectConfigured()) { EspNowDirectStart(); }
+}
+
 // Starts a pairing, a window or a scan: the radio claimed, ESP-NOW up with its
 // broadcast entry, and the state on the heap. False when something above a
 // pairing has the radio, or with no memory for it.
@@ -1412,6 +1491,7 @@ static bool EspNowDirectPairBegin(bool window) {
 // is enabled, and follows the station again.
 static void EspNowDirectPairEnd(void) {
   if (!EspNowPair) { return; }
+  EspNowDirectGuestEnd(false);
   EspNowDirectPairAccept = 0;
   if (EspNowDirect.radio) { esp_now_del_peer(EspNowDirectBroadcast); }
   EspNowDirectWipe(EspNowPair, sizeof(EspNowDirectPair_t));
@@ -1436,7 +1516,7 @@ static void EspNowDirectAnnounce(void) {
   uint8_t body[3 + 32 + ESPNOW_DIRECT_NAME_SIZE];
   uint8_t sta;
   body[0] = (EspNowDirectStationChannel(&sta) ? ESPNOW_DIRECT_ANNOUNCE_NETWORK : 0) |
-            ((ESPNOW_PAIR_WINDOW != p->phase) ? ESPNOW_DIRECT_ANNOUNCE_BUSY : 0);
+            ((ESPNOW_PAIR_WINDOW != p->phase) ? ESPNOW_DIRECT_ANNOUNCE_BUSY : 0) | ESPNOW_DIRECT_ANNOUNCE_GUEST;
   body[1] = EspNowDirectRadioChannel();
   body[2] = p->zigbee;
   memcpy(&body[3], p->own_public, 32);
@@ -1516,16 +1596,20 @@ static void EspNowDirectWindowReceive(const EspNowDirectRxItem_t* item) {
   }
 
   if (ESPNOW_DIRECT_TYPE_PAIR_REQ == item->type) {
-    if ((32 + 32 + ESPNOW_DIRECT_NONCE_SIZE != len) || (ESPNOW_PAIR_SESSION != p->phase)) { return; }
+    // The request of a guest has one byte more, which says so; any other length is not a request
+    const size_t plain = 32 + 32 + ESPNOW_DIRECT_NONCE_SIZE;
+    if (((plain != len) && (plain + 1 != len)) || (ESPNOW_PAIR_SESSION != p->phase)) { return; }
+    bool guest = (plain + 1 == len) && (body[plain] & ESPNOW_DIRECT_REQUEST_GUEST);
     if (p->exchanged) {
       // One exchange per identification; the same request again lost its answer
-      if (!memcmp(&body[32], p->other_public, 32) && !memcmp(&body[64], p->other_nonce, ESPNOW_DIRECT_NONCE_SIZE)) {
+      if ((guest == p->guest) && !memcmp(&body[32], p->other_public, 32) && !memcmp(&body[64], p->other_nonce, ESPNOW_DIRECT_NONCE_SIZE)) {
         EspNowDirectPairSend(ESPNOW_DIRECT_TYPE_PAIR_ACK, p->other_mac, p->ack, sizeof(p->ack));
       }
       return;
     }
     memcpy(p->other_public, &body[32], 32);
     memcpy(p->other_nonce, &body[64], ESPNOW_DIRECT_NONCE_SIZE);
+    p->guest = guest;
     esp_fill_random(p->own_nonce, ESPNOW_DIRECT_NONCE_SIZE);
     if (!EspNowDirectPairDerive(p->other_mac, own, p->other_public, p->own_public, p->other_nonce, p->own_nonce, p->other_public)) {
       AddLog(LOG_LEVEL_INFO, PSTR("ENW: Pairing refused, no key from the device's"));
@@ -1560,6 +1644,9 @@ static void EspNowDirectWindowReceive(const EspNowDirectRxItem_t* item) {
 static void EspNowDirectWindowTick(void) {
   EspNowDirectPair_t* p = EspNowPair;
 
+  // A guest holds the link for a while and gives it back: the window goes on announcing
+  if (EspNowDirectGuest && TimeReached(EspNowDirectGuest->until)) { EspNowDirectGuestEnd(true); }
+
   if ((ESPNOW_PAIR_SESSION == p->phase) && TimeReached(p->session_until)) {
     AddLog(LOG_LEVEL_INFO, PSTR("ENW: Pairing session timed out"));
     EspNowDirectPairReport(PSTR("Failed"), PSTR("Timeout"));
@@ -1569,13 +1656,23 @@ static void EspNowDirectWindowTick(void) {
   if (ESPNOW_PAIR_RECORDED == p->phase) {
     if (!p->saved) {
       // The device paired before learns it was replaced, over the link it still
-      // has, and the frame leaves before that link goes, at the next tick
-      if (!p->told && EspNowDirect.active && EspNowDirect.peer_known && memcmp(EspNowDirectSettings.peer_mac, p->other_mac, 6)) {
+      // has, and the frame leaves before that link goes, at the next tick. A guest
+      // replaces nobody
+      if (!p->guest && !p->told && EspNowDirect.active && EspNowDirect.peer_known && memcmp(EspNowDirectSettings.peer_mac, p->other_mac, 6)) {
         EspNowDirectSend(ESPNOW_DIRECT_TYPE_TAKEN, nullptr, 0);
         p->told = true;
         return;
       }
-      EspNowDirectPairSave(p->other_mac);
+      if (p->guest) {
+        if (!EspNowDirectGuestApply(p->other_mac)) {
+          AddLog(LOG_LEVEL_INFO, PSTR("ENW: Pairing as a guest refused, no memory for it"));
+          EspNowDirectPairReport(PSTR("Failed"), PSTR("Memory"));
+          EspNowDirectWindowFree();
+          return;
+        }
+      } else {
+        EspNowDirectPairSave(p->other_mac);
+      }
       p->saved = true;
       p->session_until = millis() + ESPNOW_DIRECT_RECONFIRM_MS;
       p->next = millis();
@@ -1722,9 +1819,10 @@ static void EspNowDirectHeard(const EspNowDirectRxItem_t* item) {
     AddLog(LOG_LEVEL_INFO, PSTR("ENW: Heard %s on channel %d"), text, h->channel);
   }
   Response_P(PSTR("{\"EspNowPair\":{\"Heard\":{\"Id\":%u,\"Mac\":\"%s\",\"Rssi\":%d,\"Channel\":%u,\"Version\":%u,"
-                  "\"Name\":\"%s\",\"Zigbee\":%u,\"Network\":%u,\"Busy\":%u}}}"),
+                  "\"Name\":\"%s\",\"Zigbee\":%u,\"Network\":%u,\"Busy\":%u,\"Guest\":%u}}}"),
     (uint32_t)(h - p->heard) + 1, text, h->rssi, h->channel, h->version, h->name, h->zigbee,
-    (h->flags & ESPNOW_DIRECT_ANNOUNCE_NETWORK) ? 1 : 0, (h->flags & ESPNOW_DIRECT_ANNOUNCE_BUSY) ? 1 : 0);
+    (h->flags & ESPNOW_DIRECT_ANNOUNCE_NETWORK) ? 1 : 0, (h->flags & ESPNOW_DIRECT_ANNOUNCE_BUSY) ? 1 : 0,
+    (h->flags & ESPNOW_DIRECT_ANNOUNCE_GUEST) ? 1 : 0);
   XdrvRulesProcess(0);
 }
 
@@ -1781,9 +1879,16 @@ static void EspNowDirectScanReceive(const EspNowDirectRxItem_t* item) {
     case ESPNOW_DIRECT_TYPE_RECORDED:
       if ((ESPNOW_PAIR_CONFIRM != p->phase) || (ESPNOW_DIRECT_PROOF_SIZE != len)) { return; }
       if (!EspNowDirectEqual(p->recorded_proof, body, ESPNOW_DIRECT_PROOF_SIZE)) { return; }   // the right one may still come
-      EspNowDirectPairSave(h->mac);
+      if (p->guest) {
+        if (!EspNowDirectGuestApply(h->mac)) {
+          EspNowDirectScanFailed(PSTR("Memory"));
+          return;
+        }
+      } else {
+        EspNowDirectPairSave(h->mac);
+      }
       EspNowDirectPairPhase(ESPNOW_PAIR_PAIRED);
-      p->linger_until = millis() + ESPNOW_DIRECT_LINGER_MS;
+      p->linger_until = millis() + (p->guest ? ESPNOW_DIRECT_GUEST_MS : ESPNOW_DIRECT_LINGER_MS);
       return;
   }
 }
@@ -1804,11 +1909,13 @@ static void EspNowDirectScanAsk(void) {
     EspNowDirectPairSend(ESPNOW_DIRECT_TYPE_BLINK, h->mac, h->key, 32);
     return;
   }
-  uint8_t body[32 + 32 + ESPNOW_DIRECT_NONCE_SIZE];
+  uint8_t body[32 + 32 + ESPNOW_DIRECT_NONCE_SIZE + 1];
   memcpy(body, h->key, 32);
   memcpy(&body[32], p->own_public, 32);
   memcpy(&body[64], p->own_nonce, ESPNOW_DIRECT_NONCE_SIZE);
-  EspNowDirectPairSend(ESPNOW_DIRECT_TYPE_PAIR_REQ, h->mac, body, sizeof(body));
+  body[64 + ESPNOW_DIRECT_NONCE_SIZE] = ESPNOW_DIRECT_REQUEST_GUEST;
+  // only a guest's request carries the byte that says so, which a window of an earlier build would not take
+  EspNowDirectPairSend(ESPNOW_DIRECT_TYPE_PAIR_REQ, h->mac, body, p->guest ? sizeof(body) : sizeof(body) - 1);
 }
 
 static void EspNowDirectScanTick(void) {
@@ -1906,6 +2013,12 @@ static void EspNowDirectPairTick(void) {
   if (EspNowPair->window) {
     EspNowDirectWindowTick();
   } else {
+    // A guest holds the link until the pairing ends, and for ESPNOW_DIRECT_GUEST_MS at most
+    if (EspNowDirectGuest && TimeReached(EspNowDirectGuest->until)) {
+      EspNowDirectPairReport(PSTR("Ended"), PSTR("Timeout"));
+      EspNowDirectPairEnd();
+      return;
+    }
     EspNowDirectScanTick();
   }
 }
@@ -1991,9 +2104,10 @@ void CmndEspNowPairHeard(void) {
       char text[18];
       EspNowDirectMacText(h->mac, text);
       ResponseAppend_P(PSTR("%s{\"Id\":%u,\"Mac\":\"%s\",\"Rssi\":%d,\"Channel\":%u,\"Version\":%u,\"Name\":\"%s\","
-                            "\"Zigbee\":%u,\"Network\":%u,\"Busy\":%u}"),
+                            "\"Zigbee\":%u,\"Network\":%u,\"Busy\":%u,\"Guest\":%u}"),
         i ? "," : "", order[i] + 1, text, h->rssi, h->channel, h->version, h->name, h->zigbee,
-        (h->flags & ESPNOW_DIRECT_ANNOUNCE_NETWORK) ? 1 : 0, (h->flags & ESPNOW_DIRECT_ANNOUNCE_BUSY) ? 1 : 0);
+        (h->flags & ESPNOW_DIRECT_ANNOUNCE_NETWORK) ? 1 : 0, (h->flags & ESPNOW_DIRECT_ANNOUNCE_BUSY) ? 1 : 0,
+        (h->flags & ESPNOW_DIRECT_ANNOUNCE_GUEST) ? 1 : 0);
     }
   }
   ResponseAppend_P(PSTR("]}"));
@@ -2030,14 +2144,30 @@ void CmndEspNowPairBlink(void) {
 
 void CmndEspNowPairWith(void) {
   EspNowDirectPair_t* p = EspNowPair;
-  if (!p || p->window || (ESPNOW_PAIR_BLINK != p->phase) || (XdrvMailbox.payload != p->chosen + 1)) {
+  uint32_t id = strtoul(XdrvMailbox.data, nullptr, 10);
+  if (!p || p->window || (ESPNOW_PAIR_BLINK != p->phase) || (id != (uint32_t)p->chosen + 1)) {
     ResponseCmndChar_P(PSTR("Blink first"));
+    return;
+  }
+  // ",guest": the pairing leaves this device's own record alone, with a window that says it takes one
+  bool guest = false;
+  const char* comma = strchr(XdrvMailbox.data, ',');
+  if (comma) {
+    if (strcasecmp(comma + 1, "guest")) {
+      ResponseCmndError();
+      return;
+    }
+    guest = true;
+  }
+  if (guest && !(p->heard[p->chosen].flags & ESPNOW_DIRECT_ANNOUNCE_GUEST)) {
+    ResponseCmndChar_P(PSTR("No guest"));
     return;
   }
   if (!EspNowDirectKeyPair(p->own_secret, p->own_public)) {
     ResponseCmndError();
     return;
   }
+  p->guest = guest;
   esp_fill_random(p->own_nonce, ESPNOW_DIRECT_NONCE_SIZE);
   p->tries = 0;
   p->next = millis();
@@ -2212,6 +2342,13 @@ void CmndEspNowEnable(void) {
   ResponseCmndStateText(EspNowDirect.active);
 }
 
+// While a guest holds the link, the record in memory is the guest's: nothing that would set the device's own is taken, and answers "Guest"
+static bool EspNowDirectGuestHolds(void) {
+  if (!EspNowDirectGuesting()) { return false; }
+  ResponseCmndChar_P(PSTR("Guest"));
+  return true;
+}
+
 // Restarts the link so a settings change takes effect without a reboot.
 static void EspNowDirectReload(void) {
   EspNowDirectSettingsSave();
@@ -2223,6 +2360,7 @@ static void EspNowDirectReload(void) {
 
 void CmndEspNowPeerMac(void) {
   if (XdrvMailbox.data_len > 0) {
+    if (EspNowDirectGuestHolds()) { return; }
     unsigned int mac[6];
     if (6 != sscanf(XdrvMailbox.data, "%x:%x:%x:%x:%x:%x", &mac[0], &mac[1], &mac[2], &mac[3], &mac[4], &mac[5])) {
       ResponseCmndError();
@@ -2244,6 +2382,7 @@ void CmndEspNowPeerMac(void) {
 void CmndEspNowSecret(void) {
   bool show_asterisk = (2 == XdrvMailbox.index);
   if (XdrvMailbox.data_len > 0) {
+    if (EspNowDirectGuestHolds()) { return; }
     uint32_t len = XdrvMailbox.data_len;
     if (len > ESPNOW_DIRECT_KEY_SIZE) { len = ESPNOW_DIRECT_KEY_SIZE; }
     memset(EspNowDirectSettings.key, 0, ESPNOW_DIRECT_KEY_SIZE);
@@ -2261,6 +2400,7 @@ void CmndEspNowSecret(void) {
 
 void CmndEspNowChannel(void) {
   if ((XdrvMailbox.payload >= 0) && (XdrvMailbox.payload <= 13)) {
+    if (EspNowDirectGuestHolds()) { return; }
     EspNowDirectSettings.channel = XdrvMailbox.payload;
     EspNowDirectReload();
   }
@@ -2270,6 +2410,7 @@ void CmndEspNowChannel(void) {
 // Kept with the pairing for the application, which the link itself does not read
 void CmndEspNowPeerMode(void) {
   if ((XdrvMailbox.data_len > 0) && (XdrvMailbox.payload >= 0) && (XdrvMailbox.payload <= 255)) {
+    if (EspNowDirectGuestHolds()) { return; }
     EspNowDirectSettings.mode = XdrvMailbox.payload;
     EspNowDirectSettingsSave();
   }
@@ -2278,6 +2419,7 @@ void CmndEspNowPeerMode(void) {
 
 void CmndEspNowPeerConfig(void) {
   if (XdrvMailbox.data_len > 0) {
+    if (EspNowDirectGuestHolds()) { return; }
     EspNowDirectSettings.config = strtoul(XdrvMailbox.data, nullptr, 0);
     EspNowDirectSettingsSave();
   }
@@ -2461,13 +2603,14 @@ void CmndEspNowStatus(void) {
   Response_P(PSTR("{\"EspNowStatus\":{\"Active\":%d,\"Peer\":\"%s\",\"Channel\":%d,\"OnChannel\":%d,\"SecretSet\":%d,"
                   "\"Session\":\"%08X\",\"Sent\":%u,\"PeerKnown\":%d,\"PeerSession\":\"%08X\",\"PeerCounter\":%u,"
                   "\"Quiet\":%d,\"Rssi\":%d,"
-                  "\"Version\":%u,\"PeerVersion\":%u,\"Epoch\":%u,\"Mode\":%u,\"Config\":%u,\"Pairing\":\"%s\",\"MaxPayload\":%u}}"),
+                  "\"Version\":%u,\"PeerVersion\":%u,\"Epoch\":%u,\"Mode\":%u,\"Config\":%u,\"Pairing\":\"%s\",\"MaxPayload\":%u,\"Guest\":%d}}"),
     EspNowDirect.active, mac_text, EspNowDirectSettings.channel, EspNowDirect.applied_channel,
     (EspNowDirectSettings.key_len > 0), EspNowDirect.session_id,
     EspNowDirect.tx_counter, EspNowDirect.peer_known, EspNowDirect.peer_session, EspNowDirect.peer_counter,
     heard ? TimePassedSince(EspNowDirect.last_heard) / 1000 : -1, heard ? EspNowDirect.peer_rssi : 0,
     ESPNOW_DIRECT_PROTOCOL, EspNowDirect.peer_version,
-    EspNowDirectSettings.epoch, EspNowDirectSettings.mode, EspNowDirectSettings.config, pairing, ESPNOW_DIRECT_MAX_PAYLOAD);
+    EspNowDirectSettings.epoch, EspNowDirectSettings.mode, EspNowDirectSettings.config, pairing, ESPNOW_DIRECT_MAX_PAYLOAD,
+    EspNowDirectGuesting() ? 1 : 0);
 }
 
 static uint8_t EspNowDirectLastPing[ESPNOW_DIRECT_OVERHEAD + 4];   // kept for EspNowReplay
