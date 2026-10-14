@@ -1965,7 +1965,9 @@ void CmndEspNowMeshStatus(void) {
   wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
   esp_wifi_get_channel(&channel, &second);
   esp_now_peer_num_t peers = {0, 0};
-  esp_now_get_peer_num(&peers);
+  // ESP-NOW is asked only while it is up: its peer count reads a state that is not there before esp_now_init nor after
+  // esp_now_deinit (a load from a null pointer), and the direct link takes ESP-NOW down and up again by its own commands
+  if (EspNowMeshDriver.radio && !EspNowMeshDriver.radio_lost && EspNowMeshRadioReady()) { esp_now_get_peer_num(&peers); }
   Response_P(PSTR("{\"EspNowMeshStatus\":{\"Running\":%u,\"Id\":%u,\"Epoch\":%u,\"Mac\":\"%s\",\"Channel\":%u,\"Group\":%u,\"GroupVersion\":%u,\"PrevVersion\":%u,\"PrevHours\":%u,\"Network\":%u,\"Radio\":%u,\"Ready\":%u,\"Dropped\":%u,\"Peers\":%d,\"Heap\":%u"),
     EspNowMeshDriver.running, EspNowMeshSettings.id, EspNowMeshSettings.epoch, mac, channel, EspNowMeshSettings.has_group, EspNowMeshSettings.group_version,
     EspNowMeshSettings.has_prev ? EspNowMeshSettings.prev_version : 0, EspNowMeshSettings.prev_hours,
