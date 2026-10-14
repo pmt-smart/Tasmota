@@ -200,12 +200,6 @@ class Tasmota
     return keys_u
   end
 
-  # Whether a rule can match an event whose top level keys are `keys_u` (keys_upper): one that starts with a key needs it there
-  def may_match(rule_matcher, keys_u)
-    var key_u = rule_matcher.key_u
-    return key_u == nil || keys_u == nil || keys_u.contains(key_u)
-  end
-
   # Rules trigger if match. return true if match, false if not
   #
   # event: native Berry map representing the JSON input
@@ -246,7 +240,9 @@ class Tasmota
         var i = 0
         while i < size(self._rules)
           var tr = self._rules[i]
-          var rule_fired = self.may_match(tr.trig, keys_u) && self.try_rule(ev, tr.trig, tr.f)
+          # a rule that starts with a key can only match an event that has it at its top level (Rule_Matcher.key_u)
+          var key_u = tr.trig.key_u
+          var rule_fired = (key_u == nil || keys_u == nil || keys_u.contains(key_u)) && self.try_rule(ev, tr.trig, tr.f)
           ret = ret || rule_fired              # 'or' with result
           if rule_fired && (tr.o == true)
             # this rule should be run_once(d) so remove it
@@ -284,7 +280,8 @@ class Tasmota
       var i = 0
       while i < size(self._rules)
         var tr = self._rules[i]
-        if self.may_match(tr.trig, keys_u)
+        var key_u = tr.trig.key_u
+        if key_u == nil || keys_u.contains(key_u)
           ret = self.try_rule(ev,tr.trig,tr.f) || ret  #- call should be first to avoid evaluation shortcut -#
         end
         i += 1
