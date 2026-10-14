@@ -160,9 +160,12 @@ class Rule_Matcher
 
   static class Rule_Matcher_Key
     var name                                # literal name of what to match
+    var name_u                              # the same in upper case, made once
 
     def init(name)
+      import string
       self.name = name
+      self.name_u = string.toupper(str(name))
     end
 
     # find a key in map, case insensitive, return actual key or nil if not found
@@ -178,12 +181,21 @@ class Rule_Matcher
       end
     end
 
+    # Every rule tries every event, so this runs for each rule on each event. The key as written is looked up first, which is
+    # the common case and allocates nothing; the case insensitive search then upper-cases only the keys of the same length
     def match(val)
       if val == nil                 return nil end        # safeguard
       if !isinstance(val, map)      return nil end        # literal name can only match a map key
-      var k = self.find_key_i(val, self.name)
-      if k == nil             return nil end        # no key with value self.name
-      return val[k]
+      if val.contains(self.name)    return val[self.name] end
+      import string
+      var n = size(self.name_u)
+      for k: val.keys()
+        var ks = str(k)
+        if size(ks) == n && string.toupper(ks) == self.name_u
+          return val[k]
+        end
+      end
+      return nil                                          # no key with value self.name
     end
 
     def tostring()
