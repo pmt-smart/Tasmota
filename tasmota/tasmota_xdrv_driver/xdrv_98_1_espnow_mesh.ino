@@ -106,6 +106,9 @@
  *                                changes it: the key it had is kept as the previous key (see below), and the version has to be another. A second change
  *                                while the first is open is refused, unless <revoke> is 1: a node was struck off with it
  *   EspNowMeshKeyClose         - the change of the key is closed: the previous key is forgotten, in RAM and in flash
+ *   EspNowMeshLeave 1          - the device leaves the network it was in: its number, the network's key and the previous one, and the nodes
+ *                                it knew are forgotten and the mesh stops, in RAM and in flash; its identity and its epoch stay. Bare, it
+ *                                says "1 to leave"
  *   EspNowMeshNode <id>,<mac>,<public key, 64 hex>[,<ip>] - a node of the network; <id>,0 forgets it; bare lists
  *   EspNowMeshPublic           - this device's public key
  *   EspNowMeshNetwork <bits>   - 1 also by the network (UDP), 2 no radio in use, 4 repeat on the network for the nodes with none
@@ -1758,6 +1761,28 @@ void CmndEspNowMeshKeyClose(void) {
   Response_P(PSTR("{\"%s\":{\"Closed\":%u}}"), XdrvMailbox.command, was ? 1 : 0);
 }
 
+// The device leaves the network it was in: the number, the network's key and the one before it, and the nodes it knew go, and the mesh
+// stops. The identity stays, and so does the epoch, which only rises: the device is a new one to a network, which can give it a number
+// and a key again, and nothing it sends after is taken for what it sent before
+void CmndEspNowMeshLeave(void) {
+  if (1 != XdrvMailbox.payload) { ResponseCmndChar_P(PSTR("1 to leave")); return; }
+  EspNowMeshStop();
+  EspNowMeshSettings.enabled = 0;
+  EspNowMeshSettings.id = 0;
+  EspNowMeshWipe(EspNowMeshSettings.group_key, sizeof(EspNowMeshSettings.group_key));
+  EspNowMeshSettings.has_group = 0;
+  EspNowMeshSettings.group_version = 0;
+  EspNowMeshWipe(EspNowMeshSettings.prev_key, sizeof(EspNowMeshSettings.prev_key));
+  EspNowMeshSettings.has_prev = 0;
+  EspNowMeshSettings.prev_version = 0;
+  EspNowMeshSettings.prev_hours = 0;
+  EspNowMeshDriver.prev_seconds = 0;
+  EspNowMeshWipe(EspNowMeshSettings.node, sizeof(EspNowMeshSettings.node));
+  if (!EspNowMeshSettingsCommit()) { ResponseCmndChar_P(PSTR("flash write failed")); return; }
+  EspNowMeshPushShared();
+  ResponseCmndDone();
+}
+
 void CmndEspNowMeshNode(void) {
   if (!XdrvMailbox.data_len) {
     char mac[18];
@@ -2456,11 +2481,11 @@ static void EspNowMeshBerryCheck(void) {
 
 const char kEspNowMeshCommands[] PROGMEM = "|"
   "EspNowMeshEnable|EspNowMeshId|EspNowMeshChannel|EspNowMeshGroupKey|EspNowMeshNode|EspNowMeshPublic|EspNowMeshNetwork|"
-  "EspNowMeshInfo|EspNowMeshSend|EspNowMeshStatus|EspNowMeshNeighbors|EspNowMeshReady|EspNowMeshStats|EspNowMeshHealth|EspNowMeshClock|EspNowMeshKeyClose";
+  "EspNowMeshInfo|EspNowMeshSend|EspNowMeshStatus|EspNowMeshNeighbors|EspNowMeshReady|EspNowMeshStats|EspNowMeshHealth|EspNowMeshClock|EspNowMeshKeyClose|EspNowMeshLeave";
 void (* const kEspNowMeshCommand[])(void) PROGMEM = {
   &CmndEspNowMeshEnable, &CmndEspNowMeshId, &CmndEspNowMeshChannel, &CmndEspNowMeshGroupKey, &CmndEspNowMeshNode, &CmndEspNowMeshPublic,
   &CmndEspNowMeshNetwork, &CmndEspNowMeshInfo, &CmndEspNowMeshSend, &CmndEspNowMeshStatus, &CmndEspNowMeshNeighbors, &CmndEspNowMeshReady, &CmndEspNowMeshStats, &CmndEspNowMeshHealth,
-  &CmndEspNowMeshClock, &CmndEspNowMeshKeyClose };
+  &CmndEspNowMeshClock, &CmndEspNowMeshKeyClose, &CmndEspNowMeshLeave };
 
 /*********************************************************************************************\
  * Interface
