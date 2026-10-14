@@ -95,6 +95,7 @@ assert(m.match({'aa':{'power':[1.2,1.5,2.5]}}) == 1.2)
 
 class Rule_Matcher
   var key_u                                 # the key, in upper case, an event must have at its top level to match, or nil (see init)
+  var keys                                  # the names of a pattern made only of keys, in order, or nil: tasmota._match_keys walks them
   
   # We don't actually need a superclass, just implementing `match(val)`
   #
@@ -335,6 +336,18 @@ class Rule_Matcher
     # those alone. One that starts with a wildcard, an index or an operator, or a list of patterns, can match any event
     var m = (matchers != nil && size(matchers) > 0) ? matchers[0] : nil
     self.key_u = (m != nil && classname(m) == "Rule_Matcher_Key") ? m.name_u : nil
+    # A pattern made only of keys is matched by one native call for all its levels, and not by a matcher per level
+    var names = (matchers != nil && size(matchers) > 0) ? [] : nil
+    if names != nil
+      for mk: matchers
+        if classname(mk) != "Rule_Matcher_Key"
+          names = nil
+          break
+        end
+        names.push(mk.name)
+      end
+    end
+    self.keys = names
   end
 
   # parses a rule pattern and creates a list of Rule_Matcher(s)
@@ -415,6 +428,7 @@ class Rule_Matcher
   # apply all matchers, abort if any returns `nil`
   def match(val_in)
     if self.matchers == nil  return nil end
+    if self.keys != nil      return tasmota._match_keys(val_in, self.keys) end
     var val = val_in
 
     var idx = 0

@@ -643,6 +643,60 @@ extern "C" {
     be_return(vm);
   }
 
+  // Walks a value down a list of key names, as a rule pattern made only of keys does (`Power1#State`): at each level the value must
+  // be a map, and the name is looked up among its keys case insensitively, a key written as the name taking precedence over one in
+  // another case. Returns the value under the last name, or nil when a level is not a map or has no such key. A key that is neither a
+  // string nor an integer is never matched. The rule matcher calls it for such patterns: one call instead of a matcher per level.
+  //
+  // tasmota._match_keys(value:any, names:list of string) -> any or nil
+  int32_t tasm_match_keys(bvm *vm);
+  int32_t tasm_match_keys(bvm *vm) {
+    int32_t top = be_top(vm);
+    if ((top < 3) || !be_islistinstance(vm, 3)) { be_return_nil(vm); }
+    be_pushvalue(vm, 2);                              // the value walked down, level by level
+    int32_t cur = be_top(vm);
+    be_getmember(vm, 3, ".p");                        // the native list of the names
+    int32_t names = be_top(vm);
+    be_pushiter(vm, names);
+    int32_t base = be_top(vm);                        // the iterator of the names, which must be on top for each step
+    bool ok = true;
+    while (ok && be_iter_hasnext(vm, names)) {
+      be_iter_next(vm, names);                        // the name
+      const char *name = be_isstring(vm, -1) ? be_tostring(vm, -1) : nullptr;
+      ok = false;
+      if (name && be_ismapinstance(vm, cur)) {
+        be_getmember(vm, cur, ".p");                  // the native map of this level
+        int32_t m = be_top(vm);
+        be_pushnil(vm);                               // the value of the key that matched, kept here
+        int32_t found = be_top(vm);
+        be_pushiter(vm, m);
+        bool exact = false;
+        while (!exact && be_iter_hasnext(vm, m)) {
+          be_iter_next(vm, m);                        // the key and its value
+          char num[24];
+          const char *k = nullptr;
+          if (be_isstring(vm, -2)) {
+            k = be_tostring(vm, -2);
+          } else if (be_isint(vm, -2)) {
+            snprintf(num, sizeof(num), "%lld", (long long)be_toint(vm, -2));
+            k = num;
+          }
+          if (k && (0 == strcasecmp(k, name))) {
+            exact = (0 == strcmp(k, name));
+            if (exact || !ok) { be_moveto(vm, -1, found); }   // the first in another case, unless the key as written comes
+            ok = true;
+          }
+          be_pop(vm, 2);
+        }
+        if (ok) { be_moveto(vm, found, cur); }
+      }
+      be_pop(vm, be_top(vm) - base);                  // back to the iterator of the names
+    }
+    if (!ok) { be_return_nil(vm); }
+    be_pushvalue(vm, cur);
+    be_return(vm);
+  }
+
   int32_t be_Tasmota_version(void) {
     return Settings->version;
   }
