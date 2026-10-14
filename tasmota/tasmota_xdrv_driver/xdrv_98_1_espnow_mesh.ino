@@ -79,10 +79,13 @@
  *       a frame for this device, Data in hex; Flags 1 asks for an answer, 2 marks a repeat of one already given, 4 says it came under the tag of the
  *       previous key of the network: its sender has not taken the last change of the key;
  *       Behind is how many numbers of its origin the frame was behind the newest heard, for the application to order by
- *   {"EspNowMesh":{"Outcome":{"Counter":5,"Frame":12,"Dest":3,"Ok":1,"Attempts":1}}}
+ *   {"EspNowMesh":{"Outcome":{"Counter":5,"Frame":12,"Dest":3,"Ok":1,"Attempts":1,"QueueUs":180,"RttUs":6450}}}
  *       what became of a frame sent with an answer asked for. Counter is the ticket the send was given (what espnow_mesh_send returned,
  *       or EspNowMeshSend answered), Frame the number the frame had on the air, which the receiver reports as its Counter. A send the
- *       core refused (no room, no key, too long) has an outcome with Ok 0, no attempts and Frame 0
+ *       core refused (no room, no key, too long) has an outcome with Ok 0, no attempts and Frame 0. Both times are taken in the task, in
+ *       microseconds: QueueUs from the main loop handing the send over to the task handing it to the core, and RttUs from there to the
+ *       answer (or to the last attempt given up), which is the round trip of the mesh without the main loop's turns; 0 for a send the
+ *       core refused
  *   {"EspNowMesh":{"Notice":{"Kind":"Silent","Node":3,"By":2,"Value":0}}}
  *       Silent, Back, Noisy, Calm, BulkDone, BulkLost
  *   {"EspNowMesh":{"Timeline":{"Old":"0300000007","New":"0100000002","Ticks":12,"Delta":"1184","Synced":1}}}
@@ -267,6 +270,7 @@ typedef struct {
   uint8_t flags;
   uint8_t len;
   uint32_t ticket;                           // what the caller is given for a send, and its outcome carries
+  uint32_t queued_us;                        // when the main loop handed it over, micros()
   uint8_t data[EspNowMesh::kMaxPayload];
 } EspNowMeshCmd_t;
 
@@ -305,6 +309,8 @@ typedef struct {
   uint32_t counter;                          // an outcome's: the ticket the send gave; a notice's value; a timeline's: the ticks of 100 ms it moved by
   uint32_t frame;                            // an outcome's: the number the frame had on the air, 0 for one that was never sent; a timeline's: the ms it moved by, low 32 bits
   uint32_t delta_high;                       // and the high 32 bits of them
+  uint32_t queue_us;                         // an outcome's: from the main loop's hand-over to the core's, in the task
+  uint32_t rtt_us;                           // and from the core's to the answer, or to the last attempt given up
 } EspNowMeshNote_t;
 
 typedef struct {
@@ -430,6 +436,8 @@ static struct {
 typedef struct {
   uint32_t frame;                            // 0: free
   uint32_t ticket;
+  uint32_t sent_us;                          // when the core was handed it, micros()
+  uint32_t queue_us;                         // how long it waited for the task before that
   uint8_t dest;
 } EspNowMeshSent_t;
 static EspNowMeshSent_t EspNowMeshSent[ESPNOW_MESH_SENT_DEPTH];
@@ -1034,22 +1042,27 @@ static void EspNowMeshApplyShared(EspNowMesh::Node* node, EspNowMeshShared_t* sh
   delete fresh;
 }
 
-// The ticket a frame sent with an answer asked was given, and the entry is free again; 0 for a frame that is not one of these
-static uint32_t EspNowMeshTicketOf(uint32_t frame, uint8_t dest) {
+// The ticket a frame sent with an answer asked was given, and the entry is free again; 0 for a frame that is not one of these. The note
+// is given the times of the send: how long it waited for the task, and how long from the core's hand-over to now
+static uint32_t EspNowMeshTicketOf(uint32_t frame, uint8_t dest, EspNowMeshNote_t* note) {
   for (uint32_t i = 0; i < ESPNOW_MESH_SENT_DEPTH; i++) {
     EspNowMeshSent_t& sent = EspNowMeshSent[i];
     if (sent.frame && (sent.frame == frame) && (sent.dest == dest)) {
       sent.frame = 0;
+      note->queue_us = sent.queue_us;
+      note->rtt_us = micros() - sent.sent_us;
       return sent.ticket;
     }
   }
   return 0;
 }
 
-static void EspNowMeshTicketKeep(uint32_t frame, uint32_t ticket, uint8_t dest) {
+static void EspNowMeshTicketKeep(uint32_t frame, uint32_t ticket, uint8_t dest, uint32_t sent_us, uint32_t queue_us) {
   EspNowMeshSent_t& sent = EspNowMeshSent[EspNowMeshSentNext];       // a ring: what has waited longest goes first, and the core holds 8
   sent.frame = frame;
   sent.ticket = ticket;
+  sent.sent_us = sent_us;
+  sent.queue_us = queue_us;
   sent.dest = dest;
   EspNowMeshSentNext = (EspNowMeshSentNext + 1) % ESPNOW_MESH_SENT_DEPTH;
 }
@@ -1094,7 +1107,7 @@ static void EspNowMeshDrain(EspNowMesh::Node* node) {
     EspNowMeshNote_t note;
     memset(&note, 0, sizeof(note));
     note.kind = ESPNOW_MESH_NOTE_OUTCOME;
-    note.counter = EspNowMeshTicketOf(o.counter, o.dest);
+    note.counter = EspNowMeshTicketOf(o.counter, o.dest, &note);
     note.frame = o.counter;
     note.dest = o.dest;
     note.ok = o.ok ? 1 : 0;
@@ -1153,6 +1166,7 @@ static void EspNowMeshDoCommand(EspNowMesh::Node* node, const EspNowMeshCmd_t* c
 static void EspNowMeshDoCommand(EspNowMesh::Node* node, const EspNowMeshCmd_t* cmd) {
   switch (cmd->op) {
     case ESPNOW_MESH_CMD_SEND: {
+      uint32_t sent_us = micros();
       uint32_t frame = node->Send((EspNowMesh::Type)cmd->type, cmd->dest, cmd->data, cmd->len, cmd->flags & 1, millis(), (cmd->flags & 2) != 0);
       if (0 == frame) {
         // The core has no room (8 frames waiting for an answer, 16 to send), no key for the destination, or the frame is too long. The
@@ -1167,7 +1181,7 @@ static void EspNowMeshDoCommand(EspNowMesh::Node* node, const EspNowMeshCmd_t* c
         note.dest = cmd->dest;
         EspNowMeshPutNote(&note);
       } else if ((cmd->flags & 1) && (EspNowMesh::kToAll != cmd->dest)) {
-        EspNowMeshTicketKeep(frame, cmd->ticket, cmd->dest);   // the outcome of this frame is this ticket's
+        EspNowMeshTicketKeep(frame, cmd->ticket, cmd->dest, sent_us, sent_us - cmd->queued_us);   // the outcome of this frame is this ticket's
       }
       break;
     }
@@ -1604,8 +1618,8 @@ static void EspNowMeshDrainEvents(void) {
   EspNowMeshNote_t note;
   while (pdTRUE == xQueueReceive(EspNowMeshDriver.note, &note, 0)) {
     if (ESPNOW_MESH_NOTE_OUTCOME == note.kind) {
-      AddLog(LOG_LEVEL_INFO, PSTR("EMH: Send %u (frame %u) for %u %s after %u attempts"), note.counter, note.frame, note.dest, note.ok ? PSTR("was answered") : PSTR("was not answered"), note.attempts);
-      Response_P(PSTR("{\"EspNowMesh\":{\"Outcome\":{\"Counter\":%u,\"Frame\":%u,\"Dest\":%u,\"Ok\":%u,\"Attempts\":%u}}}"), note.counter, note.frame, note.dest, note.ok, note.attempts);
+      AddLog(LOG_LEVEL_INFO, PSTR("EMH: Send %u (frame %u) for %u %s after %u attempts, in %u.%01u ms"), note.counter, note.frame, note.dest, note.ok ? PSTR("was answered") : PSTR("was not answered"), note.attempts, note.rtt_us / 1000, (note.rtt_us % 1000) / 100);
+      Response_P(PSTR("{\"EspNowMesh\":{\"Outcome\":{\"Counter\":%u,\"Frame\":%u,\"Dest\":%u,\"Ok\":%u,\"Attempts\":%u,\"QueueUs\":%u,\"RttUs\":%u}}}"), note.counter, note.frame, note.dest, note.ok, note.attempts, note.queue_us, note.rtt_us);
     } else if (ESPNOW_MESH_NOTE_TIMELINE == note.kind) {
       char from[11];
       char to[11];
@@ -1886,7 +1900,10 @@ static int32_t EspNowMeshQueueCommand(EspNowMeshCmd_t* cmd) {
   if (!EspNowMeshDriver.running || (nullptr == EspNowMeshDriver.cmd)) { return ESPNOW_MESH_NOT_RUNNING; }
   uint32_t ticket = EspNowMeshDriver.ticket + 1;
   if (!ticket) { ticket = 1; }
-  if (ESPNOW_MESH_CMD_SEND == cmd->op) { cmd->ticket = ticket; }
+  if (ESPNOW_MESH_CMD_SEND == cmd->op) {
+    cmd->ticket = ticket;
+    cmd->queued_us = micros();
+  }
   if (pdTRUE != xQueueSend(EspNowMeshDriver.cmd, cmd, 0)) {
     EspNowMeshCount.cmd_busy++;
     return ESPNOW_MESH_BUSY;
