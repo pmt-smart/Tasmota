@@ -94,6 +94,7 @@ assert(m.match({'aa':{'power':[1.2,1.5,2.5]}}) == 1.2)
 -#
 
 class Rule_Matcher
+  var key_u                                 # the key, in upper case, an event must have at its top level to match, or nil (see init)
   
   # We don't actually need a superclass, just implementing `match(val)`
   #
@@ -330,6 +331,10 @@ class Rule_Matcher
     self.rule = rule
     self.trigger = trigger
     self.matchers = matchers
+    # A rule whose first matcher is a key can only match an event that has that key at its top level, so the rule engine tries it on
+    # those alone. One that starts with a wildcard, an index or an operator, or a list of patterns, can match any event
+    var m = (matchers != nil && size(matchers) > 0) ? matchers[0] : nil
+    self.key_u = isinstance(m, _class.Rule_Matcher_Key) ? m.name_u : nil
   end
 
   # parses a rule pattern and creates a list of Rule_Matcher(s)
