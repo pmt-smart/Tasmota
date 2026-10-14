@@ -1044,6 +1044,7 @@ static void EspNowMeshApplyShared(EspNowMesh::Node* node, EspNowMeshShared_t* sh
 
 // The ticket a frame sent with an answer asked was given, and the entry is free again; 0 for a frame that is not one of these. The note
 // is given the times of the send: how long it waited for the task, and how long from the core's hand-over to now
+static uint32_t EspNowMeshTicketOf(uint32_t frame, uint8_t dest, EspNowMeshNote_t* note);
 static uint32_t EspNowMeshTicketOf(uint32_t frame, uint8_t dest, EspNowMeshNote_t* note) {
   for (uint32_t i = 0; i < ESPNOW_MESH_SENT_DEPTH; i++) {
     EspNowMeshSent_t& sent = EspNowMeshSent[i];
