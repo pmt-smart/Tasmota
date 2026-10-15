@@ -203,6 +203,9 @@
 #ifndef ESPNOW_MESH_CHOOSE_RELAYS
 #define ESPNOW_MESH_CHOOSE_RELAYS      1           // 1: the device chooses the neighbours that repeat for it, says whom in its heartbeat and repeats later when a sender did not choose it; 0: every device that hears a flooded frame repeats it
 #endif
+#ifndef ESPNOW_MESH_ROUTE_UNICAST
+#define ESPNOW_MESH_ROUTE_UNICAST      1           // 1: a frame for one device goes in unicast along the best way known, hop by hop, and falls back to the flood; 0: it is flooded
+#endif
 #ifndef ESPNOW_MESH_CLOCK
 #define ESPNOW_MESH_CLOCK              1           // 1: the heartbeat carries the mesh clock and the device takes it from the ones it hears; 0: the application's bytes go as they are
 #endif
@@ -1458,6 +1461,7 @@ static bool EspNowMeshStartAttempt(void) {
   config.udpOnly = (EspNowMeshSettings.network & ESPNOW_MESH_NET_NO_RADIO) != 0;
   config.udpRelay = (EspNowMeshSettings.network & ESPNOW_MESH_NET_RELAY) != 0;
   config.chooseRelays = (ESPNOW_MESH_CHOOSE_RELAYS != 0);
+  config.routeUnicast = (ESPNOW_MESH_ROUTE_UNICAST != 0);
   config.renewEpoch = EspNowMeshRenewEpoch;
   config.clock = (ESPNOW_MESH_CLOCK != 0);
   EspNowMeshDriver.epoch_renew = false;
@@ -2062,11 +2066,11 @@ void CmndEspNowMeshStats(void) {
       ResponseAppend_P(PSTR(",\"SyncAsked\":%u,\"SyncDone\":%u,\"SyncBad\":%u,\"SyncShed\":%u,\"StartAsks\":%u,"
                             "\"BeatsSent\":%u,\"BeatsHeard\":%u,\"Pings\":%u,\"Probes\":%u,\"Rescued\":%u,\"VerdictsSent\":%u,\"VerdictsHeard\":%u,\"NoiseSent\":%u,\"KeptAsOnlyWay\":%u,\"RelayHeld\":%u,\"CounterOut\":%u,"
                             "\"PartsSent\":%u,\"PiecesSent\":%u,\"PiecesNew\":%u,\"PiecesRepeated\":%u,\"NaksSent\":%u,\"BulkDone\":%u,\"BulkLost\":%u,"
-                            "\"UdpSent\":%u,\"UdpHeard\":%u"),
+                            "\"UdpSent\":%u,\"UdpHeard\":%u,\"Routed\":%u,\"RouteFlooded\":%u"),
         s.syncAsked, s.syncDone, s.syncBad, s.syncShed, s.startAsks,
         s.beatsSent, s.beatsHeard, s.pings, s.probes, s.rescued, s.verdictsSent, s.verdictsHeard, s.noiseSent, s.keptAsOnlyWay, s.relayHeld, s.counterOut,
         s.partsSent, s.piecesSent, s.piecesNew, s.piecesRepeated, s.naksSent, s.bulkDone, s.bulkLost,
-        s.udpSent, s.udpHeard);
+        s.udpSent, s.udpHeard, s.routed, s.routeFlooded);
     }
     xSemaphoreGive(EspNowMeshDriver.lock);
   }
