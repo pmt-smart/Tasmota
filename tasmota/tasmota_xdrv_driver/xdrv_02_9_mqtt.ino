@@ -1147,7 +1147,14 @@ void MqttReconnect(void) {
 #endif
   }
   if (!Mqtt.allowed) {
-    MqttConnected();
+    // With no host there is no connection to make, and MqttCheck comes back here every second: the first time is the boot's
+    // connection (its information, the subscriptions, MQTT#Connected), and after it only the state is kept, without the event
+    // and the subscriptions at every check
+    if (Mqtt.initial_connection_state) {
+      MqttConnected();
+    } else {
+      TasmotaGlobal.global_state.mqtt_down = 0;
+    }
     return;
   }
 
