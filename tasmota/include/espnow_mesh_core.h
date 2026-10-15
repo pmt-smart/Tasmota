@@ -81,6 +81,14 @@
  * times, and then dropped. An answer to something that was flooded travels this way, so the
  * answer never floods.
  *
+ * Routing a frame for one node (Config::routeUnicast): a frame of the application's for a single node, and the answer to it, go in unicast
+ * along the best way this node knows, one hop at a time, with the radio's own acknowledgement and resend on each hop, where a flood goes in
+ * broadcast with neither. The way is the destination itself when it is a neighbour counted on, then the neighbour counted on that lists it in
+ * its heartbeat and delivers best (two hops, from the neighbourhood the heartbeats give), and then the way back; each node on the way chooses
+ * its own next hop the same way. With no way, the frame is flooded as before. A hop that the radio cannot deliver in kHopTries goes on flooded
+ * from the node that tried it, with the hops it has left, and a frame whose answer has not come is sent again flooded: the flood is what a
+ * way that has gone stale falls back to. Frames for everyone, and the bulk transfer, keep their own ways.
+ *
  * Acknowledgement: a frame that asks for one, and that is for a single node, is kept by the
  * sender, which sends it again with the attempt one higher if no answer comes in 100 ms, and
  * once more after 100 ms more; without an answer 100 ms after that, it reports the failure. The
@@ -212,6 +220,7 @@ constexpr unsigned kNoticeSize = 8;          // the things the supervision tells
 constexpr uint32_t kAnswerWaitMs = 100;      // between an attempt and the next, and after the last
 constexpr uint8_t kMaxAttempt = 2;           // the attempt that is the last: 0, 1 and 2
 constexpr unsigned kHopTries = 3;            // times a routed hop is handed to the radio
+constexpr uint8_t kRouteUnknownPercent = 75; // the delivery a neighbour not yet judged counts as, when the way to a node two hops off is chosen
 constexpr uint32_t kSyncWaitMs = 2000;       // an exchange that has had no answer by then is given up
 constexpr uint32_t kSyncAskEveryMs = 1000;   // the time after the first ask to an origin that is not known, which doubles at each ask after it, up to 16 times as much
 constexpr uint8_t kFloodAskAfter = 2;        // the asks to an origin that go the way back, before they are flooded
@@ -485,6 +494,7 @@ struct Stats {
   uint32_t counterOut, epochRenewed;
   uint32_t clockSteps, timelinesTaken, clockEventsLost;
   uint32_t prevKeyHeard, prevKeyDropped;       // the frames let through under the previous key, and the ones that were not, after the change had had its time
+  uint32_t routed, routeFlooded;               // the frames for one node sent or passed on along a way (Config::routeUnicast), and the ones that went on flooded when the way failed or there was none
 };
 
 // How a neighbour stands: heard lately, not heard and being tried, or declared silent by this node
@@ -659,6 +669,7 @@ struct Config {
   bool (*renewEpoch)(void *, uint32_t);        // asked when the counter passes kCounterRenew, with the epoch above this node's: the application keeps it, so that the next start is above it, and says yes; nullptr: yes
   void *renewContext;
   bool clock;                                  // the heartbeat carries the mesh time and the timeline, and takes them from the heartbeats it hears; false: it does not, and the application's bytes go as they are
+  bool routeUnicast;                           // a frame for one node goes in unicast along the best way known, and falls back to the flood; false: it is flooded, as before
 };
 
 class Node {
@@ -974,6 +985,7 @@ class Node {
       memcpy(slot->data, p.frame, p.len);
       slot->len = p.len;
       slot->data[1] = (uint8_t)((slot->data[1] & ~3) | p.attempt);
+      slot->data[4] = 0;                       // flooded: the way the first attempt took, if it took one, did not answer
       slot->previousTag = TagOwn(slot->data, slot->len, p.previousTag);
       slot->used = true;
       slot->own = true;
@@ -1084,6 +1096,8 @@ class Node {
       if (!again) {
         stats_.hopFailed++;
         if (pingTarget == 0) DemoteRoute(inflight_.data[3], inflight_.to);
+        // a frame for one node that went along a way goes on by the flood (Config::routeUnicast)
+        if (inflight_.fallback) FloodOn(inflight_.data, inflight_.len, now);
       }
     }
     inflightValid_ = false;
@@ -1364,7 +1378,7 @@ class Node {
   struct Seen { bool used; bool hasFrom; uint8_t origin; uint8_t attempt; uint32_t epoch; uint32_t counter; uint8_t from[6]; };
   // `from` are the neighbours a flooded frame waiting to be repeated was heard from, for the first two copies;
   // `pingTarget` and `pingAsker` mark a ping: whom it tries, and for whom (0: for this node)
-  struct TxItem { bool used; bool own; bool unicast; bool wait; bool previousTag; uint8_t len; uint8_t prio; uint8_t heard; uint8_t tries; uint8_t to[6]; uint8_t from[2]; uint8_t fromCount; uint8_t pingTarget; uint8_t pingAsker; uint8_t paths; uint8_t udpTarget; uint32_t due; uint8_t data[kMaxFrame]; };
+  struct TxItem { bool used; bool own; bool unicast; bool wait; bool previousTag; bool fallback; uint8_t len; uint8_t prio; uint8_t heard; uint8_t tries; uint8_t to[6]; uint8_t from[2]; uint8_t fromCount; uint8_t pingTarget; uint8_t pingAsker; uint8_t paths; uint8_t udpTarget; uint32_t due; uint8_t data[kMaxFrame]; };
   struct Pending { bool used; bool previousTag; uint8_t dest; uint8_t attempt; uint8_t len; uint32_t counter; uint32_t due; uint8_t frame[kMaxFrame]; };
   struct SyncAsk { bool used; uint8_t target; uint32_t nonce; uint32_t until; };
   struct Mute { bool used; bool mine; uint8_t node; };
@@ -1704,6 +1718,7 @@ class Node {
     slot->paths = PathsOf(type, dest, now);
     slot->udpTarget = UdpTargetFor(dest);
     if (wait) {
+      // the frame kept for the resend is the flooded one: a resend is for a way that did not answer
       memset(keep, 0, sizeof(*keep));
       keep->used = true;
       keep->counter = f.counter;
@@ -1714,7 +1729,76 @@ class Node {
       keep->previousTag = slot->previousTag;
       memcpy(keep->frame, slot->data, slot->len);
     }
+    if (RoutableType(type) && dest != kToAll && part == 0 && slot->paths == kPathRadio) RouteSlot(slot, dest, now);
     return f.counter;
+  }
+
+  // Whether a frame of this type, for one node, goes along a way when Config::routeUnicast is on: the application's own and the answers. The
+  // heartbeat and the sync exchange have their own ways, and the bulk transfer goes along the way back and asks again for what is lost
+  static bool RoutableType(Type type) {
+    return type == kCommand || type == kAck || type == kState || type == kEvent || type == kMembership;
+  }
+
+  // The neighbour a frame for `dest` goes to next, and its address: the destination itself when it is a neighbour counted on, then the neighbour
+  // counted on that lists it and delivers best, then the way back. 0 when this node knows none, or the way is by the network
+  uint8_t NextHopFor(uint8_t dest, uint32_t now, uint8_t mac[6]) const {
+    if (dest == kToAll || dest == cfg_.id) return 0;
+    const Neighbor *direct = NeighborOf(dest);
+    if (direct != nullptr && !direct->noRadio && Usable(*direct, now)) { memcpy(mac, direct->mac, 6); return dest; }
+    const Neighbor *best = nullptr;
+    unsigned bestScore = 0;
+    for (unsigned i = 0; i < kMaxNeighbors; i++) {
+      const Neighbor &n = nbrs_[i];
+      if (!n.used || n.noRadio || !Usable(n, now) || !Lists(n, dest)) continue;
+      uint8_t q = LinkQuality(n, now);
+      // the delivery first, then the signal: a neighbour heard at -40 dBm scores 60 more than one at -100
+      unsigned score = (unsigned)(q == kQualityUnknown ? kRouteUnknownPercent : q) * 256 + (unsigned)(n.rssi + 128);
+      if (best == nullptr || score > bestScore) { best = &n; bestScore = score; }
+    }
+    if (best != nullptr) { memcpy(mac, best->mac, 6); return best->id; }
+    for (unsigned i = 0; i < kMaxOrigins; i++) {
+      const Origin &o = origins_[i];
+      if (!o.used || o.id != dest || !o.routed || o.viaUdp) continue;
+      uint8_t via = NodeOf(o.via);
+      if (via == 0) return 0;
+      memcpy(mac, o.via, 6);
+      return via;
+    }
+    return 0;
+  }
+
+  // A frame of this node's for one node, in its slot: sent along the way when there is one, flooded when not
+  void RouteSlot(TxItem *slot, uint8_t dest, uint32_t now) {
+    if (!cfg_.routeUnicast) return;
+    uint8_t mac[6];
+    uint8_t next = NextHopFor(dest, now, mac);
+    if (next == 0) return;
+    slot->data[4] = next;
+    slot->unicast = true;
+    slot->fallback = true;
+    memcpy(slot->to, mac, 6);
+    slot->udpTarget = next;
+    stats_.routed++;
+  }
+
+  // A routed frame whose hop failed, or that has no way on from here: flooded from this node with the hops it has left (none: its neighbours
+  // hear it and repeat nothing). False when the queue has no room
+  bool FloodOn(const uint8_t *data, size_t n, uint32_t now) {
+    if (n < kHeaderLen) return false;
+    TxItem *slot = FreeSlot();
+    if (slot == nullptr) { stats_.queueFull++; return false; }
+    memset(slot, 0, sizeof(*slot));
+    memcpy(slot->data, data, n);
+    slot->len = (uint8_t)n;
+    slot->data[4] = 0;
+    slot->used = true;
+    memset(slot->to, 0xff, 6);
+    slot->prio = FramePriority(data);
+    slot->heard = 1;
+    slot->due = now;
+    slot->paths = kPathRadio;
+    stats_.routeFlooded++;
+    return true;
   }
 
   bool SeenBefore(uint8_t origin, uint32_t epoch, uint32_t counter, uint8_t attempt) const {
@@ -1896,11 +1980,29 @@ class Node {
     }
   }
 
-  // A routed frame for someone else: to the neighbour this node keeps for its destination, with no wait
+  // A routed frame for someone else: to the neighbour this node keeps for its destination, with no wait. With Config::routeUnicast, a frame
+  // the application sent for one node goes to the best next hop this node knows (NextHopFor), and on by the flood when it knows none
   void Forward(const uint8_t *data, size_t n, const Frame &f, uint32_t now) {
-    Origin *d = FindOrigin(f.dest, false);
-    uint8_t next = d != nullptr && d->routed ? NodeOf(d->via) : 0;
-    if (next == 0) { stats_.noRoute++; return; }
+    bool routing = cfg_.routeUnicast && RoutableType(f.type());
+    uint8_t mac[6];
+    uint8_t next = 0;
+    bool viaUdp = false;
+    if (routing) next = NextHopFor(f.dest, now, mac);
+    if (next == 0) {
+      Origin *d = FindOrigin(f.dest, false);
+      next = d != nullptr && d->routed ? NodeOf(d->via) : 0;
+      if (next != 0) { memcpy(mac, d->via, 6); viaUdp = d->viaUdp; }
+    }
+    if (next == 0) {
+      stats_.noRoute++;
+      if (routing) {
+        uint8_t copy[kMaxFrame];
+        memcpy(copy, data, n);
+        copy[5] = data[5] - 1;
+        FloodOn(copy, n, now);
+      }
+      return;
+    }
     TxItem *slot = FreeSlot();
     if (slot == nullptr) { stats_.queueFull++; return; }
     memset(slot, 0, sizeof(*slot));
@@ -1910,12 +2012,14 @@ class Node {
     slot->data[5] = data[5] - 1;
     slot->used = true;
     slot->unicast = true;
-    memcpy(slot->to, d->via, 6);
+    slot->fallback = routing;
+    memcpy(slot->to, mac, 6);
     slot->prio = FramePriority(data);
     slot->heard = 1;
     slot->due = now;
-    slot->paths = d->viaUdp && udpUp_ ? kPathUdp : kPathRadio;
+    slot->paths = viaUdp && udpUp_ ? kPathUdp : kPathRadio;
     slot->udpTarget = next;
+    if (routing) stats_.routed++;
   }
 
   // Whether the frame is in the application's hands: false when its inbox is full, or the application is not taking frames
@@ -1955,12 +2059,14 @@ class Node {
     o.attempts = attempts;
   }
 
-  // "Received", for a frame of `f.origin`, along the way back: the number and the attempt it answers
+  // "Received", for a frame of `f.origin`, along the way back: the number and the attempt it answers. With Config::routeUnicast, along the best
+  // way this node knows, and flooded when it knows none
   void SendAck(const Frame &f, uint32_t now) {
     uint8_t p[5];
     Put32(p, f.counter);
     p[4] = f.attempt();
-    if (SendRouted(kAck, f.origin, p, sizeof(p), now) != 0) stats_.acksSent++;
+    uint32_t sent = cfg_.routeUnicast ? Queue(kAck, f.origin, p, sizeof(p), false, kMaxHops, now) : SendRouted(kAck, f.origin, p, sizeof(p), now);
+    if (sent != 0) stats_.acksSent++;
   }
 
   void HandleAck(const Frame &f) {
