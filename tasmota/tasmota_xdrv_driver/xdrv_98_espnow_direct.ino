@@ -193,8 +193,10 @@
  *                       saved network to the peer, or the one named
  *   EspNowTakeWifi [0] - join the network the peer offered; 0 drops the offer
  * With USE_ESPNOW_DIRECT_PAIRING:
- *   EspNowPairOpen <s>[,<zigbee>] - open a pairing window for s seconds, up to
- *                       600, announcing a Zigbee channel, 0 for none; reports
+ *   EspNowPairOpen <s>[,<zigbee>[,<display>]] - open a pairing window for s
+ *                       seconds, up to 600, announcing a Zigbee channel, 0 for
+ *                       none, and with <display> 1 that the device identifies
+ *                       itself on a screen rather than by a LED; reports
  *                       whether a window is open when called bare
  *   EspNowPairScan [2] - look for a window; 2 goes through every channel straight
  *                       away, without listening on the current one first
@@ -1082,6 +1084,8 @@ static void EspNowDirectEverySecond(void) {
  *   type(1) | version(1) | to(6) | body
  *
  *   ANNOUNCE     window -> all      flags(1) | channel(1) | zigbee(1) | key(32) | name(0..32)
+ *                flags: 0x01 on an access point, 0x02 busy with a device, 0x04 takes a guest,
+ *                0x08 a device with a display (a wall panel), which identifies itself on its screen
  *   BLINK        scan -> window     window key(32)
  *   PAIR_STATUS  window -> scan     window key(32) | code(1)
  *   PAIR_REQ     scan -> window     window key(32) | scan key(32) | scan nonce(16) | guest(1, only from a guest)
@@ -1128,6 +1132,7 @@ static void EspNowDirectEverySecond(void) {
 #define ESPNOW_DIRECT_ANNOUNCE_NETWORK 0x01   // the window is on an access point
 #define ESPNOW_DIRECT_ANNOUNCE_BUSY    0x02   // the window is in a session with a device
 #define ESPNOW_DIRECT_ANNOUNCE_GUEST   0x04   // the window takes a guest: a pairing that leaves the device's own record alone
+#define ESPNOW_DIRECT_ANNOUNCE_DISPLAY 0x08   // the window is on a device with a display, which identifies itself on its screen
 #define ESPNOW_DIRECT_REQUEST_GUEST    0x01   // PAIR_REQ's last byte, from a guest
 #define ESPNOW_DIRECT_STATUS_OK        0      // the window identifies itself
 #define ESPNOW_DIRECT_STATUS_BUSY      1      // the window is in a session with another device
@@ -1169,6 +1174,7 @@ typedef struct {
   bool guest;                              // the session is a guest's: nothing is saved, on either side
   uint8_t tries;
   uint8_t zigbee;                          // what the window announces
+  bool display;                            // and whether it is on a device with a display
   uint8_t sweep;                           // the channel a sweep listens on, 0 before it starts
   uint8_t home;                            // the channel the radio was on before the sweep
   uint8_t target;                          // the channel of the device picked, 0 for the station's own
@@ -1516,7 +1522,8 @@ static void EspNowDirectAnnounce(void) {
   uint8_t body[3 + 32 + ESPNOW_DIRECT_NAME_SIZE];
   uint8_t sta;
   body[0] = (EspNowDirectStationChannel(&sta) ? ESPNOW_DIRECT_ANNOUNCE_NETWORK : 0) |
-            ((ESPNOW_PAIR_WINDOW != p->phase) ? ESPNOW_DIRECT_ANNOUNCE_BUSY : 0) | ESPNOW_DIRECT_ANNOUNCE_GUEST;
+            ((ESPNOW_PAIR_WINDOW != p->phase) ? ESPNOW_DIRECT_ANNOUNCE_BUSY : 0) | ESPNOW_DIRECT_ANNOUNCE_GUEST |
+            (p->display ? ESPNOW_DIRECT_ANNOUNCE_DISPLAY : 0);
   body[1] = EspNowDirectRadioChannel();
   body[2] = p->zigbee;
   memcpy(&body[3], p->own_public, 32);
@@ -1819,10 +1826,10 @@ static void EspNowDirectHeard(const EspNowDirectRxItem_t* item) {
     AddLog(LOG_LEVEL_INFO, PSTR("ENW: Heard %s on channel %d"), text, h->channel);
   }
   Response_P(PSTR("{\"EspNowPair\":{\"Heard\":{\"Id\":%u,\"Mac\":\"%s\",\"Rssi\":%d,\"Channel\":%u,\"Version\":%u,"
-                  "\"Name\":\"%s\",\"Zigbee\":%u,\"Network\":%u,\"Busy\":%u,\"Guest\":%u}}}"),
+                  "\"Name\":\"%s\",\"Zigbee\":%u,\"Network\":%u,\"Busy\":%u,\"Guest\":%u,\"Display\":%u}}}"),
     (uint32_t)(h - p->heard) + 1, text, h->rssi, h->channel, h->version, h->name, h->zigbee,
     (h->flags & ESPNOW_DIRECT_ANNOUNCE_NETWORK) ? 1 : 0, (h->flags & ESPNOW_DIRECT_ANNOUNCE_BUSY) ? 1 : 0,
-    (h->flags & ESPNOW_DIRECT_ANNOUNCE_GUEST) ? 1 : 0);
+    (h->flags & ESPNOW_DIRECT_ANNOUNCE_GUEST) ? 1 : 0, (h->flags & ESPNOW_DIRECT_ANNOUNCE_DISPLAY) ? 1 : 0);
   XdrvRulesProcess(0);
 }
 
@@ -2032,7 +2039,9 @@ void CmndEspNowPairOpen(void) {
     uint32_t seconds = strtoul(XdrvMailbox.data, nullptr, 10);
     const char* comma = strchr(XdrvMailbox.data, ',');
     uint32_t zigbee = comma ? strtoul(comma + 1, nullptr, 10) : 0;
-    if (!seconds || (seconds > ESPNOW_DIRECT_WINDOW_MAX_S) || (zigbee > 26)) {
+    const char* second = comma ? strchr(comma + 1, ',') : nullptr;
+    uint32_t display = second ? strtoul(second + 1, nullptr, 10) : 0;
+    if (!seconds || (seconds > ESPNOW_DIRECT_WINDOW_MAX_S) || (zigbee > 26) || (display > 1)) {
       ResponseCmndError();
       return;
     }
@@ -2057,6 +2066,7 @@ void CmndEspNowPairOpen(void) {
       AddLog(LOG_LEVEL_INFO, PSTR("ENW: Pairing window open for %u s"), seconds);
     }
     EspNowPair->zigbee = zigbee;
+    EspNowPair->display = (1 == display);
     EspNowPair->window_until = millis() + seconds * 1000;
     EspNowPair->announce_at = millis();
   }
@@ -2104,10 +2114,10 @@ void CmndEspNowPairHeard(void) {
       char text[18];
       EspNowDirectMacText(h->mac, text);
       ResponseAppend_P(PSTR("%s{\"Id\":%u,\"Mac\":\"%s\",\"Rssi\":%d,\"Channel\":%u,\"Version\":%u,\"Name\":\"%s\","
-                            "\"Zigbee\":%u,\"Network\":%u,\"Busy\":%u,\"Guest\":%u}"),
+                            "\"Zigbee\":%u,\"Network\":%u,\"Busy\":%u,\"Guest\":%u,\"Display\":%u}"),
         i ? "," : "", order[i] + 1, text, h->rssi, h->channel, h->version, h->name, h->zigbee,
         (h->flags & ESPNOW_DIRECT_ANNOUNCE_NETWORK) ? 1 : 0, (h->flags & ESPNOW_DIRECT_ANNOUNCE_BUSY) ? 1 : 0,
-        (h->flags & ESPNOW_DIRECT_ANNOUNCE_GUEST) ? 1 : 0);
+        (h->flags & ESPNOW_DIRECT_ANNOUNCE_GUEST) ? 1 : 0, (h->flags & ESPNOW_DIRECT_ANNOUNCE_DISPLAY) ? 1 : 0);
     }
   }
   ResponseAppend_P(PSTR("]}"));
