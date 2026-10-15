@@ -173,6 +173,7 @@ class be_class_tasmota (scope: global, name: Tasmota) {
     add_rule, closure(class_Tasmota_add_rule_closure)
     add_rule_once, closure(class_Tasmota_add_rule_once_closure)
     remove_rule, closure(class_Tasmota_remove_rule_closure)
+    keys_upper, closure(class_Tasmota_keys_upper_closure)
     try_rule, closure(class_Tasmota_try_rule_closure)
     exec_rules, closure(class_Tasmota_exec_rules_closure)
     exec_tele, closure(class_Tasmota_exec_tele_closure)
