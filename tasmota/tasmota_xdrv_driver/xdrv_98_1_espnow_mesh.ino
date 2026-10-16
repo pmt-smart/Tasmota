@@ -663,16 +663,30 @@ bool EspNowMeshHearsFrame(const uint8_t* mac, int8_t rssi, const uint8_t* data, 
   return true;
 }
 
+#ifdef USE_ESPNOW_MESH_PROBE
+// The off-channel probe (xdrv_98_2) rides on the mesh's radio: it takes its frames and its send's word before the mesh looks at them,
+// and holds the channel while it stands in for a device with no network
+bool EspNowProbeHears(const esp_now_recv_info_t* info, const uint8_t* data, int len);
+bool EspNowProbeSendResult(const uint8_t* mac, bool ok);
+bool EspNowProbeHoldsChannel(void);
+#endif  // USE_ESPNOW_MESH_PROBE
+
 // The mesh's own callbacks, for when it started ESP-NOW itself. Declared before their definition, as every function whose
 // signature names a type of the ESP-IDF: the sketch preprocessor would otherwise hoist a generated prototype above the include.
 void EspNowMeshRecvCb(const esp_now_recv_info_t* info, const uint8_t* data, int len);
 void EspNowMeshRecvCb(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
+#ifdef USE_ESPNOW_MESH_PROBE
+  if (EspNowProbeHears(info, data, len)) { return; }
+#endif
   if ((len < 1) || (EspNowMesh::kVersion != data[0])) { return; }
   EspNowMeshEnqueue(info->src_addr, info->rx_ctrl->rssi, data, len);
 }
 
 void EspNowMeshSendCb(const esp_now_send_info_t* info, esp_now_send_status_t status);
 void EspNowMeshSendCb(const esp_now_send_info_t* info, esp_now_send_status_t status) {
+#ifdef USE_ESPNOW_MESH_PROBE
+  if (EspNowProbeSendResult(info->des_addr, ESP_NOW_SEND_SUCCESS == status)) { return; }
+#endif
   EspNowMeshSendResult(info->des_addr, ESP_NOW_SEND_SUCCESS == status);
 }
 
@@ -863,6 +877,9 @@ static void EspNowMeshRadioStop(void) {
 // moves the radio and starts ESP-NOW again when it changes, and a second channel that moved it back would be a fight every second
 static void EspNowMeshApplyChannel(void) {
   if (!EspNowMeshSettings.channel || EspNowMeshDriver.direct_radio) { return; }
+#ifdef USE_ESPNOW_MESH_PROBE
+  if (EspNowProbeHoldsChannel()) { return; }
+#endif
   wifi_ap_record_t ap;
   if (ESP_OK == esp_wifi_sta_get_ap_info(&ap)) { return; }
   // The station keeps trying a saved network, or a scan runs: the radio is not moved under them
