@@ -41,12 +41,26 @@
  *                                <count> probes (10) to <mac>, one every <interval> (100 ms), on <channel> (0: the radio's). On a channel
  *                                that is not the radio's, by esp_now_switch_channel_tx, which keeps the radio there <wait> ms (10). <size>
  *                                is the frame's length, 18 to 250 (18). ff:ff:ff:ff:ff:ff broadcasts: no acknowledgement, no echo
- *   EspNowProbeListen <channel>,<ms>
- *                                the radio stays <ms> on <channel> (esp_now_remain_on_channel), and counts the probe frames heard there
+ *   EspNowProbeListen <channel>,<ms>[,<count>[,<interval ms>]]
+ *                                the radio stays <ms> on <channel> (esp_now_remain_on_channel), and counts the probe frames heard there.
+ *                                With <count>, it also sends that many broadcast beacons while there, one every <interval> (50 ms), by
+ *                                esp_now_send: whether a frame can be sent during a remain-on-channel, and on which channel it goes out
+ *   EspNowProbeNap <channel>,<beacons>,<home ms>[,<seconds>[,<tx>[,<beacon TU>]]]
+ *                                a station that lives on <channel> and naps on its access point: every <beacons> beacon intervals, the
+ *                                radio comes home for <home ms> around the beacon (the window is anchored on the TBTT, from the station's
+ *                                TSF) and stays on <channel> the rest of the time (esp_now_remain_on_channel), for <seconds> (60; up to
+ *                                3600). <tx> 1 sends a broadcast beacon on <channel> each time it gets there. <beacon TU> is the access
+ *                                point's beacon interval (100). The multi-channel concurrency of a Wi-Fi driver, in probe form: what the
+ *                                station keeps (its beacons, its link, a ping from the LAN) and what it hears on <channel> meanwhile.
+ *                                EspNowProbeNap 0 ends it after the current period
  *   EspNowProbeAway <channel>,<seconds>[,<beacon ms>]
  *                                stands in for a device with no network: the WiFi pauses, the radio goes to <channel> for <seconds>, with
  *                                a broadcast beacon every <beacon ms> (0: none) and an echo for each probe, and the WiFi comes back as it
  *                                was. The web server is down meanwhile; the summary comes after, in the log and in EspNowProbe
+ *
+ * EspNowProbe also counts, since the last EspNowProbe 0: the 100 ms ticks the radio was on another channel than the mesh's setting
+ * (a station with a network it cannot reach scans for it, and leaves the channel), and the Wi-Fi events of a scan done, a beacon
+ * timeout and a disconnection.
  *
  * Results go to the log and to the rule engine:
  *   {"EspNowProbe":{"Kind":"Send",...}} at the end of a run, {"EspNowProbeAway":{"State":"Back",...}} at the end of an away
@@ -69,6 +83,13 @@
 #define ESPNOW_PROBE_MAX_FRAME         250     // what an ESP-NOW v1.0 device takes
 #define ESPNOW_PROBE_ECHO_WAIT_MS      300     // the echoes of a run's last probes are counted until then
 #define ESPNOW_PROBE_AWAY_MAX_S        600
+#define ESPNOW_PROBE_NAP_MAX_S         3600
+#define ESPNOW_PROBE_NAP_GUARD_US      2000    // the radio is meant to be home this long before the beacon
+#define ESPNOW_PROBE_NAP_LEAVE_US      8000    // what a remain-on-channel takes to get to the channel, by the first run of the probe (the send
+                                               // callback of a frame sent away came 4 to 9 ms after the call): the request is made this much
+                                               // shorter than the time left to the return
+#define ESPNOW_PROBE_NAP_MIN_WAIT_MS   5       // a remain-on-channel shorter than this is skipped
+#define ESPNOW_PROBE_ROC_TX_DELAY_MS   12      // a frame sent during a remain-on-channel waits this long after the request, for the radio to get there
 
 typedef struct __attribute__((packed)) {
   uint8_t magic;
@@ -82,7 +103,7 @@ typedef struct __attribute__((packed)) {
   uint8_t rx_channel;      // echo: the channel the probe was heard on
 } EspNowProbeFrame_t;
 
-enum EspNowProbeJobs { ESPNOW_PROBE_JOB_ECHO = 1, ESPNOW_PROBE_JOB_SEND, ESPNOW_PROBE_JOB_LISTEN, ESPNOW_PROBE_JOB_WAKE };
+enum EspNowProbeJobs { ESPNOW_PROBE_JOB_ECHO = 1, ESPNOW_PROBE_JOB_SEND, ESPNOW_PROBE_JOB_LISTEN, ESPNOW_PROBE_JOB_WAKE, ESPNOW_PROBE_JOB_NAP };
 
 typedef struct {
   uint8_t type;
@@ -90,10 +111,25 @@ typedef struct {
   uint8_t channel;
   uint16_t wait_ms;
   uint16_t size;
-  uint32_t count;
-  uint32_t interval_ms;
+  uint32_t count;              // send: the probes; listen: the beacons sent during it; nap: the beacon intervals of a period
+  uint32_t interval_ms;        // send: between probes; listen: the stay, and between its beacons in tx_interval_ms; nap: the time home
+  uint16_t tx_interval_ms;
+  uint16_t seconds;            // nap: how long
+  uint16_t beacon_tu;          // nap: the access point's beacon interval
+  uint8_t tx;                  // nap: a beacon sent on the channel each period
   EspNowProbeFrame_t frame;    // echo: the probe heard
 } EspNowProbeJob_t;
+
+// What the frames sent during a remain-on-channel did
+typedef struct {
+  uint32_t sent;
+  uint32_t api_err;
+  int32_t last_err;
+  uint32_t acked;
+  uint32_t nacked;
+  uint32_t no_word;
+  uint8_t channel;             // what esp_wifi_get_channel said while there, the last time
+} EspNowProbeRocTx_t;
 
 // What one send did, as the task saw it
 typedef struct {
@@ -146,6 +182,19 @@ typedef struct {
   bool roc_done;
   uint32_t roc_us;
   uint32_t heard;
+  EspNowProbeRocTx_t tx;       // listen and nap: the frames sent while on the channel
+  // nap
+  uint16_t home_ms;
+  uint16_t beacon_tu;
+  uint16_t seconds;
+  uint32_t periods;            // the periods the radio went to the channel
+  uint32_t skipped;            // the periods it did not: too little time left
+  uint32_t roc_refused;        // the requests esp_now_remain_on_channel refused
+  uint32_t roc_cancelled;
+  uint32_t roc_no_back;
+  uint32_t late;               // the returns after the beacon's time
+  EspNowProbeSpan_t late_us;   // how long after the planned return the radio was back
+  uint32_t tsf_lost;           // the periods the station's TSF could not be read: not associated
   uint32_t ms;
   volatile bool done;
   bool reported;
@@ -181,6 +230,13 @@ struct {
   volatile bool listening = false;
   volatile uint8_t listen_channel = 0;
   volatile uint32_t listen_heard = 0;
+  volatile bool stop = false;                // EspNowProbeNap 0
+  // Since the last EspNowProbe 0: the Wi-Fi events counted, and the ticks the radio was off the mesh's channel
+  volatile uint32_t scan_done = 0;
+  volatile uint32_t beacon_timeout = 0;
+  volatile uint32_t disconnected = 0;
+  uint32_t ticks = 0;
+  uint32_t off_ticks = 0;
   // EspNowProbeAway, on the main loop; away_on once the radio is on the channel, which the task beacons on
   bool away = false;
   bool away_paused = false;                  // the WiFi is paused, a tick after the command, whose answer goes out first
@@ -284,6 +340,19 @@ void EspNowProbeWifiEvent(void* arg, esp_event_base_t base, int32_t id, void* da
   if (EspNowProbe.back) { xSemaphoreGive(EspNowProbe.back); }
 }
 
+// The Wi-Fi events only counted: a scan done, a beacon timeout, a disconnection
+void EspNowProbeCountEvent(void* arg, esp_event_base_t base, int32_t id, void* data);
+void EspNowProbeCountEvent(void* arg, esp_event_base_t base, int32_t id, void* data) {
+  (void)arg;
+  (void)base;
+  (void)data;
+  switch (id) {
+    case WIFI_EVENT_SCAN_DONE:          EspNowProbe.scan_done = EspNowProbe.scan_done + 1; break;
+    case WIFI_EVENT_STA_BEACON_TIMEOUT: EspNowProbe.beacon_timeout = EspNowProbe.beacon_timeout + 1; break;
+    case WIFI_EVENT_STA_DISCONNECTED:   EspNowProbe.disconnected = EspNowProbe.disconnected + 1; break;
+  }
+}
+
 /*********************************************************************************************\
  * The task: sends, listens and echoes, with the mesh's radio lock
 \*********************************************************************************************/
@@ -354,6 +423,47 @@ static void EspNowProbeTx(const uint8_t* to, uint8_t channel, uint16_t wait_ms, 
   }
   if (EspNowMeshDriver.radio && !EspNowMeshDriver.radio_lost) { EspNowProbeTxLocked(to, channel, wait_ms, data, len, tx); }
   EspNowMeshRadioGive();
+}
+
+// A broadcast beacon by esp_now_send while the radio is on another channel by a remain-on-channel, with the lock already held: does the
+// call take it, and does the radio say sent. Where it went out, the device listening on that channel says
+static void EspNowProbeRocBeacon(uint8_t sent_on, EspNowProbeRocTx_t* tx);
+static void EspNowProbeRocBeacon(uint8_t sent_on, EspNowProbeRocTx_t* tx) {
+  uint8_t channel = 0;
+  wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
+  if (ESP_OK == esp_wifi_get_channel(&channel, &second)) { tx->channel = channel; }
+  if (!esp_now_is_peer_exist(EspNowProbeBroadcast) && !EspNowMeshAddPeer(EspNowProbeBroadcast, millis())) {
+    tx->api_err++;
+    tx->last_err = ESP_ERR_ESPNOW_FULL;
+    return;
+  }
+  EspNowProbeFrame_t frame;
+  memset(&frame, 0, sizeof(frame));
+  frame.magic = ESPNOW_PROBE_MAGIC;
+  frame.kind = ESPNOW_PROBE_BEACON;
+  frame.home = channel;
+  frame.sent_on = sent_on;
+  EspNowProbe.seq = EspNowProbe.seq + 1;
+  frame.seq = EspNowProbe.seq;
+  frame.sent_us = (uint32_t)esp_timer_get_time();
+  xSemaphoreTake(EspNowProbe.word, 0);
+  memcpy(EspNowProbe.send_to, EspNowProbeBroadcast, 6);
+  EspNowProbe.word_ok = false;
+  EspNowProbe.awaiting = true;
+  esp_err_t err = esp_now_send(EspNowProbeBroadcast, (const uint8_t*)&frame, sizeof(frame));
+  tx->sent++;
+  if (ESP_OK != err) {
+    EspNowProbe.awaiting = false;
+    tx->api_err++;
+    tx->last_err = err;
+    return;
+  }
+  if (pdTRUE == xSemaphoreTake(EspNowProbe.word, pdMS_TO_TICKS(100))) {
+    if (EspNowProbe.word_ok) { tx->acked++; } else { tx->nacked++; }
+  } else {
+    tx->no_word++;
+  }
+  EspNowProbe.awaiting = false;
 }
 
 static void EspNowProbeFill(EspNowProbeFrame_t* frame, uint8_t kind, uint8_t sent_on);
@@ -482,13 +592,124 @@ static void EspNowProbeListenRun(const EspNowProbeJob_t* job) {
     int64_t start = esp_timer_get_time();
     run.roc_err = esp_now_remain_on_channel(&request);
     if (ESP_OK == run.roc_err) {
-      run.roc_done = (pdTRUE == xSemaphoreTake(EspNowProbe.back, pdMS_TO_TICKS(job->interval_ms + 500)));
-      if (run.roc_done) { run.roc_us = (uint32_t)(EspNowProbe.back_at - start); }
+      // The beacons asked for go out while the radio is there, until the listen ends
+      uint32_t beacons = job->count;
+      uint32_t next = millis() + ESPNOW_PROBE_ROC_TX_DELAY_MS;
+      for (;;) {
+        int32_t left = (int32_t)(next - millis());
+        if (!beacons) { left = job->interval_ms + 500; }
+        if (left < 0) { left = 0; }
+        if (pdTRUE == xSemaphoreTake(EspNowProbe.back, pdMS_TO_TICKS(left))) {
+          run.roc_done = true;
+          run.roc_us = (uint32_t)(EspNowProbe.back_at - start);
+          break;
+        }
+        if (!beacons) { break; }
+        if ((int32_t)(millis() - next) >= 0) {
+          EspNowProbeRocBeacon(job->channel, &run.tx);
+          beacons--;
+          next = millis() + job->tx_interval_ms;
+        }
+      }
     }
     EspNowProbe.listening = false;
     run.heard = EspNowProbe.listen_heard;
     EspNowMeshRadioGive();
   }
+  run.ms = millis() - started;
+}
+
+// Until a TSF time (µs of the station's clock), serving the echoes meanwhile; false when the TSF cannot be read
+static bool EspNowProbeNapUntil(int64_t tsf_until);
+static bool EspNowProbeNapUntil(int64_t tsf_until) {
+  for (;;) {
+    int64_t tsf = esp_wifi_get_tsf_time(WIFI_IF_STA);
+    if (tsf <= 0) { return false; }
+    int64_t left_us = tsf_until - tsf;
+    if (left_us <= 0) { return true; }
+    uint32_t left_ms = (uint32_t)((left_us + 999) / 1000);
+    EspNowProbeServeUntil(millis() + ((left_ms > 1000) ? 1000 : left_ms));
+  }
+}
+
+// A station that lives on another channel and naps on its access point: the island node of a multi-channel mesh, in probe form
+static void EspNowProbeNapRun(const EspNowProbeJob_t* job);
+static void EspNowProbeNapRun(const EspNowProbeJob_t* job) {
+  EspNowProbeRun_t& run = EspNowProbe.run;
+  uint32_t started = millis();
+  uint32_t until = started + (uint32_t)job->seconds * 1000;
+  int64_t bi_us = (int64_t)job->beacon_tu * 1024;
+  int64_t period_us = bi_us * job->count;
+  int64_t home_us = (int64_t)job->interval_ms * 1000;
+  EspNowProbe.stop = false;
+  EspNowProbe.listen_channel = job->channel;
+  EspNowProbe.listen_heard = 0;
+  while (!EspNowProbe.stop && ((int32_t)(until - millis()) > 0)) {
+    int64_t tsf = esp_wifi_get_tsf_time(WIFI_IF_STA);
+    if (tsf <= 0) {
+      run.tsf_lost++;
+      EspNowProbeServeUntil(millis() + 1000);
+      continue;
+    }
+    // Home now. The beacon comes at the next TBTT; the radio stays home_us past it, then goes to the channel until just before the TBTT
+    // that ends the period
+    int64_t tbtt = ((tsf / bi_us) + 1) * bi_us;
+    if (!EspNowProbeNapUntil(tbtt + home_us)) { run.tsf_lost++; continue; }
+    int64_t return_at = tbtt + period_us - ESPNOW_PROBE_NAP_GUARD_US;
+    int64_t now = esp_wifi_get_tsf_time(WIFI_IF_STA);
+    int64_t wait_us = return_at - now - ESPNOW_PROBE_NAP_LEAVE_US;
+    if (wait_us < (int64_t)ESPNOW_PROBE_NAP_MIN_WAIT_MS * 1000) {
+      run.skipped++;
+      continue;
+    }
+    if (!EspNowMeshDriver.radio || EspNowMeshDriver.radio_lost || !EspNowMeshRadioTake(100)) {
+      run.skipped++;
+      EspNowProbeServeUntil(millis() + 10);
+      continue;
+    }
+    // The lock is held while the radio is away: no frame of the mesh goes out on the wrong channel. It is given back for the time home
+    EspNowProbe.listening = true;
+    xSemaphoreTake(EspNowProbe.back, 0);
+    esp_now_remain_on_channel_t request;
+    memset(&request, 0, sizeof(request));
+    request.type = WIFI_ROC_REQ;
+    request.channel = job->channel;
+    request.sec_channel = WIFI_SECOND_CHAN_NONE;
+    request.wait_time_ms = (uint32_t)(wait_us / 1000);
+    int64_t start = esp_timer_get_time();
+    esp_err_t err = esp_now_remain_on_channel(&request);
+    if (ESP_OK != err) {
+      run.roc_refused++;
+      run.roc_err = err;
+    } else {
+      run.periods++;
+      bool back = false;
+      if (job->tx) {
+        // The beacon on the channel, once the radio should be there; a return before that ends the wait
+        if (pdTRUE == xSemaphoreTake(EspNowProbe.back, pdMS_TO_TICKS(ESPNOW_PROBE_ROC_TX_DELAY_MS))) {
+          back = true;
+        } else {
+          EspNowProbeRocBeacon(job->channel, &run.tx);
+        }
+      }
+      if (!back) { back = (pdTRUE == xSemaphoreTake(EspNowProbe.back, pdMS_TO_TICKS(request.wait_time_ms + 500))); }
+      if (!back) {
+        run.roc_no_back++;
+      } else {
+        if (WIFI_ROC_DONE != EspNowProbe.back_status) { run.roc_cancelled++; }
+        uint32_t away_us = (uint32_t)(EspNowProbe.back_at - start);
+        EspNowProbeSpanAdd(&run.away, away_us);
+        // How late the radio was back, against the plan: the TSF now, less the time since the event
+        int64_t back_tsf = esp_wifi_get_tsf_time(WIFI_IF_STA) - (esp_timer_get_time() - EspNowProbe.back_at);
+        int64_t late_us = back_tsf - return_at;
+        if (late_us > 0) { EspNowProbeSpanAdd(&run.late_us, (uint32_t)late_us); }
+        if (back_tsf > (return_at + ESPNOW_PROBE_NAP_GUARD_US)) { run.late++; }
+      }
+    }
+    EspNowProbe.listening = false;
+    EspNowMeshRadioGive();
+  }
+  run.heard = EspNowProbe.listen_heard;
   run.ms = millis() - started;
 }
 
@@ -498,7 +719,8 @@ static void EspNowProbeDo(const EspNowProbeJob_t* job) {
       EspNowProbeEcho(job);
       break;
     case ESPNOW_PROBE_JOB_SEND:
-    case ESPNOW_PROBE_JOB_LISTEN: {
+    case ESPNOW_PROBE_JOB_LISTEN:
+    case ESPNOW_PROBE_JOB_NAP: {
       EspNowProbeRun_t& run = EspNowProbe.run;
       memset(&run, 0, sizeof(run));
       run.kind = job->type;
@@ -510,7 +732,16 @@ static void EspNowProbeDo(const EspNowProbeJob_t* job) {
       run.interval_ms = job->interval_ms;
       run.wait_ms = job->wait_ms;
       run.size = job->size;
-      if (ESPNOW_PROBE_JOB_SEND == job->type) { EspNowProbeSendRun(job); } else { EspNowProbeListenRun(job); }
+      run.home_ms = job->interval_ms;
+      run.beacon_tu = job->beacon_tu;
+      run.seconds = job->seconds;
+      if (ESPNOW_PROBE_JOB_SEND == job->type) {
+        EspNowProbeSendRun(job);
+      } else if (ESPNOW_PROBE_JOB_LISTEN == job->type) {
+        EspNowProbeListenRun(job);
+      } else {
+        EspNowProbeNapRun(job);
+      }
       run.done = true;
       EspNowProbe.busy = false;
       break;
@@ -563,7 +794,16 @@ static void EspNowProbeEvents(void) {
   if (EspNowProbe.events || (WIFI_OFF == WiFi.getMode())) { return; }
   esp_err_t a = esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_ACTION_TX_STATUS, &EspNowProbeWifiEvent, nullptr, nullptr);
   esp_err_t b = esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_ROC_DONE, &EspNowProbeWifiEvent, nullptr, nullptr);
+  esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_SCAN_DONE, &EspNowProbeCountEvent, nullptr, nullptr);
+  esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_STA_BEACON_TIMEOUT, &EspNowProbeCountEvent, nullptr, nullptr);
+  esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &EspNowProbeCountEvent, nullptr, nullptr);
   EspNowProbe.events = (ESP_OK == a) && (ESP_OK == b);
+}
+
+static void EspNowProbeRocTxJson(const EspNowProbeRocTx_t* tx);
+static void EspNowProbeRocTxJson(const EspNowProbeRocTx_t* tx) {
+  ResponseAppend_P(PSTR(",\"Tx\":{\"Sent\":%u,\"ApiErr\":%u,\"Err\":%d,\"Acked\":%u,\"Nacked\":%u,\"NoWord\":%u,\"Channel\":%u}"),
+    tx->sent, tx->api_err, tx->last_err, tx->acked, tx->nacked, tx->no_word, tx->channel);
 }
 
 static void EspNowProbeSpanJson(const char* name, const EspNowProbeSpan_t* span);
@@ -580,8 +820,23 @@ static void EspNowProbeRunJson(void) {
   char mac[18];
   ToHex_P(run.mac, 6, mac, sizeof(mac), ':');
   if (ESPNOW_PROBE_JOB_LISTEN == run.kind) {
-    ResponseAppend_P(PSTR("{\"Kind\":\"Listen\",\"Channel\":%u,\"Home\":%u,\"Associated\":%u,\"WaitMs\":%u,\"Err\":%d,\"RocDone\":%u,\"RocUs\":%u,\"Heard\":%u,\"Ms\":%u,\"Done\":%u}"),
-      run.channel, run.home, run.associated, run.interval_ms, run.roc_err, run.roc_done, run.roc_us, run.heard, run.ms, run.done);
+    ResponseAppend_P(PSTR("{\"Kind\":\"Listen\",\"Channel\":%u,\"Home\":%u,\"Associated\":%u,\"WaitMs\":%u,\"Err\":%d,\"RocDone\":%u,\"RocUs\":%u,\"Heard\":%u"),
+      run.channel, run.home, run.associated, run.interval_ms, run.roc_err, run.roc_done, run.roc_us, run.heard);
+    EspNowProbeRocTxJson(&run.tx);
+    ResponseAppend_P(PSTR(",\"Ms\":%u,\"Done\":%u}"), run.ms, run.done);
+    return;
+  }
+  if (ESPNOW_PROBE_JOB_NAP == run.kind) {
+    ResponseAppend_P(PSTR("{\"Kind\":\"Nap\",\"Channel\":%u,\"Home\":%u,\"Associated\":%u,\"Beacons\":%u,\"HomeMs\":%u,\"BeaconTu\":%u,\"Seconds\":%u,"
+                          "\"Periods\":%u,\"Skipped\":%u,\"RocRefused\":%u,\"RocErr\":%d,\"RocCancelled\":%u,\"NoBack\":%u,\"TsfLost\":%u,\"Late\":%u"),
+      run.channel, run.home, run.associated, run.count, run.home_ms, run.beacon_tu, run.seconds,
+      run.periods, run.skipped, run.roc_refused, run.roc_err, run.roc_cancelled, run.roc_no_back, run.tsf_lost, run.late);
+    EspNowProbeSpanJson(PSTR("AwayUs"), &run.away);
+    EspNowProbeSpanJson(PSTR("LateUs"), &run.late_us);
+    ResponseAppend_P(PSTR(",\"Heard\":%u"), run.heard);
+    EspNowProbeRocTxJson(&run.tx);
+    ResponseAppend_P(PSTR(",\"ScanDone\":%u,\"BeaconTimeout\":%u,\"Disconnected\":%u,\"Ms\":%u,\"Done\":%u}"),
+      EspNowProbe.scan_done, EspNowProbe.beacon_timeout, EspNowProbe.disconnected, run.ms, run.done);
     return;
   }
   ResponseAppend_P(PSTR("{\"Kind\":\"Send\",\"To\":\"%s\",\"Channel\":%u,\"Home\":%u,\"Associated\":%u,\"Count\":%u,\"IntervalMs\":%u,\"WaitMs\":%u,\"Size\":%u,"
@@ -612,7 +867,14 @@ static void EspNowProbeEvery100ms(void) {
   EspNowProbeEvents();
   uint8_t channel = 0;
   wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
-  if ((WiFi.getMode() & WIFI_MODE_STA) && (ESP_OK == esp_wifi_get_channel(&channel, &second))) { EspNowProbe.home = channel; }
+  if ((WiFi.getMode() & WIFI_MODE_STA) && (ESP_OK == esp_wifi_get_channel(&channel, &second))) {
+    EspNowProbe.home = channel;
+    // The ticks the radio is off the mesh's channel, with no run holding it elsewhere: a station scanning for a network it cannot reach
+    if (EspNowMeshSettings.channel && !EspNowProbe.away && !EspNowProbe.busy) {
+      EspNowProbe.ticks++;
+      if (channel != EspNowMeshSettings.channel) { EspNowProbe.off_ticks++; }
+    }
+  }
   if (EspNowProbe.away && !EspNowProbe.away_paused) {
     if ((int32_t)(millis() - EspNowProbe.away_since) >= 300) {
       EspNowProbe.away_paused = true;
@@ -691,13 +953,17 @@ void CmndEspNowProbe(void) {
     EspNowProbe.heard_probe = EspNowProbe.heard_echo = EspNowProbe.heard_beacon = EspNowProbe.heard_off = 0;
     EspNowProbe.echo_err = 0;
     EspNowProbe.echo_sent = EspNowProbe.echo_failed = EspNowProbe.beacon_sent = EspNowProbe.beacon_failed = EspNowProbe.queue_full = 0;
+    EspNowProbe.scan_done = EspNowProbe.beacon_timeout = EspNowProbe.disconnected = 0;
+    EspNowProbe.ticks = EspNowProbe.off_ticks = 0;
   }
   Response_P(PSTR("{\"%s\":{\"Channel\":%u,\"Associated\":%u,\"Away\":%u,\"Busy\":%u,\"Events\":%u,"
                   "\"Heard\":{\"Probe\":%u,\"Echo\":%u,\"Beacon\":%u,\"OffChannel\":%u,\"Rssi\":%d,\"RxChannel\":%u},"
-                  "\"Echoes\":{\"Sent\":%u,\"Failed\":%u,\"Err\":%d},\"Beacons\":{\"Sent\":%u,\"Failed\":%u},\"QueueFull\":%u,\"Last\":"),
+                  "\"Echoes\":{\"Sent\":%u,\"Failed\":%u,\"Err\":%d},\"Beacons\":{\"Sent\":%u,\"Failed\":%u},\"QueueFull\":%u,"
+                  "\"Radio\":{\"MeshChannel\":%u,\"Ticks\":%u,\"OffTicks\":%u},\"Wifi\":{\"ScanDone\":%u,\"BeaconTimeout\":%u,\"Disconnected\":%u},\"Last\":"),
     XdrvMailbox.command, EspNowProbe.home, EspNowProbeAssociated(), EspNowProbe.away, EspNowProbe.busy, EspNowProbe.events,
     EspNowProbe.heard_probe, EspNowProbe.heard_echo, EspNowProbe.heard_beacon, EspNowProbe.heard_off, EspNowProbe.last_rssi, EspNowProbe.last_channel,
-    EspNowProbe.echo_sent, EspNowProbe.echo_failed, EspNowProbe.echo_err, EspNowProbe.beacon_sent, EspNowProbe.beacon_failed, EspNowProbe.queue_full);
+    EspNowProbe.echo_sent, EspNowProbe.echo_failed, EspNowProbe.echo_err, EspNowProbe.beacon_sent, EspNowProbe.beacon_failed, EspNowProbe.queue_full,
+    EspNowMeshSettings.channel, EspNowProbe.ticks, EspNowProbe.off_ticks, EspNowProbe.scan_done, EspNowProbe.beacon_timeout, EspNowProbe.disconnected);
   if (EspNowProbe.busy) { ResponseAppend_P(PSTR("null")); } else { EspNowProbeRunJson(); }
   ResponseAppend_P(PSTR("}}"));
 }
@@ -736,10 +1002,10 @@ void CmndEspNowProbeSend(void) {
 }
 
 void CmndEspNowProbeListen(void) {
-  char text[32];
+  char text[48];
   snprintf(text, sizeof(text), "%s", XdrvMailbox.data);
-  char* fields[2];
-  uint32_t count = EspNowProbeFields(text, fields, 2);
+  char* fields[4];
+  uint32_t count = EspNowProbeFields(text, fields, 4);
   if (count < 2) {
     ResponseCmndError();
     return;
@@ -749,11 +1015,60 @@ void CmndEspNowProbeListen(void) {
   job.type = ESPNOW_PROBE_JOB_LISTEN;
   job.channel = atoi(fields[0]);
   job.interval_ms = atoi(fields[1]);
-  if (!job.channel || (job.channel > 13) || !job.interval_ms || (job.interval_ms > 10000)) {
+  job.count = (count > 2) ? atoi(fields[2]) : 0;
+  job.tx_interval_ms = (count > 3) ? atoi(fields[3]) : 50;
+  if (!job.channel || (job.channel > 13) || !job.interval_ms || (job.interval_ms > 10000) || (job.count > 1000) || (job.tx_interval_ms < 10)) {
     ResponseCmndError();
     return;
   }
   if (!EspNowProbeReady()) { return; }
+  EspNowProbe.busy = true;
+  if (pdTRUE != xQueueSend(EspNowProbe.jobs, &job, 0)) {
+    EspNowProbe.busy = false;
+    ResponseCmndChar_P(PSTR("busy"));
+    return;
+  }
+  ResponseCmndChar_P(PSTR("Started"));
+}
+
+void CmndEspNowProbeNap(void) {
+  if (XdrvMailbox.data_len && (0 == XdrvMailbox.payload)) {
+    EspNowProbe.stop = true;
+    ResponseCmndChar_P(PSTR("Stopping"));
+    return;
+  }
+  char text[48];
+  snprintf(text, sizeof(text), "%s", XdrvMailbox.data);
+  char* fields[6];
+  uint32_t count = EspNowProbeFields(text, fields, 6);
+  if (count < 3) {
+    ResponseCmndError();
+    return;
+  }
+  EspNowProbeJob_t job;
+  memset(&job, 0, sizeof(job));
+  job.type = ESPNOW_PROBE_JOB_NAP;
+  job.channel = atoi(fields[0]);
+  job.count = atoi(fields[1]);
+  job.interval_ms = atoi(fields[2]);
+  job.seconds = (count > 3) ? atoi(fields[3]) : 60;
+  job.tx = (count > 4) ? (atoi(fields[4]) ? 1 : 0) : 0;
+  job.beacon_tu = (count > 5) ? atoi(fields[5]) : 100;
+  if (!job.channel || (job.channel > 13) || !job.count || (job.count > 10) || (job.interval_ms < 5) || (job.interval_ms > 2000) ||
+      !job.seconds || (job.seconds > ESPNOW_PROBE_NAP_MAX_S) || (job.beacon_tu < 20) || (job.beacon_tu > 1000) ||
+      (job.interval_ms + ESPNOW_PROBE_NAP_MIN_WAIT_MS + (ESPNOW_PROBE_NAP_LEAVE_US + ESPNOW_PROBE_NAP_GUARD_US) / 1000 >= job.count * job.beacon_tu * 1024 / 1000)) {
+    ResponseCmndError();
+    return;
+  }
+  if (!EspNowProbeReady()) { return; }
+  if (!EspNowProbeAssociated()) {
+    ResponseCmndChar_P(PSTR("not associated"));
+    return;
+  }
+  if (job.channel == EspNowProbe.home) {
+    ResponseCmndChar_P(PSTR("that is the station's channel"));
+    return;
+  }
   EspNowProbe.busy = true;
   if (pdTRUE != xQueueSend(EspNowProbe.jobs, &job, 0)) {
     EspNowProbe.busy = false;
@@ -807,9 +1122,9 @@ void CmndEspNowProbeAway(void) {
 }
 
 const char kEspNowProbeCommands[] PROGMEM = "|"
-  "EspNowProbe|EspNowProbeSend|EspNowProbeListen|EspNowProbeAway";
+  "EspNowProbe|EspNowProbeSend|EspNowProbeListen|EspNowProbeNap|EspNowProbeAway";
 void (* const kEspNowProbeCommand[])(void) PROGMEM = {
-  &CmndEspNowProbe, &CmndEspNowProbeSend, &CmndEspNowProbeListen, &CmndEspNowProbeAway };
+  &CmndEspNowProbe, &CmndEspNowProbeSend, &CmndEspNowProbeListen, &CmndEspNowProbeNap, &CmndEspNowProbeAway };
 
 /*********************************************************************************************\
  * Interface
