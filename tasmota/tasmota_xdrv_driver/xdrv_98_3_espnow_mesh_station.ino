@@ -80,6 +80,12 @@ struct {
   volatile uint8_t reason = 0;             // the last one
 } EspNowMeshStation;
 
+// The milliseconds since a mark of millis(), 0 for a mark not reached yet
+static uint32_t EspNowMeshStationSince(uint32_t mark) {
+  int32_t since = (int32_t)(millis() - mark);
+  return (since > 0) ? (uint32_t)since : 0;
+}
+
 // Run on the network event task: it only counts
 void EspNowMeshStationEvent(arduino_event_t *event);
 void EspNowMeshStationEvent(arduino_event_t *event) {
@@ -173,18 +179,18 @@ static void EspNowMeshStationEverySecond(void) {
   if (WL_CONNECTED == WiFi.status()) {
     if (ESPNOW_MESH_STATION_TRYING == EspNowMeshStation.state) {
       EspNowMeshStation.found++;
-      AddLog(LOG_LEVEL_INFO, PSTR("EMS: WiFi back after %u s"), (millis() - EspNowMeshStation.down_since) / 1000);
+      AddLog(LOG_LEVEL_INFO, PSTR("EMS: WiFi back after %u s"), EspNowMeshStationSince(EspNowMeshStation.down_since) / 1000);
     }
     EspNowMeshStation.state = ESPNOW_MESH_STATION_WATCH;
     EspNowMeshStation.down_since = 0;
     EspNowMeshStation.interval_s = ESPNOW_MESH_STATION_FIRST_S;
     return;
   }
-  if (!EspNowMeshStation.down_since) { EspNowMeshStation.down_since = millis() | 1; }
   uint32_t now = millis();
+  if (!EspNowMeshStation.down_since) { EspNowMeshStation.down_since = now ? now : 1; }
   switch (EspNowMeshStation.state) {
     case ESPNOW_MESH_STATION_WATCH:
-      if (((now - EspNowMeshStation.down_since) >= ESPNOW_MESH_STATION_GRACE_S * 1000) && EspNowMeshStationRadioFree()) {
+      if ((EspNowMeshStationSince(EspNowMeshStation.down_since) >= ESPNOW_MESH_STATION_GRACE_S * 1000) && EspNowMeshStationRadioFree()) {
         EspNowMeshStationPark();
       }
       break;
@@ -197,7 +203,7 @@ static void EspNowMeshStationEverySecond(void) {
       }
       break;
     case ESPNOW_MESH_STATION_TRYING: {
-      uint32_t trying = now - EspNowMeshStation.try_since;
+      uint32_t trying = EspNowMeshStationSince(EspNowMeshStation.try_since);
       wifi_ap_record_t ap;
       bool associated = (ESP_OK == esp_wifi_sta_get_ap_info(&ap));
       bool over = associated ? (trying >= ESPNOW_MESH_STATION_ASSOC_S * 1000)
@@ -221,7 +227,7 @@ static const char* EspNowMeshStationStateText(void) {
 
 void CmndEspNowMeshStation(void) {
   uint32_t now = millis();
-  uint32_t down = EspNowMeshStation.down_since ? (now - EspNowMeshStation.down_since) / 1000 : 0;
+  uint32_t down = EspNowMeshStation.down_since ? EspNowMeshStationSince(EspNowMeshStation.down_since) / 1000 : 0;
   uint32_t next = 0;
   if ((ESPNOW_MESH_STATION_PARKED == EspNowMeshStation.state) && !TimeReached(EspNowMeshStation.next_try)) {
     next = (EspNowMeshStation.next_try - now) / 1000;
