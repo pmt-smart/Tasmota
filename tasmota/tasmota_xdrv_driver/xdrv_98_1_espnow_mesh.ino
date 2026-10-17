@@ -888,6 +888,10 @@ static void EspNowMeshApplyChannel(void) {
   if (EspNowProbeHoldsChannel()) { return; }
 #endif
   if (EspNowMeshSearchHolds()) { return; }
+#ifdef USE_WIFI_STATION_CONTROL
+  // A join, a pairing, a hotspot, a scan or the WiFi Manager has the radio: its channel is theirs until it is free
+  if (STA_RADIO_FREE != StaCtrlRadioOwner()) { return; }
+#endif
   wifi_ap_record_t ap;
   if (ESP_OK == esp_wifi_sta_get_ap_info(&ap)) { return; }
   // The station keeps trying a saved network, or a scan runs: the radio is not moved under them
