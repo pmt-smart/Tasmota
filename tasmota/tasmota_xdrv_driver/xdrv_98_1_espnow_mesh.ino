@@ -104,7 +104,8 @@
  * Commands:
  *   EspNowMeshEnable 0|1       - stop/start, reports the state when called bare
  *   EspNowMeshId <1..254>      - this device's number in the network
- *   EspNowMeshChannel <0..13>  - the channel the radio goes to when the station is not associated; 0 leaves it
+ *   EspNowMeshChannel <0..13>  - the channel the radio goes to when the station is not associated; 0 leaves it. The search for the nodes on
+ *                                the other channels (xdrv_98_4) changes it too, and the station keeps to it (xdrv_98_3)
  *   EspNowMeshGroupKey <64 hex>[,<version>[,<revoke>]] - the key of the network, never echoed back. A key that is not the one the device has
  *                                changes it: the key it had is kept as the previous key (see below), and the version has to be another. A second change
  *                                while the first is open is refused, unless <revoke> is 1: a node was struck off with it
@@ -327,6 +328,7 @@ typedef struct {
   uint16_t beat_s;                           // since its last heartbeat, 0xFFFF if none
   uint32_t heard_at;                         // the millisecond counter when something of it last got through, and when its last heartbeat came (0 if none)
   uint32_t beat_at;
+  uint32_t radio_at;                         // and when something of it last got through by the radio (0 if never)
   uint8_t hears;
   uint8_t info_len;
   uint8_t info[EspNowMesh::kMaxInfo];
@@ -671,6 +673,11 @@ bool EspNowProbeSendResult(const uint8_t* mac, bool ok);
 bool EspNowProbeHoldsChannel(void);
 #endif  // USE_ESPNOW_MESH_PROBE
 
+// The search for the mesh's nodes on the other channels (xdrv_98_4) holds the channel while it listens on another one, and the
+// station of xdrv_98_3 lets it, or not
+bool EspNowMeshSearchHolds(void);
+bool EspNowMeshStationLetsSearch(void);
+
 // The mesh's own callbacks, for when it started ESP-NOW itself. Declared before their definition, as every function whose
 // signature names a type of the ESP-IDF: the sketch preprocessor would otherwise hoist a generated prototype above the include.
 void EspNowMeshRecvCb(const esp_now_recv_info_t* info, const uint8_t* data, int len);
@@ -880,6 +887,7 @@ static void EspNowMeshApplyChannel(void) {
 #ifdef USE_ESPNOW_MESH_PROBE
   if (EspNowProbeHoldsChannel()) { return; }
 #endif
+  if (EspNowMeshSearchHolds()) { return; }
   wifi_ap_record_t ap;
   if (ESP_OK == esp_wifi_sta_get_ap_info(&ap)) { return; }
   // The station keeps trying a saved network, or a scan runs: the radio is not moved under them
@@ -892,6 +900,37 @@ static void EspNowMeshApplyChannel(void) {
   if (ESP_OK == esp_wifi_set_channel(EspNowMeshSettings.channel, WIFI_SECOND_CHAN_NONE)) {
     AddLog(LOG_LEVEL_INFO, PSTR("EMH: Radio from channel %d to %d"), channel, EspNowMeshSettings.channel);
   }
+}
+
+// Whether the device has other nodes of the mesh in its table
+bool EspNowMeshKnowsNodes(void) {
+  for (uint32_t i = 0; i < ESPNOW_MESH_NODES; i++) {
+    if (EspNowMeshSettings.node[i].id) { return true; }
+  }
+  return false;
+}
+
+// What the radio heard of the neighbours, as the task's last snapshot has it: how many were heard by the radio since a mark of millis(), the
+// strongest of them, and when the radio last heard any of them (0 if never). False when the task is not running
+bool EspNowMeshRadioHeard(uint32_t since, uint32_t* count, int8_t* rssi, uint32_t* last) {
+  *count = 0;
+  *rssi = -128;
+  *last = 0;
+  if (!EspNowMeshDriver.running || (nullptr == EspNowMeshDriver.snapshot) || (pdTRUE != xSemaphoreTake(EspNowMeshDriver.lock, pdMS_TO_TICKS(50)))) {
+    return false;
+  }
+  const EspNowMeshSnapshot_t* s = EspNowMeshDriver.snapshot;
+  for (uint32_t i = 0; i < s->neighbors; i++) {
+    const EspNowMeshNeighbor_t& n = s->neighbor[i];
+    if (!n.radio_at) { continue; }
+    if (!*last || ((int32_t)(n.radio_at - *last) > 0)) { *last = n.radio_at; }
+    if ((int32_t)(n.radio_at - since) >= 0) {
+      (*count)++;
+      if (n.rssi > *rssi) { *rssi = n.rssi; }
+    }
+  }
+  xSemaphoreGive(EspNowMeshDriver.lock);
+  return true;
 }
 
 // With the radio's lock: the peer, the send and the wait for the radio's word, none of which the main loop takes apart under it
@@ -1244,6 +1283,7 @@ static void EspNowMeshSnapshotMake(EspNowMesh::Node* node) {
     out.beat_s = n->beatAt ? (now - n->beatAt) / 1000 : 0xFFFF;
     out.heard_at = n->lastHeard;
     out.beat_at = n->beatAt;
+    out.radio_at = n->radioAt;
     out.hears = n->hearsCount;
     out.info_len = n->infoLen;
     memcpy(out.info, n->info, n->infoLen);
