@@ -169,7 +169,8 @@
  *                                             1 suspect, 2 silent), rssi, age (ms since something of it got through), beat (ms since its last heartbeat, -1
  *                                             if none), info (hex: the application's bytes of its last heartbeat, which are its to say), seen and skew (the
  *                                             clock of its last heartbeat: 0 it carried none, 1 another timeline than this device's, 2 the same; and how
- *                                             far its time was from this device's when it came, ms); false when the task is not running
+ *                                             far its time was from this device's when it came, ms), and hears (how many nodes its last heartbeat says it
+ *                                             hears); false when the task is not running
 \*********************************************************************************************/
 
 #define XDRV_100                       100
@@ -2452,6 +2453,7 @@ int EspNowMeshBerryNeighbors(struct bvm *vm) {
     be_map_insert_int(vm, "skew", n.clock_skew);
     be_map_insert_int(vm, "key", n.key_version);
     be_map_insert_int(vm, "keybits", n.key_bits);
+    be_map_insert_int(vm, "hears", n.hears);
     be_pop(vm, 1);
     be_data_push(vm, -2);
     be_pop(vm, 1);
