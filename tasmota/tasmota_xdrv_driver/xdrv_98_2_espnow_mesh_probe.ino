@@ -45,13 +45,16 @@
  *                                the radio stays <ms> on <channel> (esp_now_remain_on_channel), and counts the probe frames heard there.
  *                                With <count>, it also sends that many broadcast beacons while there, one every <interval> (50 ms), by
  *                                esp_now_send: whether a frame can be sent during a remain-on-channel, and on which channel it goes out
- *   EspNowProbeNap <channel>,<beacons>,<home ms>[,<seconds>[,<tx>[,<beacon TU>]]]
+ *   EspNowProbeNap <channel>,<beacons>,<home ms>[,<seconds>[,<tx>[,<beacon TU>[,<ps>]]]]
  *                                a station that lives on <channel> and naps on its access point: every <beacons> beacon intervals, the
  *                                radio comes home for <home ms> around the beacon (the window is anchored on the TBTT, from the station's
  *                                TSF) and stays on <channel> the rest of the time (esp_now_remain_on_channel), for <seconds> (60; up to
  *                                3600). <tx> 1 sends a broadcast beacon on <channel> each time it gets there. <beacon TU> is the access
  *                                point's beacon interval (100). The multi-channel concurrency of a Wi-Fi driver, in probe form: what the
  *                                station keeps (its beacons, its link, a ping from the LAN) and what it hears on <channel> meanwhile.
+ *                                <ps> 1 tells the access point before each stay that the station dozes (a null frame with the power
+ *                                management bit, by esp_wifi_80211_tx), and that it is awake once back (the bit clear): the access point
+ *                                keeps the station's frames while it is away, as it does for a station in power save, and sends them then
  *                                EspNowProbeNap 0 ends it after the current period
  *   EspNowProbeAway <channel>,<seconds>[,<beacon ms>]
  *                                stands in for a device with no network: the WiFi pauses, the radio goes to <channel> for <seconds>, with
@@ -89,6 +92,7 @@
                                                // callback of a frame sent away came 4 to 9 ms after the call): the request is made this much
                                                // shorter than the time left to the return
 #define ESPNOW_PROBE_NAP_MIN_WAIT_MS   5       // a remain-on-channel shorter than this is skipped
+#define ESPNOW_PROBE_NAP_PS_WAIT_MS    5       // the radio's word on a null frame is waited for this long
 #define ESPNOW_PROBE_ROC_TX_DELAY_MS   12      // a frame sent during a remain-on-channel waits this long after the request, for the radio to get there
 
 typedef struct __attribute__((packed)) {
@@ -117,6 +121,7 @@ typedef struct {
   uint16_t seconds;            // nap: how long
   uint16_t beacon_tu;          // nap: the access point's beacon interval
   uint8_t tx;                  // nap: a beacon sent on the channel each period
+  uint8_t ps;                  // nap: the access point told before each stay that the station dozes, and once back that it is awake
   EspNowProbeFrame_t frame;    // echo: the probe heard
 } EspNowProbeJob_t;
 
@@ -130,6 +135,16 @@ typedef struct {
   uint32_t no_word;
   uint8_t channel;             // what esp_wifi_get_channel said while there, the last time
 } EspNowProbeRocTx_t;
+
+// What the null frames of a nap did
+typedef struct {
+  uint32_t sent;
+  uint32_t api_err;
+  int32_t last_err;
+  uint32_t acked;
+  uint32_t failed;
+  uint32_t no_word;
+} EspNowProbeNull_t;
 
 // What one send did, as the task saw it
 typedef struct {
@@ -195,6 +210,8 @@ typedef struct {
   uint32_t late;               // the returns after the beacon's time
   EspNowProbeSpan_t late_us;   // how long after the planned return the radio was back
   uint32_t tsf_lost;           // the periods the station's TSF could not be read: not associated
+  bool ps;                     // the null frames were asked for, and the access point was known
+  EspNowProbeNull_t null;
   uint32_t ms;
   volatile bool done;
   bool reported;
@@ -205,6 +222,8 @@ struct {
   QueueHandle_t jobs = nullptr;
   SemaphoreHandle_t word = nullptr;          // the radio's word on a send
   SemaphoreHandle_t back = nullptr;          // the radio back on its channel, after a send away or a listen
+  SemaphoreHandle_t null_word = nullptr;     // the radio's word on a null frame
+  volatile bool null_ok = false;
   bool events = false;                       // the WiFi event handlers are registered
   volatile bool awaiting = false;
   uint8_t send_to[6];
@@ -356,6 +375,13 @@ void EspNowProbeCountEvent(void* arg, esp_event_base_t base, int32_t id, void* d
 /*********************************************************************************************\
  * The task: sends, listens and echoes, with the mesh's radio lock
 \*********************************************************************************************/
+
+// The radio's word on a raw frame (esp_wifi_80211_tx): the nap's null frames are the only ones the firmware sends that way
+void EspNowProbeNullDone(const esp_80211_tx_info_t* info);
+void EspNowProbeNullDone(const esp_80211_tx_info_t* info) {
+  EspNowProbe.null_ok = info && (WIFI_SEND_SUCCESS == info->tx_status);
+  if (EspNowProbe.null_word) { xSemaphoreGive(EspNowProbe.null_word); }
+}
 
 static void EspNowProbeTxLocked(const uint8_t* to, uint8_t channel, uint16_t wait_ms, const uint8_t* data, size_t len, EspNowProbeTx_t* tx);
 static void EspNowProbeTxLocked(const uint8_t* to, uint8_t channel, uint16_t wait_ms, const uint8_t* data, size_t len, EspNowProbeTx_t* tx) {
@@ -619,6 +645,34 @@ static void EspNowProbeListenRun(const EspNowProbeJob_t* job) {
   run.ms = millis() - started;
 }
 
+// A null data frame to the access point, with the power management bit set (the station dozes, and the access point keeps its frames)
+// or clear (awake again, and the access point sends what it kept): what a station's driver says before it leaves its channel, and once
+// it is back
+static void EspNowProbeNull(const uint8_t* bssid, bool doze, EspNowProbeNull_t* null);
+static void EspNowProbeNull(const uint8_t* bssid, bool doze, EspNowProbeNull_t* null) {
+  uint8_t frame[24];
+  memset(frame, 0, sizeof(frame));
+  frame[0] = 0x48;                         // a data frame of the null function subtype
+  frame[1] = doze ? 0x11 : 0x01;           // to the distribution system, with the power management bit or without it
+  memcpy(&frame[4], bssid, 6);             // to the access point
+  esp_wifi_get_mac(WIFI_IF_STA, &frame[10]);
+  memcpy(&frame[16], bssid, 6);
+  xSemaphoreTake(EspNowProbe.null_word, 0);
+  EspNowProbe.null_ok = false;
+  esp_err_t err = esp_wifi_80211_tx(WIFI_IF_STA, frame, sizeof(frame), true);
+  if (ESP_OK != err) {
+    null->api_err++;
+    null->last_err = err;
+    return;
+  }
+  null->sent++;
+  if (pdTRUE != xSemaphoreTake(EspNowProbe.null_word, pdMS_TO_TICKS(ESPNOW_PROBE_NAP_PS_WAIT_MS))) {
+    null->no_word++;
+    return;
+  }
+  if (EspNowProbe.null_ok) { null->acked++; } else { null->failed++; }
+}
+
 // Until a TSF time (µs of the station's clock), serving the echoes meanwhile; false when the TSF cannot be read
 static bool EspNowProbeNapUntil(int64_t tsf_until);
 static bool EspNowProbeNapUntil(int64_t tsf_until) {
@@ -644,6 +698,14 @@ static void EspNowProbeNapRun(const EspNowProbeJob_t* job) {
   EspNowProbe.stop = false;
   EspNowProbe.listen_channel = job->channel;
   EspNowProbe.listen_heard = 0;
+  uint8_t bssid[6] = { 0 };
+  if (job->ps && EspNowProbe.null_word) {
+    wifi_ap_record_t ap;
+    if (ESP_OK == esp_wifi_sta_get_ap_info(&ap)) {
+      memcpy(bssid, ap.bssid, 6);
+      run.ps = true;
+    }
+  }
   while (!EspNowProbe.stop && ((int32_t)(until - millis()) > 0)) {
     int64_t tsf = esp_wifi_get_tsf_time(WIFI_IF_STA);
     if (tsf <= 0) {
@@ -668,6 +730,17 @@ static void EspNowProbeNapRun(const EspNowProbeJob_t* job) {
       continue;
     }
     // The lock is held while the radio is away: no frame of the mesh goes out on the wrong channel. It is given back for the time home
+    if (run.ps) {
+      EspNowProbeNull(bssid, true, &run.null);
+      // The stay is what is left after the null frame
+      wait_us = return_at - esp_wifi_get_tsf_time(WIFI_IF_STA) - ESPNOW_PROBE_NAP_LEAVE_US;
+      if (wait_us < (int64_t)ESPNOW_PROBE_NAP_MIN_WAIT_MS * 1000) {
+        EspNowProbeNull(bssid, false, &run.null);
+        EspNowMeshRadioGive();
+        run.skipped++;
+        continue;
+      }
+    }
     EspNowProbe.listening = true;
     xSemaphoreTake(EspNowProbe.back, 0);
     esp_now_remain_on_channel_t request;
@@ -707,6 +780,7 @@ static void EspNowProbeNapRun(const EspNowProbeJob_t* job) {
       }
     }
     EspNowProbe.listening = false;
+    if (run.ps) { EspNowProbeNull(bssid, false, &run.null); }
     EspNowMeshRadioGive();
   }
   run.heard = EspNowProbe.listen_heard;
@@ -777,7 +851,8 @@ static bool EspNowProbeStart(void) {
   EspNowProbe.jobs = xQueueCreate(ESPNOW_PROBE_JOBS, sizeof(EspNowProbeJob_t));
   EspNowProbe.word = xSemaphoreCreateBinary();
   EspNowProbe.back = xSemaphoreCreateBinary();
-  if (!EspNowProbe.jobs || !EspNowProbe.word || !EspNowProbe.back) {
+  EspNowProbe.null_word = xSemaphoreCreateBinary();
+  if (!EspNowProbe.jobs || !EspNowProbe.word || !EspNowProbe.back || !EspNowProbe.null_word) {
     AddLog(LOG_LEVEL_ERROR, PSTR("EPR: No memory for the probe"));
     return false;
   }
@@ -797,6 +872,7 @@ static void EspNowProbeEvents(void) {
   esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_SCAN_DONE, &EspNowProbeCountEvent, nullptr, nullptr);
   esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_STA_BEACON_TIMEOUT, &EspNowProbeCountEvent, nullptr, nullptr);
   esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, &EspNowProbeCountEvent, nullptr, nullptr);
+  esp_wifi_register_80211_tx_cb(&EspNowProbeNullDone);
   EspNowProbe.events = (ESP_OK == a) && (ESP_OK == b);
 }
 
@@ -835,6 +911,10 @@ static void EspNowProbeRunJson(void) {
     EspNowProbeSpanJson(PSTR("LateUs"), &run.late_us);
     ResponseAppend_P(PSTR(",\"Heard\":%u"), run.heard);
     EspNowProbeRocTxJson(&run.tx);
+    if (run.ps) {
+      ResponseAppend_P(PSTR(",\"Ps\":{\"Sent\":%u,\"ApiErr\":%u,\"Err\":%d,\"Acked\":%u,\"Failed\":%u,\"NoWord\":%u}"),
+        run.null.sent, run.null.api_err, run.null.last_err, run.null.acked, run.null.failed, run.null.no_word);
+    }
     ResponseAppend_P(PSTR(",\"ScanDone\":%u,\"BeaconTimeout\":%u,\"Disconnected\":%u,\"Ms\":%u,\"Done\":%u}"),
       EspNowProbe.scan_done, EspNowProbe.beacon_timeout, EspNowProbe.disconnected, run.ms, run.done);
     return;
@@ -1039,8 +1119,8 @@ void CmndEspNowProbeNap(void) {
   }
   char text[48];
   snprintf(text, sizeof(text), "%s", XdrvMailbox.data);
-  char* fields[6];
-  uint32_t count = EspNowProbeFields(text, fields, 6);
+  char* fields[7];
+  uint32_t count = EspNowProbeFields(text, fields, 7);
   if (count < 3) {
     ResponseCmndError();
     return;
@@ -1054,6 +1134,7 @@ void CmndEspNowProbeNap(void) {
   job.seconds = (count > 3) ? atoi(fields[3]) : 60;
   job.tx = (count > 4) ? (atoi(fields[4]) ? 1 : 0) : 0;
   job.beacon_tu = (count > 5) ? atoi(fields[5]) : 100;
+  job.ps = (count > 6) ? (atoi(fields[6]) ? 1 : 0) : 0;
   if (!job.channel || (job.channel > 13) || !job.count || (job.count > 10) || (job.interval_ms < 5) || (job.interval_ms > 2000) ||
       !job.seconds || (job.seconds > ESPNOW_PROBE_NAP_MAX_S) || (job.beacon_tu < 20) || (job.beacon_tu > 1000) ||
       (job.interval_ms + ESPNOW_PROBE_NAP_MIN_WAIT_MS + (ESPNOW_PROBE_NAP_LEAVE_US + ESPNOW_PROBE_NAP_GUARD_US) / 1000 >= job.count * job.beacon_tu * 1024 / 1000)) {
