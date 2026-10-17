@@ -1165,6 +1165,10 @@ bool HasIP(void) {
   return false;
 }
 
+#ifdef USE_ESPNOW_MESH
+bool EspNowMeshStationQuiet(void);
+#endif  // USE_ESPNOW_MESH
+
 /**
  * Verifies WiFi connection status and manages reconnection
  * 
@@ -1217,6 +1221,12 @@ void WifiCheckIp(void) {
     Wifi.status = WL_CONNECTED;
   } else {
     WifiSetState(0);
+#ifdef USE_ESPNOW_MESH
+    if (EspNowMeshStationQuiet()) {  // An ESP-NOW mesh node retries a network out of reach on its own schedule (xdrv_98_3)
+      Wifi.counter = 1;
+      return;
+    }
+#endif  // USE_ESPNOW_MESH
     uint8_t wifi_config_tool = Settings->sta_config;
     Wifi.status = (Wifi.retry &1) ? WiFi.status() : 0;  // Skip every second to reset result WiFi.status()
     switch (Wifi.status) {
