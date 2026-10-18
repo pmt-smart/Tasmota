@@ -546,6 +546,7 @@ struct IdSet {
   void Clear() { memset(bits, 0, sizeof(bits)); }
   bool Has(uint8_t id) const { return ((bits[id >> 3] >> (id & 7)) & 1) != 0; }
   void Add(uint8_t id) { bits[id >> 3] = (uint8_t)(bits[id >> 3] | (1u << (id & 7))); }
+  void Remove(uint8_t id) { bits[id >> 3] = (uint8_t)(bits[id >> 3] & ~(1u << (id & 7))); }
 };
 
 // What a neighbour is worth to this node as a peer of the radio's table, from the least to the most (Node::PeerRoleOf)
@@ -1167,6 +1168,18 @@ class Node {
 
   // The neighbours, by slot: a slot that is not in use is null
   const Neighbor *NeighborAt(unsigned i) const { return i < kMaxNeighbors && nbrs_[i].used ? &nbrs_[i] : nullptr; }
+
+  // The node `id` left the network (the application took it out of its nodes): this node keeps nothing of it as a neighbour, no verdict
+  // that it is silent, no sync asked of it, no transfer from it, and does not count on it as a repeater. The window of its frames stays, as
+  // the guard against old frames played again, and goes as any window does when its slot is wanted; what waits to go to it, or for its
+  // answer, ends as anything unanswered does
+  void Forget(uint8_t id) {
+    for (unsigned i = 0; i < kMaxNeighbors; i++) if (nbrs_[i].used && nbrs_[i].id == id) memset(&nbrs_[i], 0, sizeof(nbrs_[i]));
+    for (unsigned i = 0; i < kMaxOrigins; i++) if (mutes_[i].used && mutes_[i].node == id) mutes_[i].used = false;
+    for (unsigned i = 0; i < kSyncSize; i++) if (asks_[i].used && asks_[i].target == id) asks_[i].used = false;
+    for (unsigned i = 0; i < kBulkInSize; i++) if (bulkIn_[i].used && bulkIn_[i].origin == id) bulkIn_[i].used = false;
+    relays_.Remove(id);
+  }
 
   const Neighbor *NeighborOf(uint8_t id) const {
     for (unsigned i = 0; i < kMaxNeighbors; i++) if (nbrs_[i].used && nbrs_[i].id == id) return &nbrs_[i];

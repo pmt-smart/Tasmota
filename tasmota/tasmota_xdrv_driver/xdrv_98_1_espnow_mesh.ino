@@ -1087,6 +1087,24 @@ static void EspNowMeshApplyShared(EspNowMesh::Node* node, EspNowMeshShared_t* sh
       EspNowMeshDriver.crypto->ForgetPeer(old_entry.id);
     }
   }
+  // A node that left the table, in none of its slots now, is forgotten by the core as well, and its place among the radio's peers is
+  // given back: nothing of it stays once the application has taken it out
+  for (uint32_t i = 0; i < ESPNOW_MESH_NODES; i++) {
+    const EspNowMeshNode_t& old_entry = EspNowMeshTable[i];
+    if (!old_entry.id) { continue; }
+    bool kept = false;
+    for (uint32_t j = 0; (j < ESPNOW_MESH_NODES) && !kept; j++) { kept = (fresh->node[j].id == old_entry.id); }
+    if (kept) { continue; }
+    node->Forget(old_entry.id);
+    if (EspNowMeshRadioTake(100)) {
+      int32_t peer = EspNowMeshPeerFind(old_entry.mac);
+      if (peer >= 0) {
+        if (EspNowMeshDriver.radio) { esp_now_del_peer(EspNowMeshPeers[peer].mac); }
+        EspNowMeshPeers[peer].used = false;
+      }
+      EspNowMeshRadioGive();
+    }
+  }
   for (uint32_t i = 0; i < ESPNOW_MESH_NODES; i++) {
     const EspNowMeshNode_t& old_entry = EspNowMeshTable[i];
     const EspNowMeshNode_t& entry = fresh->node[i];
