@@ -1339,12 +1339,15 @@ static void EspNowMeshSnapshotMake(EspNowMesh::Node* node) {
   xSemaphoreGive(EspNowMeshDriver.lock);
 }
 
-// The frames the radio has handed the task, to the core
+// The frames the radio has handed the task, to the core, and what each holds for the main loop on to it at once: the core's inbox keeps 8,
+// and the radio's queue can hold twice as many frames for this device
+static void EspNowMeshDrain(EspNowMesh::Node* node);
 static void EspNowMeshTakeFrames(EspNowMesh::Node* node);
 static void EspNowMeshTakeFrames(EspNowMesh::Node* node) {
   EspNowMeshRx_t rx;
   while (pdTRUE == xQueueReceive(EspNowMeshDriver.rx, &rx, 0)) {
     node->OnReceive(rx.data, rx.len, rx.mac, rx.rssi, millis(), false);
+    EspNowMeshDrain(node);
   }
 }
 
@@ -1364,7 +1367,6 @@ static void EspNowMeshPump(EspNowMesh::Node* node) {
     if (paths & EspNowMesh::kPathRadio) { ok = EspNowMeshRadioSend(to, frame, len); }
     node->TxDone(ok, millis());
     EspNowMeshTakeFrames(node);
-    EspNowMeshDrain(node);                   // and what they hold for the main loop goes on, before the core's inbox of 8 is full
   }
 }
 
