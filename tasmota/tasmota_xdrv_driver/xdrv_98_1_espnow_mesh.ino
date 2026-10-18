@@ -194,7 +194,7 @@
 #define ESPNOW_MESH_UDP_PORT           47474
 #define ESPNOW_MESH_RX_DEPTH           16          // frames heard, on their way to the task: a node that answers a burst from several neighbours, and hears the copies of their repeats, takes 8 in a few ms
 #define ESPNOW_MESH_CMD_DEPTH          4
-#define ESPNOW_MESH_EVENT_DEPTH        8           // frames for the application on their way to the main loop: the inbox of the core keeps 8 more
+#define ESPNOW_MESH_EVENT_DEPTH        24          // frames for the application on their way to the main loop, which takes each through the rules: 40 at once from five nodes found 8 full 57 times; the inbox of the core keeps 8 more
 #define ESPNOW_MESH_NOTE_DEPTH         16          // outcomes and notices on their way to the main loop: the core keeps 8 of each
 #define ESPNOW_MESH_SENT_DEPTH         16          // the frames sent with an answer asked, whose ticket is kept until their outcome comes
 #define ESPNOW_MESH_TASK_STACK         6144
