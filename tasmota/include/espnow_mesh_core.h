@@ -1323,6 +1323,13 @@ class Node {
     return false;
   }
 
+  // The neighbour a frame of this node's for `dest` goes to next, as it would be sent now: dest itself when it is a neighbour counted on, then a
+  // neighbour counted on whose heartbeat lists it, then the way back. 0 when no way is known
+  uint8_t NextHop(uint8_t dest, uint32_t now) const {
+    uint8_t mac[6];
+    return NextHopFor(dest, now, mac);
+  }
+
   bool PopNotice(Notice *out) {
     if (noticeCount_ == 0) return false;
     *out = notices_[noticeHead_];

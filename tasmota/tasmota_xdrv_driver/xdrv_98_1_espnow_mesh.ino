@@ -165,6 +165,9 @@
  *   espnow_mesh_age(stamp)                  - a map of how old a stamp is by this device's clock now: age (ms, signed: negative for one from the future),
  *                                             tag (true when the stamp is of this device's timeline: the time of another has no meaning here) and
  *                                             synced; false when the bytes are not a stamp or the task is not running
+ *   espnow_mesh_route(dest)                 - the neighbour a frame for dest goes to next, as the task last saw it (up to half a second ago): dest
+ *                                             itself, a neighbour whose heartbeat lists it, or the way back; 0 when no way is known, false when the
+ *                                             task is not running
  *   espnow_mesh_neighbors()                 - a list with a map for each neighbour, as the task last saw them (up to half a second ago): id, state (0 alive,
  *                                             1 suspect, 2 silent), rssi, age (ms since something of it got through), beat (ms since its last heartbeat, -1
  *                                             if none), info (hex: the application's bytes of its last heartbeat, which are its to say), seen and skew (the
@@ -351,6 +354,9 @@ typedef struct {
   uint8_t silent_count;
   uint8_t needs_key;                         // this device hears frames whose tag it cannot check, and none that it can
   uint8_t silent[ESPNOW_MESH_NODES];
+  uint8_t routes;                            // the nodes of the table but this one, and for each the neighbour a frame for it goes to next (0: no way known)
+  uint8_t route_id[ESPNOW_MESH_NODES];
+  uint8_t route_next[ESPNOW_MESH_NODES];
   uint16_t stack_free;
   bool net_up;
   EspNowMesh::Health health;                 // what the heartbeats say of the surroundings, two hops deep
@@ -1319,6 +1325,13 @@ static void EspNowMeshSnapshotMake(EspNowMesh::Node* node) {
     if (EspNowMeshTable[i].id && node->IsSilent(EspNowMeshTable[i].id) && (s->silent_count < ESPNOW_MESH_NODES)) {
       s->silent[s->silent_count++] = EspNowMeshTable[i].id;
     }
+  }
+  for (uint32_t i = 0; i < ESPNOW_MESH_NODES; i++) {
+    uint8_t id = EspNowMeshTable[i].id;
+    if (!id || (id == EspNowMeshSettings.id) || (s->routes >= ESPNOW_MESH_NODES)) { continue; }
+    s->route_id[s->routes] = id;
+    s->route_next[s->routes] = node->NextHop(id, now);
+    s->routes++;
   }
   s->health_links = node->HealthReport(&s->health, s->link, EspNowMesh::kMaxNeighbors, now);
   s->stack_free = stack_free;
@@ -2331,6 +2344,9 @@ void CmndEspNowMeshClock(void) {
 //   espnow_mesh_clock()                      -> a map of the mesh clock (synced, adopted, ticks10, ticks100, tag, timeline, taken, lo, hi), or false
 //   espnow_mesh_stamp()                      -> the 6 bytes that stamp a message with the mesh time and the tag of the timeline, or false when not synced
 //   espnow_mesh_age(stamp)                   -> a map (age in ms, tag, synced) of how old a stamp is, or false
+//   espnow_mesh_route(dest)                  -> the neighbour a frame for dest goes to next, as the task last saw it: dest itself when it is a neighbour
+//                                               counted on, then a neighbour counted on whose heartbeat lists it, then the way back its flooded frames
+//                                               came by; 0 when no way is known or dest is not in the table, false when the task is not running
 //   espnow_mesh_neighbors()                  -> a list of maps, one for each neighbour (id, state, rssi, age, beat, info, seen, skew, key, keybits), or false.
 //                                               key is the version of the network's key its heartbeat says it sends with (0: it does not say), and keybits has
 //                                               1 it holds the previous key, 2 it needs the key, 4 its heartbeat came under the previous key's tag
@@ -2377,6 +2393,27 @@ int EspNowMeshBerryMaxPayload(struct bvm *vm) {
     be_return(vm);
   }
   be_raise(vm, kTypeError, nullptr);
+}
+
+int EspNowMeshBerryRoute(struct bvm *vm);
+int EspNowMeshBerryRoute(struct bvm *vm) {
+  if ((be_top(vm) < 1) || !be_isint(vm, 1)) { be_raise(vm, kTypeError, nullptr); }
+  int32_t dest = be_toint(vm, 1);
+  int32_t next = -1;
+  if (EspNowMeshDriver.running && EspNowMeshDriver.snapshot && (pdTRUE == xSemaphoreTake(EspNowMeshDriver.lock, pdMS_TO_TICKS(50)))) {
+    const EspNowMeshSnapshot_t* snap = EspNowMeshDriver.snapshot;
+    next = 0;
+    for (uint32_t i = 0; i < snap->routes; i++) {
+      if (snap->route_id[i] == dest) { next = snap->route_next[i]; break; }
+    }
+    xSemaphoreGive(EspNowMeshDriver.lock);
+  }
+  if (next < 0) {
+    be_pushbool(vm, false);
+  } else {
+    be_pushint(vm, (bint)next);
+  }
+  be_return(vm);
 }
 
 int EspNowMeshBerryReady(struct bvm *vm);
@@ -2578,6 +2615,9 @@ static void EspNowMeshBerryRegister(void) {
   be_pop(berry.vm, 1);
   be_pushntvfunction(berry.vm, EspNowMeshBerryNeighbors);
   be_setglobal(berry.vm, "espnow_mesh_neighbors");
+  be_pop(berry.vm, 1);
+  be_pushntvfunction(berry.vm, EspNowMeshBerryRoute);
+  be_setglobal(berry.vm, "espnow_mesh_route");
   be_pop(berry.vm, 1);
 }
 
