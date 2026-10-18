@@ -1364,6 +1364,7 @@ static void EspNowMeshPump(EspNowMesh::Node* node) {
     if (paths & EspNowMesh::kPathRadio) { ok = EspNowMeshRadioSend(to, frame, len); }
     node->TxDone(ok, millis());
     EspNowMeshTakeFrames(node);
+    EspNowMeshDrain(node);                   // and what they hold for the main loop goes on, before the core's inbox of 8 is full
   }
 }
 

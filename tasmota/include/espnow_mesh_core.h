@@ -1474,8 +1474,9 @@ class Node {
   uint32_t BeatPeriod() const { return cfg_.beatEveryMs + kBeatJitterMs / 2; }
 
   // A neighbour heard on the radio lately and not under suspicion
+  // Heard lately on the radio: a neighbour the probes keep alive through the others, or that comes by the network alone, is alive and not heard
   bool Heard(const Neighbor &n, uint32_t now) const {
-    return n.used && n.state == kAlive && n.rssi != 0 && (int32_t)(now - n.lastHeard) < (int32_t)kHeardWindowMs;
+    return n.used && n.state == kAlive && n.rssi != 0 && (int32_t)(now - n.radioAt) < (int32_t)kHeardWindowMs;
   }
 
   // The groups of a set of neighbours, by the smallest of each: the ones that two neighbours listing each other or the same node make one
@@ -1872,7 +1873,7 @@ class Node {
     for (unsigned i = 0; i < kMaxNeighbors; i++) {
       const Neighbor &m = nbrs_[i];
       if (!m.used || m.state != kAlive || m.rssi == 0 || m.listsMe == 2 || m.id == origin) continue;
-      if ((int32_t)(now - m.lastHeard) >= (int32_t)kHeardWindowMs) continue;
+      if ((int32_t)(now - m.radioAt) >= (int32_t)kHeardWindowMs) continue;
       bool covered = false;
       for (unsigned k = 0; k < t.fromCount && !covered; k++) {
         if (t.from[k] == m.id) { covered = true; break; }
@@ -2537,7 +2538,7 @@ class Node {
     uint8_t count = 0;
     for (unsigned i = 0; i < kMaxNeighbors; i++) {
       const Neighbor &n = nbrs_[i];
-      if (!n.used || n.rssi == 0 || (int32_t)(now - n.lastHeard) >= (int32_t)kHeardWindowMs) continue;
+      if (!n.used || n.rssi == 0 || (int32_t)(now - n.radioAt) >= (int32_t)kHeardWindowMs) continue;
       p[at++] = n.id;
       p[at++] = (uint8_t)n.rssi;
       count++;
