@@ -189,7 +189,7 @@
 #define ESPNOW_MESH_NVS_NAMESPACE      "espnowmesh"
 #define ESPNOW_MESH_NODES              48          // as many as the core keeps of origins and of neighbours
 #define ESPNOW_MESH_UDP_PORT           47474
-#define ESPNOW_MESH_RX_DEPTH           8
+#define ESPNOW_MESH_RX_DEPTH           16          // frames heard, on their way to the task: a node that answers a burst from several neighbours, and hears the copies of their repeats, takes 8 in a few ms
 #define ESPNOW_MESH_CMD_DEPTH          4
 #define ESPNOW_MESH_EVENT_DEPTH        8           // frames for the application on their way to the main loop: the inbox of the core keeps 8 more
 #define ESPNOW_MESH_NOTE_DEPTH         16          // outcomes and notices on their way to the main loop: the core keeps 8 of each
@@ -1325,8 +1325,18 @@ static void EspNowMeshSnapshotMake(EspNowMesh::Node* node) {
   xSemaphoreGive(EspNowMeshDriver.lock);
 }
 
+// The frames the radio has handed the task, to the core
+static void EspNowMeshTakeFrames(EspNowMesh::Node* node);
+static void EspNowMeshTakeFrames(EspNowMesh::Node* node) {
+  EspNowMeshRx_t rx;
+  while (pdTRUE == xQueueReceive(EspNowMeshDriver.rx, &rx, 0)) {
+    node->OnReceive(rx.data, rx.len, rx.mac, rx.rssi, millis(), false);
+  }
+}
+
 // What the core has ready to send, one frame at a time: by the network if it says so, then by the radio, whose word on it the
-// core is given
+// core is given. What was heard while a frame went is taken before the next goes: a send waits for the radio's word, a few ms on a
+// busy channel, and the frames that come meanwhile, the answers among them, would otherwise wait for the whole turn
 static void EspNowMeshPump(EspNowMesh::Node* node);
 static void EspNowMeshPump(EspNowMesh::Node* node) {
   uint8_t frame[EspNowMesh::kMaxFrame];
@@ -1339,6 +1349,7 @@ static void EspNowMeshPump(EspNowMesh::Node* node) {
     bool ok = true;
     if (paths & EspNowMesh::kPathRadio) { ok = EspNowMeshRadioSend(to, frame, len); }
     node->TxDone(ok, millis());
+    EspNowMeshTakeFrames(node);
   }
 }
 
@@ -1362,10 +1373,7 @@ static void EspNowMeshTask(void* argument) {
     EspNowMeshCmd_t cmd;
     while (pdTRUE == xQueueReceive(EspNowMeshDriver.cmd, &cmd, 0)) { EspNowMeshDoCommand(node, &cmd); }
 
-    EspNowMeshRx_t rx;
-    while (pdTRUE == xQueueReceive(EspNowMeshDriver.rx, &rx, 0)) {
-      node->OnReceive(rx.data, rx.len, rx.mac, rx.rssi, millis(), false);
-    }
+    EspNowMeshTakeFrames(node);
     EspNowMeshUdpPoll(node);
 
     uint32_t now = millis();
