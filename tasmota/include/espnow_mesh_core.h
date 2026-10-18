@@ -1292,15 +1292,15 @@ class Node {
   uint8_t PeerRoleOf(const uint8_t mac[6], uint32_t now) const {
     const Neighbor *peer = nullptr;
     for (unsigned i = 0; i < kMaxNeighbors; i++) if (nbrs_[i].used && memcmp(nbrs_[i].mac, mac, 6) == 0) peer = &nbrs_[i];
-    if (peer == nullptr || !Heard(*peer, now)) return kPeerGone;
+    if (peer == nullptr || !Alive(*peer, now)) return kPeerGone;
     IdSet direct, once, twice;
     direct.Clear();
     once.Clear();
     twice.Clear();
-    for (unsigned i = 0; i < kMaxNeighbors; i++) if (Heard(nbrs_[i], now)) direct.Add(nbrs_[i].id);
+    for (unsigned i = 0; i < kMaxNeighbors; i++) if (Alive(nbrs_[i], now)) direct.Add(nbrs_[i].id);
     for (unsigned i = 0; i < kMaxNeighbors; i++) {
       const Neighbor &n = nbrs_[i];
-      if (!Heard(n, now)) continue;
+      if (!Alive(n, now)) continue;
       for (unsigned j = 0; j < n.hearsCount; j++) {
         uint8_t t = n.hears[j];
         if (t == 0 || t == kToAll || t == cfg_.id || direct.Has(t)) continue;
@@ -1477,6 +1477,11 @@ class Node {
   // Heard lately on the radio: a neighbour the probes keep alive through the others, or that comes by the network alone, is alive and not heard
   bool Heard(const Neighbor &n, uint32_t now) const {
     return n.used && n.state == kAlive && n.rssi != 0 && (int32_t)(now - n.radioAt) < (int32_t)kHeardWindowMs;
+  }
+
+  // A neighbour of the radio known to be there lately, by the radio or by the probes through the others: what a peer of the radio's table is worth
+  bool Alive(const Neighbor &n, uint32_t now) const {
+    return n.used && n.state == kAlive && n.rssi != 0 && (int32_t)(now - n.lastHeard) < (int32_t)kHeardWindowMs;
   }
 
   // The groups of a set of neighbours, by the smallest of each: the ones that two neighbours listing each other or the same node make one
