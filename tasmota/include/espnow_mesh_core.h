@@ -1324,10 +1324,16 @@ class Node {
   }
 
   // The neighbour a frame of this node's for `dest` goes to next, as it would be sent now: dest itself when it is a neighbour counted on, then a
-  // neighbour counted on whose heartbeat lists it, then the way back. 0 when no way is known
-  uint8_t NextHop(uint8_t dest, uint32_t now) const {
+  // neighbour counted on whose heartbeat lists it, then the way back. 0 when no way is known. `how` gets which of the three it is (1, 2 or 3,
+  // 0 for none): the first two are as fresh as the last heartbeats, the way back as the last frame of `dest` heard, however old
+  uint8_t NextHop(uint8_t dest, uint32_t now, uint8_t *how = nullptr) const {
     uint8_t mac[6];
-    return NextHopFor(dest, now, mac);
+    uint8_t next = NextHopFor(dest, now, mac);
+    if (how != nullptr) {
+      const Neighbor *by = next != 0 && next != dest ? NeighborOf(next) : nullptr;
+      *how = next == 0 ? 0 : (next == dest ? 1 : ((by != nullptr && Usable(*by, now) && Lists(*by, dest)) ? 2 : 3));
+    }
+    return next;
   }
 
   bool PopNotice(Notice *out) {

@@ -165,9 +165,9 @@
  *   espnow_mesh_age(stamp)                  - a map of how old a stamp is by this device's clock now: age (ms, signed: negative for one from the future),
  *                                             tag (true when the stamp is of this device's timeline: the time of another has no meaning here) and
  *                                             synced; false when the bytes are not a stamp or the task is not running
- *   espnow_mesh_route(dest)                 - the neighbour a frame for dest goes to next, as the task last saw it (up to half a second ago): dest
- *                                             itself, a neighbour whose heartbeat lists it, or the way back; 0 when no way is known, false when the
- *                                             task is not running
+ *   espnow_mesh_route(dest)                 - [next, how]: the neighbour a frame for dest goes to next, as the task last saw it (up to half a second
+ *                                             ago), and how: 1 dest itself, 2 a neighbour whose heartbeat lists it, 3 the way back; [0, 0] when no
+ *                                             way is known, false when the task is not running
  *   espnow_mesh_neighbors()                 - a list with a map for each neighbour, as the task last saw them (up to half a second ago): id, state (0 alive,
  *                                             1 suspect, 2 silent), rssi, age (ms since something of it got through), beat (ms since its last heartbeat, -1
  *                                             if none), info (hex: the application's bytes of its last heartbeat, which are its to say), seen and skew (the
@@ -357,6 +357,7 @@ typedef struct {
   uint8_t routes;                            // the nodes of the table but this one, and for each the neighbour a frame for it goes to next (0: no way known)
   uint8_t route_id[ESPNOW_MESH_NODES];
   uint8_t route_next[ESPNOW_MESH_NODES];
+  uint8_t route_how[ESPNOW_MESH_NODES];      // 1 it is a neighbour, 2 a neighbour's heartbeat lists it, 3 the way back its frames came by
   uint16_t stack_free;
   bool net_up;
   EspNowMesh::Health health;                 // what the heartbeats say of the surroundings, two hops deep
@@ -1330,7 +1331,7 @@ static void EspNowMeshSnapshotMake(EspNowMesh::Node* node) {
     uint8_t id = EspNowMeshTable[i].id;
     if (!id || (id == EspNowMeshSettings.id) || (s->routes >= ESPNOW_MESH_NODES)) { continue; }
     s->route_id[s->routes] = id;
-    s->route_next[s->routes] = node->NextHop(id, now);
+    s->route_next[s->routes] = node->NextHop(id, now, &s->route_how[s->routes]);
     s->routes++;
   }
   s->health_links = node->HealthReport(&s->health, s->link, EspNowMesh::kMaxNeighbors, now);
@@ -2344,9 +2345,11 @@ void CmndEspNowMeshClock(void) {
 //   espnow_mesh_clock()                      -> a map of the mesh clock (synced, adopted, ticks10, ticks100, tag, timeline, taken, lo, hi), or false
 //   espnow_mesh_stamp()                      -> the 6 bytes that stamp a message with the mesh time and the tag of the timeline, or false when not synced
 //   espnow_mesh_age(stamp)                   -> a map (age in ms, tag, synced) of how old a stamp is, or false
-//   espnow_mesh_route(dest)                  -> the neighbour a frame for dest goes to next, as the task last saw it: dest itself when it is a neighbour
-//                                               counted on, then a neighbour counted on whose heartbeat lists it, then the way back its flooded frames
-//                                               came by; 0 when no way is known or dest is not in the table, false when the task is not running
+//   espnow_mesh_route(dest)                  -> [next, how], the neighbour a frame for dest goes to next as the task last saw it, and how: 1 dest itself, a
+//                                               neighbour counted on; 2 a neighbour counted on whose heartbeat lists it; 3 the way back its flooded frames came
+//                                               by, as old as the last of them. [0, 0] when no way is known or dest is not in the table; false when the task is
+//                                               not running. A heartbeat is not repeated: a script that sees a node by its heartbeats sees one hop, and this
+//                                               says what lies behind
 //   espnow_mesh_neighbors()                  -> a list of maps, one for each neighbour (id, state, rssi, age, beat, info, seen, skew, key, keybits), or false.
 //                                               key is the version of the network's key its heartbeat says it sends with (0: it does not say), and keybits has
 //                                               1 it holds the previous key, 2 it needs the key, 4 its heartbeat came under the previous key's tag
@@ -2400,19 +2403,27 @@ int EspNowMeshBerryRoute(struct bvm *vm) {
   if ((be_top(vm) < 1) || !be_isint(vm, 1)) { be_raise(vm, kTypeError, nullptr); }
   int32_t dest = be_toint(vm, 1);
   int32_t next = -1;
+  int32_t how = 0;
   if (EspNowMeshDriver.running && EspNowMeshDriver.snapshot && (pdTRUE == xSemaphoreTake(EspNowMeshDriver.lock, pdMS_TO_TICKS(50)))) {
     const EspNowMeshSnapshot_t* snap = EspNowMeshDriver.snapshot;
     next = 0;
     for (uint32_t i = 0; i < snap->routes; i++) {
-      if (snap->route_id[i] == dest) { next = snap->route_next[i]; break; }
+      if (snap->route_id[i] == dest) { next = snap->route_next[i]; how = snap->route_how[i]; break; }
     }
     xSemaphoreGive(EspNowMeshDriver.lock);
   }
   if (next < 0) {
     be_pushbool(vm, false);
-  } else {
-    be_pushint(vm, (bint)next);
+    be_return(vm);
   }
+  be_newobject(vm, "list");
+  be_pushint(vm, (bint)next);
+  be_data_push(vm, -2);
+  be_pop(vm, 1);
+  be_pushint(vm, (bint)how);
+  be_data_push(vm, -2);
+  be_pop(vm, 1);
+  be_pop(vm, 1);
   be_return(vm);
 }
 
