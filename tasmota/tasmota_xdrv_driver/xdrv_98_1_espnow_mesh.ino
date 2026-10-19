@@ -340,6 +340,7 @@ typedef struct {
   uint8_t clock_seen;                        // 0 its heartbeat carried no clock, 1 it did and it is in another timeline, 2 the same
   uint8_t key_version;                       // the version of the network's key its heartbeat says it sends with, 0 if it does not say
   uint8_t key_bits;                          // 1 it holds the previous key, 2 it needs the key, 4 its heartbeat came under the previous key's tag
+  uint8_t fwd;                               // the percent of this device's last unicast frames to it that were acknowledged, 255 not judged
 } EspNowMeshNeighbor_t;
 
 // What the task publishes for the status commands
@@ -1323,6 +1324,7 @@ static void EspNowMeshSnapshotMake(EspNowMesh::Node* node) {
     out.clock_seen = n->clockSeen;
     out.key_version = n->keyVersion;
     out.key_bits = n->keyBits;
+    out.fwd = node->SendQuality(*n, now);
   }
   for (uint32_t i = 0; i < ESPNOW_MESH_NODES; i++) {
     if (EspNowMeshTable[i].id && node->IsSilent(EspNowMeshTable[i].id) && (s->silent_count < ESPNOW_MESH_NODES)) {
@@ -2232,9 +2234,9 @@ void CmndEspNowMeshNeighbors(void) {
     char info[2 * EspNowMesh::kMaxInfo + 1];
     ToHex_P(n.info, n.info_len, info, sizeof(info));
     char entry[ESPNOW_MESH_ENTRY_MAX];
-    int len = snprintf_P(entry, sizeof(entry), PSTR("%s{\"Id\":%u,\"State\":\"%s\",\"Rssi\":%d,\"TheirRssi\":%d,\"Lists\":%u,\"NoRadio\":%u,\"Age\":%u,\"Beat\":%d,\"Hears\":%u,\"Key\":%u,\"KeyBits\":%u,\"Info\":\"%s\"}"),
+    int len = snprintf_P(entry, sizeof(entry), PSTR("%s{\"Id\":%u,\"State\":\"%s\",\"Rssi\":%d,\"TheirRssi\":%d,\"Lists\":%u,\"NoRadio\":%u,\"Age\":%u,\"Beat\":%d,\"Hears\":%u,\"Key\":%u,\"KeyBits\":%u,\"Fwd\":%u,\"Info\":\"%s\"}"),
       (i == first) ? PSTR("") : PSTR(","), n.id, EspNowMeshStateName(n.state), n.rssi, n.their_rssi, n.lists_me, n.no_radio, n.age_s,
-      (0xFFFF == n.beat_s) ? -1 : (int)n.beat_s, n.hears, n.key_version, n.key_bits, info);
+      (0xFFFF == n.beat_s) ? -1 : (int)n.beat_s, n.hears, n.key_version, n.key_bits, n.fwd, info);
     if ((i > first) && !EspNowMeshPageRoom((len > 0) ? (size_t)len : sizeof(entry))) { break; }
     ResponseAppend_P(PSTR("%s"), entry);
   }

@@ -242,6 +242,9 @@ constexpr unsigned kBeatWindow = 16;         // the heartbeat intervals the deli
 constexpr unsigned kLinkMinSlots = 4;        // fewer intervals than this are too few to say anything of a link
 constexpr uint8_t kLinkGoodPercent = 50;     // a neighbour that delivers fewer of its heartbeats than this is heard, but not counted on as a way
 constexpr uint8_t kQualityUnknown = 255;     // the delivery of a neighbour not yet judged
+constexpr unsigned kSendWindow = 8;           // the last unicast frames to a neighbour whose outcome says how well this node reaches it
+constexpr unsigned kSendMinSlots = 3;         // fewer outcomes than this say nothing
+constexpr uint32_t kSendForgetMs = 60000;     // and outcomes older than this neither: a neighbour left alone as a way is tried again after it
 
 // The change of the network's key. A node that takes a new key holds the one it had too, as the previous key, until the change has reached every node
 // (Crypto::ChangeGroupKey, and SetKeyState here). In the time the others have to take it, kKeyConvergeMs from the moment this node took it, a frame
@@ -529,6 +532,9 @@ struct Neighbor {
   uint8_t clockHold;                           // its heartbeats in a row that show a timeline of a lower identity behind this node's by more than the band and no more than kClockWideMs
   uint8_t keyVersion;                          // the version of the network's key that its heartbeat says it sends with; 0 when it does not say
   uint8_t keyBits;                             // kKeyHoldsPrevious, kKeyNeeds, kKeyUnderPrevious
+  uint8_t sendSlots;                           // the outcomes below, up to kSendWindow
+  uint8_t sendBits;                            // one bit for each unicast frame of this node's to it, the latest the lowest: set when the radio said it was acknowledged
+  uint32_t sendAt;                             // when the latest of them came; 0 before the first
 };
 
 // What the supervision has to tell the application
@@ -1089,6 +1095,7 @@ class Node {
     bool again = false;
     // a ping to a node that is gone fails for want of the node, and says nothing of the channel
     if (unicast && pingTarget == 0) { noiseTried_++; if (!ok) noiseFailed_++; }
+    if (unicast) NoteSend(inflight_.to, ok, now);
     if (unicast && !ok) {
       if (++inflight_.tries < kHopTries) {
         TxItem *slot = FreeSlot();
@@ -1190,6 +1197,22 @@ class Node {
   // An interval in which one is overdue counts against it, so a neighbour that has gone quiet falls as the intervals pass. The signal
   // says how strongly a frame is heard and not how many of them are: a strong link that loses frames reads high there and low here.
   // kQualityUnknown while fewer than kLinkMinSlots intervals have been judged, or with no heartbeats
+  // How well this node reaches a neighbour: the percent of its last unicast frames to it that the radio said were acknowledged, the other way
+  // from LinkQuality, which is how well the neighbour's heartbeats reach this node. kQualityUnknown with fewer than kSendMinSlots outcomes, or
+  // none within kSendForgetMs
+  uint8_t SendQuality(const Neighbor &n, uint32_t now) const {
+    if (n.sendSlots < kSendMinSlots || n.sendAt == 0 || (int32_t)(now - n.sendAt) >= (int32_t)kSendForgetMs) return kQualityUnknown;
+    unsigned ones = 0;
+    for (uint8_t b = n.sendBits; b != 0; b &= (uint8_t)(b - 1)) ones++;
+    return (uint8_t)(ones * 100 / n.sendSlots);
+  }
+
+  // Whether this node's frames get to a neighbour well enough for it to be a way: not judged, or acknowledged at least kLinkGoodPercent of the time
+  bool SendsTo(const Neighbor &n, uint32_t now) const {
+    uint8_t s = SendQuality(n, now);
+    return s == kQualityUnknown || s >= kLinkGoodPercent;
+  }
+
   uint8_t LinkQuality(const Neighbor &n, uint32_t now) const {
     if (cfg_.beatEveryMs == 0 || n.beatRadioAt == 0) return kQualityUnknown;
     uint32_t period = BeatPeriod();
@@ -1536,6 +1559,19 @@ class Node {
 
   // A hop to `mac` for a frame to `dest` failed for good: the way to `dest` through it is kept, for there may be no other yet, but it
   // counts as the farthest, and the next frame heard from `dest`, by whatever neighbour, takes its place
+  // The radio's word on a unicast frame of this node's to the neighbour at `mac`, kept in the neighbour's window
+  void NoteSend(const uint8_t mac[6], bool ok, uint32_t now) {
+    for (unsigned i = 0; i < kMaxNeighbors; i++) {
+      Neighbor &n = nbrs_[i];
+      if (!n.used || memcmp(n.mac, mac, 6) != 0) continue;
+      if (n.sendAt != 0 && (int32_t)(now - n.sendAt) >= (int32_t)kSendForgetMs) n.sendSlots = 0;
+      n.sendBits = (uint8_t)((n.sendBits << 1) | (ok ? 1 : 0));
+      if (n.sendSlots < kSendWindow) n.sendSlots++;
+      n.sendAt = now == 0 ? 1 : now;
+      return;
+    }
+  }
+
   void DemoteRoute(uint8_t dest, const uint8_t mac[6]) {
     Origin *d = FindOrigin(dest, false);
     if (d != nullptr && d->routed && memcmp(d->via, mac, 6) == 0) d->routeHops = 0;
@@ -1775,16 +1811,21 @@ class Node {
   // counted on that lists it and delivers best, then the way back. 0 when this node knows none, or the way is by the network
   uint8_t NextHopFor(uint8_t dest, uint32_t now, uint8_t mac[6]) const {
     if (dest == kToAll || dest == cfg_.id) return 0;
+    // a neighbour this node's unicast frames do not get to is no way, whatever its heartbeats say (SendsTo)
     const Neighbor *direct = NeighborOf(dest);
-    if (direct != nullptr && !direct->noRadio && Usable(*direct, now)) { memcpy(mac, direct->mac, 6); return dest; }
+    if (direct != nullptr && !direct->noRadio && Usable(*direct, now) && SendsTo(*direct, now)) { memcpy(mac, direct->mac, 6); return dest; }
     const Neighbor *best = nullptr;
     unsigned bestScore = 0;
     for (unsigned i = 0; i < kMaxNeighbors; i++) {
       const Neighbor &n = nbrs_[i];
-      if (!n.used || n.noRadio || !Usable(n, now) || !Lists(n, dest)) continue;
+      if (!n.used || n.noRadio || !Usable(n, now) || !SendsTo(n, now) || !Lists(n, dest)) continue;
       uint8_t q = LinkQuality(n, now);
+      if (q == kQualityUnknown) q = kRouteUnknownPercent;
+      // the worse of the two ways the link is known by: its heartbeats here, this node's frames there
+      uint8_t s = SendQuality(n, now);
+      if (s != kQualityUnknown && s < q) q = s;
       // the delivery first, then the signal: a neighbour heard at -40 dBm scores 60 more than one at -100
-      unsigned score = (unsigned)(q == kQualityUnknown ? kRouteUnknownPercent : q) * 256 + (unsigned)(n.rssi + 128);
+      unsigned score = (unsigned)q * 256 + (unsigned)(n.rssi + 128);
       if (best == nullptr || score > bestScore) { best = &n; bestScore = score; }
     }
     if (best != nullptr) { memcpy(mac, best->mac, 6); return best->id; }
@@ -1793,6 +1834,8 @@ class Node {
       if (!o.used || o.id != dest || !o.routed || o.viaUdp) continue;
       uint8_t via = NodeOf(o.via);
       if (via == 0) return 0;
+      const Neighbor *v = NeighborOf(via);
+      if (v != nullptr && !SendsTo(*v, now)) return 0;
       memcpy(mac, o.via, 6);
       return via;
     }
