@@ -1202,8 +1202,10 @@ class Node {
   // none within kSendForgetMs
   uint8_t SendQuality(const Neighbor &n, uint32_t now) const {
     if (n.sendSlots < kSendMinSlots || n.sendAt == 0 || (int32_t)(now - n.sendAt) >= (int32_t)kSendForgetMs) return kQualityUnknown;
+    // only the bits of the outcomes counted: the ones older than the window, or than a forgetting, are not
+    uint8_t mask = n.sendSlots >= kSendWindow ? (uint8_t)0xFF : (uint8_t)((1u << n.sendSlots) - 1);
     unsigned ones = 0;
-    for (uint8_t b = n.sendBits; b != 0; b &= (uint8_t)(b - 1)) ones++;
+    for (uint8_t b = n.sendBits & mask; b != 0; b &= (uint8_t)(b - 1)) ones++;
     return (uint8_t)(ones * 100 / n.sendSlots);
   }
 
@@ -1564,7 +1566,7 @@ class Node {
     for (unsigned i = 0; i < kMaxNeighbors; i++) {
       Neighbor &n = nbrs_[i];
       if (!n.used || memcmp(n.mac, mac, 6) != 0) continue;
-      if (n.sendAt != 0 && (int32_t)(now - n.sendAt) >= (int32_t)kSendForgetMs) n.sendSlots = 0;
+      if (n.sendAt != 0 && (int32_t)(now - n.sendAt) >= (int32_t)kSendForgetMs) { n.sendSlots = 0; n.sendBits = 0; }
       n.sendBits = (uint8_t)((n.sendBits << 1) | (ok ? 1 : 0));
       if (n.sendSlots < kSendWindow) n.sendSlots++;
       n.sendAt = now == 0 ? 1 : now;
