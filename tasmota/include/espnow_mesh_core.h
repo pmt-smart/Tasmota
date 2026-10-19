@@ -2780,7 +2780,12 @@ class Node {
       if (n.state == kAlive && (int32_t)(now - n.lastHeard) >= (int32_t)(kSuspectAfterMs + n.jitter)) {
         n.state = kSuspect;
         n.suspectAt = now;
-        if (n.rssi != 0) StartPing(n, 0, now);       // one the radio has not heard is not tried with the radio
+        // one the radio has not heard is not tried with the radio, and one whose heartbeat says it does not hear this node would not
+        // answer a ping: the neighbours that hear it are asked at once
+        if (n.rssi != 0) {
+          if (n.listsMe == 2) SendProbes(n, now);
+          else StartPing(n, 0, now);
+        }
       } else if (n.state == kSuspect && (int32_t)(now - n.suspectAt) >= (int32_t)kSilentAfterMs) {
         n.state = kMute;
         if (!IsSilent(n.id)) {
