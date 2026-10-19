@@ -26,12 +26,15 @@
  * 95% of ten minutes off the mesh's channel.
  *
  * With the mesh running on a channel of its own setting, this driver takes the retries of such a node over:
- * - after ESPNOW_MESH_STATION_GRACE_S with no connection, or as soon as the stack says it did not find the network, the
- *   station stops trying (the stack's retries off, Tasmota's held through EspNowMeshStationQuiet, and no restart) and the
- *   radio goes to the mesh's channel;
+ * - a node with other nodes of the mesh in its table does not leave a lost access point to the stack, whose retry scans every
+ *   channel and takes the radio off the mesh's for a second or two: while the station is associated the stack's retries are off,
+ *   and when the access point is lost the station stops trying at once and looks for it on the mesh's channel right away;
+ * - a node alone stops trying after ESPNOW_MESH_STATION_GRACE_S with no connection, or as soon as the stack says it did not find
+ *   the network. Stopping is the stack's retries off, Tasmota's held through EspNowMeshStationQuiet, no restart, and the radio
+ *   on the mesh's channel;
  * - it looks for the network with a scan of the mesh's channel, active, of ESPNOW_MESH_STATION_PROBE_MS, which does not take
  *   the radio off it. The scans come 10, 30 and then every 60 s after the park, plus a delay of the node's own, from its MAC,
- *   of up to ESPNOW_MESH_STATION_SPREAD_S;
+ *   of up to ESPNOW_MESH_STATION_SPREAD_S, after the one at once of a node of a mesh that has just lost its access point;
  * - a scan that finds one of the saved networks joins it on that channel and that access point, and a join that connects
  *   hands the station to Tasmota, connected;
  * - every ESPNOW_MESH_STATION_WIDE_S the scan is of every channel, for an access point that moved to another channel. The
@@ -185,19 +188,23 @@ static uint32_t EspNowMeshStationWideFirst(void) {
   return ESPNOW_MESH_STATION_WIDE_MIN_S + ((mac[4] << 8) | mac[5]) % (ESPNOW_MESH_STATION_WIDE_S - ESPNOW_MESH_STATION_WIDE_MIN_S + 1);
 }
 
-// The station stops trying, the radio goes to the mesh's channel, and the next scan is set
-static void EspNowMeshStationPark(void) {
+// The station stops trying, the radio goes to the mesh's channel, and the next scan is set: at once, for a network just lost
+static void EspNowMeshStationPark(bool at_once) {
   WiFi.setAutoReconnect(false);
   // A connection under way, Tasmota's or a join, is ended; the radio stays on. A scan leaves nothing to end
   uint8_t state = EspNowMeshStation.state;
   if ((ESPNOW_MESH_STATION_PROBING != state) && (ESPNOW_MESH_STATION_PARKED != state) && (ESPNOW_MESH_STATION_WIDE != state)) {
     WiFi.disconnect();
   }
-  uint8_t mac[6];
-  esp_wifi_get_mac(WIFI_IF_STA, mac);
-  uint32_t wait_s = EspNowMeshStationWaits[EspNowMeshStation.step] + mac[5] % (ESPNOW_MESH_STATION_SPREAD_S + 1);
-  if (EspNowMeshStation.step < sizeof(EspNowMeshStationWaits) - 1) { EspNowMeshStation.step++; }
-  EspNowMeshStation.next_try = millis() + wait_s * 1000;
+  if (at_once) {
+    EspNowMeshStation.next_try = millis();
+  } else {
+    uint8_t mac[6];
+    esp_wifi_get_mac(WIFI_IF_STA, mac);
+    uint32_t wait_s = EspNowMeshStationWaits[EspNowMeshStation.step] + mac[5] % (ESPNOW_MESH_STATION_SPREAD_S + 1);
+    if (EspNowMeshStation.step < sizeof(EspNowMeshStationWaits) - 1) { EspNowMeshStation.step++; }
+    EspNowMeshStation.next_try = millis() + wait_s * 1000;
+  }
   if (ESPNOW_MESH_STATION_WATCH == state) {
     EspNowMeshStation.parks++;
     EspNowMeshStation.wide_at = millis() + EspNowMeshStationWideFirst() * 1000;
@@ -217,14 +224,14 @@ static void EspNowMeshStationLeaveAp(const wifi_ap_record_t* ap) {
   if (!EspNowMeshStation.down_since) { EspNowMeshStation.down_since = millis() ? millis() : 1; }
   AddLog(LOG_LEVEL_INFO, PSTR("EMS: The access point %02X:%02X:%02X:%02X:%02X:%02X is on channel %d, not the mesh's %d: the station leaves it"),
     ap->bssid[0], ap->bssid[1], ap->bssid[2], ap->bssid[3], ap->bssid[4], ap->bssid[5], ap->primary, EspNowMeshSettings.channel);
-  EspNowMeshStationPark();
+  EspNowMeshStationPark(false);
 }
 
 // A scan of the mesh's channel, or of every channel
 static void EspNowMeshStationScan(bool wide) {
   int16_t started = WiFi.scanNetworks(true, false, false, ESPNOW_MESH_STATION_PROBE_MS, wide ? 0 : EspNowMeshSettings.channel);
   if (WIFI_SCAN_RUNNING != started) {
-    EspNowMeshStationPark();               // the stack refused it: the next one, later
+    EspNowMeshStationPark(false);          // the stack refused it: the next one, later
     return;
   }
   if (wide) {
@@ -284,7 +291,7 @@ static void EspNowMeshStationScanned(void) {
   }
   if (best < 0) {
     WiFi.scanDelete();
-    EspNowMeshStationPark();
+    EspNowMeshStationPark(false);
     return;
   }
   EspNowMeshStation.seen++;
@@ -334,18 +341,23 @@ static void EspNowMeshStationEverySecond(void) {
     EspNowMeshStation.not_found = false;
     EspNowMeshStation.off_channel = 0;
     memset(EspNowMeshStation.off_bssid, 0, 6);
+    // the stack's retry after a lost access point scans every channel: a node of a mesh has its own, on the mesh's channel
+    if (EspNowMeshKnowsNodes()) { WiFi.setAutoReconnect(false); }
     return;
   }
   if (!EspNowMeshStation.down_since) { EspNowMeshStation.down_since = millis() ? millis() : 1; }
   switch (EspNowMeshStation.state) {
-    case ESPNOW_MESH_STATION_WATCH:
+    case ESPNOW_MESH_STATION_WATCH: {
       if (!EspNowMeshStationRadioFree()) { break; }
-      if (EspNowMeshStation.not_found || (EspNowMeshStationSince(EspNowMeshStation.down_since) >= ESPNOW_MESH_STATION_GRACE_S * 1000)) {
+      // a node of a mesh stops trying at once, and looks for a network just lost right away; a node alone has the grace
+      bool lost = EspNowMeshKnowsNodes() && !EspNowMeshStation.not_found;
+      if (lost || EspNowMeshStation.not_found || (EspNowMeshStationSince(EspNowMeshStation.down_since) >= ESPNOW_MESH_STATION_GRACE_S * 1000)) {
         AddLog(LOG_LEVEL_INFO, PSTR("EMS: WiFi %s, the radio stays on the mesh's channel %d and the network is looked for there"),
-          EspNowMeshStation.not_found ? PSTR("not found") : PSTR("out of reach"), EspNowMeshSettings.channel);
-        EspNowMeshStationPark();
+          EspNowMeshStation.not_found ? PSTR("not found") : (lost ? PSTR("lost") : PSTR("out of reach")), EspNowMeshSettings.channel);
+        EspNowMeshStationPark(lost);
       }
       break;
+    }
     case ESPNOW_MESH_STATION_PARKED:
       if (!EspNowMeshStationRadioFree() || EspNowMeshSearchHolds()) { break; }
       if (!TimeReached(EspNowMeshStation.next_try)) {
@@ -363,7 +375,7 @@ static void EspNowMeshStationEverySecond(void) {
       bool associated = (ESP_OK == esp_wifi_sta_get_ap_info(&ap));
       bool over = associated ? (trying >= ESPNOW_MESH_STATION_ASSOC_S * 1000)
                              : ((EspNowMeshStation.fails >= ESPNOW_MESH_STATION_TRY_FAILS) || (trying >= ESPNOW_MESH_STATION_TRY_S * 1000));
-      if (over) { EspNowMeshStationPark(); }
+      if (over) { EspNowMeshStationPark(false); }
       break;
     }
   }
