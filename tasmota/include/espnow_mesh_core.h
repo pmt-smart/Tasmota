@@ -2627,21 +2627,24 @@ class Node {
     if (SendDirect(target, p, sizeof(p), now, target.id, asker) != 0) stats_.pings++;
   }
 
-  // The neighbours asked to try a suspect: of those that hear it and are heard back, the two of the best signal
-  void SendProbes(const Neighbor &suspect, uint32_t now) {
+  // The neighbours asked to try a suspect: of those that hear it and whose heartbeat says they hear this node, the two of the best signal.
+  // Returns how many were asked
+  unsigned SendProbes(const Neighbor &suspect, uint32_t now) {
     bool taken[kMaxNeighbors] = {};
+    unsigned asked = 0;
     for (unsigned sent = 0; sent < kProbeHelpers; sent++) {
       int best = -1;
       for (unsigned i = 0; i < kMaxNeighbors; i++) {
         const Neighbor &n = nbrs_[i];
-        if (!n.used || taken[i] || n.id == suspect.id || n.state != kAlive || n.rssi == 0 || n.listsMe == 2 || !Lists(n, suspect.id)) continue;
+        if (!n.used || taken[i] || n.id == suspect.id || n.state != kAlive || n.rssi == 0 || n.listsMe != 1 || !Lists(n, suspect.id)) continue;
         if (best < 0 || n.rssi > nbrs_[best].rssi) best = (int)i;
       }
-      if (best < 0) return;
+      if (best < 0) break;
       taken[best] = true;
       uint8_t p[2] = {kSubProbe, suspect.id};
-      if (SendDirect(nbrs_[best], p, sizeof(p), now, 0, 0) != 0) stats_.probes++;
+      if (SendDirect(nbrs_[best], p, sizeof(p), now, 0, 0) != 0) { stats_.probes++; asked++; }
     }
+    return asked;
   }
 
   // What became of a ping: for this node's own, a neighbour that answers is alive and one that does not is tried through
@@ -2780,12 +2783,9 @@ class Node {
       if (n.state == kAlive && (int32_t)(now - n.lastHeard) >= (int32_t)(kSuspectAfterMs + n.jitter)) {
         n.state = kSuspect;
         n.suspectAt = now;
-        // one the radio has not heard is not tried with the radio, and one whose heartbeat says it does not hear this node would not
-        // answer a ping: the neighbours that hear it are asked at once
-        if (n.rssi != 0) {
-          if (n.listsMe == 2) SendProbes(n, now);
-          else StartPing(n, 0, now);
-        }
+        // one the radio has not heard is not tried with the radio. A ping goes to one whose heartbeat says it hears this node: of the others,
+        // one that does not or has not said, the neighbours that hear it are asked at once, and the ping is the way left when none can be
+        if (n.rssi != 0 && (n.listsMe == 1 || SendProbes(n, now) == 0)) StartPing(n, 0, now);
       } else if (n.state == kSuspect && (int32_t)(now - n.suspectAt) >= (int32_t)kSilentAfterMs) {
         n.state = kMute;
         if (!IsSilent(n.id)) {
