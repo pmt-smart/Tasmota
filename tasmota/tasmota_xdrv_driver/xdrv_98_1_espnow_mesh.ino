@@ -199,7 +199,7 @@
 #define ESPNOW_MESH_SENT_DEPTH         16          // the frames sent with an answer asked, whose ticket is kept until their outcome comes
 #define ESPNOW_MESH_TASK_STACK         6144
 #define ESPNOW_MESH_TASK_PRIORITY      5
-#define ESPNOW_MESH_SEND_WAIT_MS       20          // for the radio to say what became of a frame
+#define ESPNOW_MESH_SEND_WAIT_MS       60          // for the radio to say what became of a frame: a unicast to a weak neighbour, with the radio's own retries on a busy channel, takes more than 20 ms
 #define ESPNOW_MESH_LATE_WORD_MS       1000        // after which a word of the radio's that comes is no late word of a send that gave up
 #define ESPNOW_MESH_PEER_KEEP_MS       3000        // a peer sent to within this is not the one to give up when the radio's table is full
 #define ESPNOW_MESH_BEAT_MS            5000
@@ -441,6 +441,7 @@ static struct {
   volatile uint32_t peer_evicted = 0;        // peers given up to make room
   volatile uint32_t wait_expired = 0;        // the wait for the radio's word on a frame ran out
   volatile uint32_t late_word = 0;           // and the word came later
+  volatile uint32_t late_ok = 0;             // and said the frame was acknowledged: a failure counted that was none
   volatile uint32_t not_acked = 0;           // unicast sends the radio said the neighbour did not acknowledge
 } EspNowMeshCount;
 
@@ -659,6 +660,7 @@ bool EspNowMeshSendResult(const uint8_t* mac, bool ok) {
     EspNowMeshDriver.late_pending = false;
     if ((millis() - EspNowMeshDriver.late_at) < ESPNOW_MESH_LATE_WORD_MS) {
       EspNowMeshCount.late_word++;
+      if (ok) { EspNowMeshCount.late_ok++; }
       return true;
     }
   }
@@ -1533,6 +1535,7 @@ static bool EspNowMeshStartAttempt(void) {
   EspNowMeshCount.peer_evicted = 0;
   EspNowMeshCount.wait_expired = 0;
   EspNowMeshCount.late_word = 0;
+  EspNowMeshCount.late_ok = 0;
   EspNowMeshCount.not_acked = 0;
   EspNowMeshDriver.late_pending = false;
   EspNowMeshDriver.dropped = 0;
@@ -2182,11 +2185,11 @@ void CmndEspNowMeshStats(void) {
   if (0 == page) {
     // What happens around the core, that the core cannot count: the queues of the driver, the radio's refusals, the late word, the peers
     ResponseAppend_P(PSTR(",\"Dropped\":%u,\"CmdBusy\":%u,\"EvtFull\":%u,\"NoteLost\":%u,\"Refused\":%u,"
-                          "\"SendFailed\":%u,\"BcastFailed\":%u,\"NotAcked\":%u,\"WaitExpired\":%u,\"LateWord\":%u,"
+                          "\"SendFailed\":%u,\"BcastFailed\":%u,\"NotAcked\":%u,\"WaitExpired\":%u,\"LateWord\":%u,\"LateOk\":%u,"
                           "\"PeerFailed\":%u,\"PeerFull\":%u,\"PeerEvicted\":%u"),
       EspNowMeshDriver.dropped, EspNowMeshCount.cmd_busy, EspNowMeshCount.evt_full, EspNowMeshCount.note_lost, EspNowMeshCount.refused,
       EspNowMeshCount.send_failed, EspNowMeshCount.bcast_failed, EspNowMeshCount.not_acked, EspNowMeshCount.wait_expired, EspNowMeshCount.late_word,
-      EspNowMeshCount.peer_failed, EspNowMeshCount.peer_full, EspNowMeshCount.peer_evicted);
+      EspNowMeshCount.late_ok, EspNowMeshCount.peer_failed, EspNowMeshCount.peer_full, EspNowMeshCount.peer_evicted);
     nvs_stats_t nvs;
     if (ESP_OK == nvs_get_stats(nullptr, &nvs)) {
       ResponseAppend_P(PSTR(",\"NvsUsed\":%u,\"NvsTotal\":%u"), (uint32_t)nvs.used_entries, (uint32_t)nvs.total_entries);
