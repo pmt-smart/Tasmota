@@ -41,6 +41,12 @@
  *   ack     to the sender           image(4) block(2) offset(4) state(1): the block and the byte it wants next
  * The image is the first 4 bytes of the SHA-256. The signature covers the 39 bytes before it.
  *
+ * A station looking for a network out of reach scans every channel at each try, and the radio is off the mesh's channel
+ * most of the time. The station is parked, its retries and Tasmota's off and the radio on the channel of the mesh's record,
+ * when the image is to come over ESP-NOW and the station is not on that channel: the application asked for it before it
+ * restarted into this image (the NVS key "armed"), or a transfer is under way. A device whose WiFi has not connected
+ * ESPNOW_OTA_GRACE_S after its start parks it too, so that a neighbour can reach it. It stays parked until it restarts.
+ *
  * The buttons of a device of a network do nothing while it runs this image: they are taken before the default handling,
  * which would switch its relays.
 \*********************************************************************************************/
@@ -65,6 +71,7 @@
 #define ESPNOW_OTA_BLOCK_MAX_KB        64
 #define ESPNOW_OTA_RX_DEPTH            8
 #define ESPNOW_OTA_BEACON_S            2
+#define ESPNOW_OTA_GRACE_S             30         // a device whose WiFi has not connected by then parks it, for the mesh
 #define ESPNOW_OTA_NVS                 "espnowota"
 #define ESPNOW_OTA_MESH_NVS            "espnowmesh"  // the record of the ESP-NOW mesh: the device's number, the channel and the network key
 #define ESPNOW_OTA_MESH_ID             5          // offsets in that record
@@ -101,6 +108,8 @@ struct {
   bool radio = false;
   bool has_key = false;
   bool has_manifest = false;
+  bool armed = false;                        // the application asked for the image over ESP-NOW
+  bool parked = false;                       // the station, on the mesh's channel
 } EspNowOta;
 
 /*********************************************************************************************/
@@ -206,7 +215,39 @@ static void EspNowOtaLoadProgress(void) {
     EspNowOta.block = block;
     EspNowOta.state = kOtaReceiving;
   }
+  uint8_t armed = 0;
+  EspNowOta.armed = (ESP_OK == nvs_get_u8(handle, "armed", &armed)) && armed;
   nvs_close(handle);
+}
+
+/*********************************************************************************************/
+
+// Tasmota's retries are held while the station is parked (WifiCheckIp)
+bool EspNowOtaWifiQuiet(void) {
+  return EspNowOta.parked;
+}
+
+static bool EspNowOtaShouldPark(void) {
+  bool connected = (WL_CONNECTED == WiFi.status());
+  if (EspNowOta.armed || EspNowOta.has_manifest) {
+    return !connected || (EspNowOta.channel && (WiFi.channel() != EspNowOta.channel));
+  }
+  return !connected && (TasmotaGlobal.uptime >= ESPNOW_OTA_GRACE_S);
+}
+
+static void EspNowOtaPark(void) {
+  WiFi.setAutoReconnect(false);
+  WiFi.disconnect();                         // a connection under way is ended; the radio stays on
+  EspNowOta.parked = true;
+  AddLog(LOG_LEVEL_INFO, PSTR("EOT: WiFi parked on channel %u, for the mesh"), EspNowOta.channel);
+}
+
+static void EspNowOtaKeepChannel(void) {
+  if (!EspNowOta.parked || !EspNowOta.channel) { return; }
+  uint8_t channel = 0;
+  wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
+  esp_wifi_get_channel(&channel, &second);
+  if (channel != EspNowOta.channel) { esp_wifi_set_channel(EspNowOta.channel, WIFI_SECOND_CHAN_NONE); }
 }
 
 /*********************************************************************************************/
@@ -440,6 +481,8 @@ static void EspNowOtaLoop(void) {
 }
 
 static void EspNowOtaEverySecond(void) {
+  if (EspNowOta.has_key && !EspNowOta.parked && (WiFi.getMode() & WIFI_MODE_STA) && EspNowOtaShouldPark()) { EspNowOtaPark(); }
+  EspNowOtaKeepChannel();
   EspNowOtaRadioStart();
   if (EspNowOta.radio && (0 == (TasmotaGlobal.uptime % ESPNOW_OTA_BEACON_S))) { EspNowOtaBeacon(); }
 }

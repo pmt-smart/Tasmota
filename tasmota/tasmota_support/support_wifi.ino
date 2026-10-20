@@ -1168,6 +1168,9 @@ bool HasIP(void) {
 #ifdef USE_ESPNOW_MESH
 bool EspNowMeshStationQuiet(void);
 #endif  // USE_ESPNOW_MESH
+#ifdef USE_ESPNOW_OTA_RECEIVER
+bool EspNowOtaWifiQuiet(void);
+#endif  // USE_ESPNOW_OTA_RECEIVER
 
 /**
  * Verifies WiFi connection status and manages reconnection
@@ -1227,6 +1230,12 @@ void WifiCheckIp(void) {
       return;
     }
 #endif  // USE_ESPNOW_MESH
+#ifdef USE_ESPNOW_OTA_RECEIVER
+    if (EspNowOtaWifiQuiet()) {  // A device taking its image over ESP-NOW keeps the radio on the mesh's channel (xdrv_98_5)
+      Wifi.counter = 1;
+      return;
+    }
+#endif  // USE_ESPNOW_OTA_RECEIVER
     uint8_t wifi_config_tool = Settings->sta_config;
     Wifi.status = (Wifi.retry &1) ? WiFi.status() : 0;  // Skip every second to reset result WiFi.status()
     switch (Wifi.status) {
