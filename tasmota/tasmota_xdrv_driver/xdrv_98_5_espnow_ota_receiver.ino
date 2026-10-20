@@ -36,7 +36,8 @@
  *
  * Frames, after the protocol byte, the kind and the sender's number in the network:
  *   beacon  to all, every 2 s       state(1) image(4) block(2) blocks(2)
- *   offer   to the device           size(4) blocks(2) block_kb(1) sha256(32) signature(64)
+ *   offer   to the device           size(4) blocks(2) block_kb(1) sha256(32) signature(64), then, unsigned, the sender's
+ *                                   name for a display: length(1) name(up to 20)
  *   piece   to the device           image(4) block(2) offset(4) length(4) data
  *   ack     to the sender           image(4) block(2) offset(4) state(1): the block and the byte it wants next
  * The image is the first 4 bytes of the SHA-256. The signature covers the 39 bytes before it.
@@ -46,6 +47,8 @@
  * when the image is to come over ESP-NOW and the station is not on that channel: the application asked for it before it
  * restarted into this image (the NVS key "armed"), or a transfer is under way. A device whose WiFi has not connected
  * ESPNOW_OTA_GRACE_S after its start parks it too, so that a neighbour can reach it. It stays parked until it restarts.
+ * Tasmota's WiFi Manager has the radio while it runs (its access point is on a channel of its own): nothing is parked and
+ * the channel is left alone.
  *
  * The buttons of a device of a network do nothing while it runs this image: they are taken before the default handling,
  * which would switch its relays.
@@ -67,6 +70,7 @@
 #define ESPNOW_OTA_HEADER              3          // protocol, kind, sender
 #define ESPNOW_OTA_PIECE_HEADER        14         // image, block, offset, length
 #define ESPNOW_OTA_OFFER_LEN           103
+#define ESPNOW_OTA_NAME_MAX            20         // the sender's name after an offer
 #define ESPNOW_OTA_SIGNED_LEN          39
 #define ESPNOW_OTA_BLOCK_MAX_KB        64
 #define ESPNOW_OTA_RX_DEPTH            8
@@ -110,6 +114,11 @@ struct {
   bool has_manifest = false;
   bool armed = false;                        // the application asked for the image over ESP-NOW
   bool parked = false;                       // the station, on the mesh's channel
+  uint8_t sender_node = 0;                   // the sender's number in the network
+  char sender_name[ESPNOW_OTA_NAME_MAX + 1] = "";
+  uint32_t last_piece_ms = 0;                // when the last piece was taken
+  uint32_t since_ms = 0;                     // when the sender offered, and the block it found: what the time left is reckoned from
+  uint16_t since_block = 0;
 } EspNowOta;
 
 /*********************************************************************************************/
@@ -228,6 +237,7 @@ bool EspNowOtaWifiQuiet(void) {
 }
 
 static bool EspNowOtaShouldPark(void) {
+  if (Wifi.config_type) { return false; }    // the WiFi Manager's access point
   bool connected = (WL_CONNECTED == WiFi.status());
   if (EspNowOta.armed || EspNowOta.has_manifest) {
     return !connected || (EspNowOta.channel && (WiFi.channel() != EspNowOta.channel));
@@ -243,7 +253,7 @@ static void EspNowOtaPark(void) {
 }
 
 static void EspNowOtaKeepChannel(void) {
-  if (!EspNowOta.parked || !EspNowOta.channel) { return; }
+  if (!EspNowOta.parked || !EspNowOta.channel || Wifi.config_type) { return; }
   uint8_t channel = 0;
   wifi_second_chan_t second = WIFI_SECOND_CHAN_NONE;
   esp_wifi_get_channel(&channel, &second);
@@ -358,8 +368,10 @@ static void EspNowOtaCheck(void) {
   TasmotaGlobal.restart_flag = 3;
 }
 
-static void EspNowOtaOffer(const uint8_t *mac, const uint8_t *body, size_t len) {
-  if (len != ESPNOW_OTA_OFFER_LEN) { return; }
+static void EspNowOtaOffer(const uint8_t *mac, uint8_t node, const uint8_t *body, size_t len) {
+  if (len < ESPNOW_OTA_OFFER_LEN) { return; }
+  size_t name_len = (len > ESPNOW_OTA_OFFER_LEN) ? body[ESPNOW_OTA_OFFER_LEN] : 0;
+  if ((name_len > ESPNOW_OTA_NAME_MAX) || (len != ESPNOW_OTA_OFFER_LEN + ((len > ESPNOW_OTA_OFFER_LEN) ? 1 + name_len : 0))) { return; }
   bool same = EspNowOta.has_manifest && (0 == memcmp(body + 7, EspNowOtaSha(), 32));
   if (!same) {
     if (!EspNowOtaSigned(body)) {
@@ -383,6 +395,12 @@ static void EspNowOtaOffer(const uint8_t *mac, const uint8_t *body, size_t len) 
   free(EspNowOta.in);
   EspNowOta.in = nullptr;
   EspNowOta.got = 0;
+  EspNowOta.sender_node = node;
+  memcpy(EspNowOta.sender_name, body + ESPNOW_OTA_OFFER_LEN + 1, name_len);
+  EspNowOta.sender_name[name_len] = '\0';
+  EspNowOta.since_ms = millis();
+  EspNowOta.since_block = EspNowOta.block;
+  EspNowOta.last_piece_ms = EspNowOta.since_ms;
   EspNowOtaSetSender(mac);
   EspNowOtaAck(mac);
 }
@@ -409,6 +427,7 @@ static void EspNowOtaPiece(const uint8_t *mac, const uint8_t *body, size_t len) 
   }
   memcpy(EspNowOta.in + offset, data, n);
   EspNowOta.got += n;
+  EspNowOta.last_piece_ms = millis();
   if (EspNowOta.got == EspNowOta.length) {
     bool ok = EspNowOtaWriteBlock();
     free(EspNowOta.in);
@@ -435,7 +454,7 @@ static void EspNowOtaHandle(const EspNowOtaRx_t &rx) {
   const uint8_t *body = rx.data + ESPNOW_OTA_HEADER;
   len -= ESPNOW_OTA_HEADER;
   switch (rx.data[1]) {
-    case kOtaOffer: EspNowOtaOffer(rx.mac, body, len); break;
+    case kOtaOffer: EspNowOtaOffer(rx.mac, rx.data[2], body, len); break;
     case kOtaPiece: EspNowOtaPiece(rx.mac, body, len); break;
   }
 }
@@ -455,7 +474,7 @@ static void EspNowOtaRecvCb(const esp_now_recv_info_t *info, const uint8_t *data
 
 static void EspNowOtaRadioStart(void) {
   if (EspNowOta.radio || !EspNowOta.has_key || !(WiFi.getMode() & WIFI_MODE_STA)) { return; }
-  if (EspNowOta.channel) { esp_wifi_set_channel(EspNowOta.channel, WIFI_SECOND_CHAN_NONE); }
+  if (EspNowOta.channel && !Wifi.config_type) { esp_wifi_set_channel(EspNowOta.channel, WIFI_SECOND_CHAN_NONE); }
   if (ESP_OK != esp_now_init()) { return; }
   if (nullptr == EspNowOta.rx) { EspNowOta.rx = xQueueCreate(ESPNOW_OTA_RX_DEPTH, sizeof(EspNowOtaRx_t)); }
   esp_now_register_recv_cb(EspNowOtaRecvCb);
