@@ -182,7 +182,11 @@
 #undef USE_AUTOCONF
 #undef USE_BERRY
 
-#ifndef SAFEBOOT_WITHOUT_TLS                        // Define to leave TLS out: the image is then fetched over plain HTTP only
+#ifdef SAFEBOOT_WITHOUT_TLS                         // Define to leave TLS out: the image is then fetched over plain HTTP only
+#undef USE_WEBCLIENT_HTTPS
+#undef USE_MQTT_TLS
+#undef USE_TLS
+#else
 #define USE_TLS
 #endif  // SAFEBOOT_WITHOUT_TLS
 #define USE_WEBSERVER
