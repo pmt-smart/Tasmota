@@ -1,5 +1,5 @@
 /*
-  xdrv_100_espnow_ota_receiver.ino - ESP-NOW OTA receiver for the safeboot image
+  xdrv_98_5_espnow_ota_receiver.ino - ESP-NOW OTA receiver for the safeboot image
 
   Copyright (C) 2026  Casa Inteligente
 
@@ -45,7 +45,7 @@
  * which would switch its relays.
 \*********************************************************************************************/
 
-#define XDRV_100                       100
+#define XDRV_104                       104
 
 #include <esp_now.h>
 #include <esp_wifi.h>
@@ -448,7 +448,7 @@ static void EspNowOtaEverySecond(void) {
  * Interface
 \*********************************************************************************************/
 
-bool Xdrv100(uint32_t function) {
+bool Xdrv104(uint32_t function) {
   bool result = false;
 
   switch (function) {
