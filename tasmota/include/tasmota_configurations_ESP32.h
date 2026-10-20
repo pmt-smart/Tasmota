@@ -182,11 +182,14 @@
 #undef USE_AUTOCONF
 #undef USE_BERRY
 
+#ifndef SAFEBOOT_WITHOUT_TLS                        // Define to leave TLS out: the image is then fetched over plain HTTP only
 #define USE_TLS
+#endif  // SAFEBOOT_WITHOUT_TLS
 #define USE_WEBSERVER
 
 #undef USE_ESP32_WDT                                  // disable watchdog on SAFEBOOT until more testing is done
 
+#ifndef SAFEBOOT_WITHOUT_ETHERNET                   // Define to leave Ethernet out, for a device that has none
 #if CONFIG_FREERTOS_UNICORE || CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32P4
 #if CONFIG_ETH_ENABLED                               // Check for Ethernet support in Arduino libs
 //  #undef USE_MQTT_TLS
@@ -195,6 +198,7 @@
   #define USE_ETHERNET
 #endif  // CONFIG_ETH_ENABLED
 #endif  // CONFIG_FREERTOS_UNICORE || CONFIG_IDF_TARGET_ESP32S3 || CONFIG_IDF_TARGET_ESP32P4
+#endif  // SAFEBOOT_WITHOUT_ETHERNET
 
 #endif  // FIRMWARE_SAFEBOOT
 
