@@ -668,9 +668,17 @@ bool EspNowMeshSendResult(const uint8_t* mac, bool ok) {
   return false;
 }
 
+#ifdef USE_ESPNOW_OTA
+// ESP-NOW OTA (xdrv_98_7) rides on the mesh's radio: it takes its frames, whose first byte is neither the mesh's nor the direct link's
+bool EspNowOtaHears(const uint8_t *mac, int8_t rssi, const uint8_t *data, int len);
+#endif  // USE_ESPNOW_OTA
+
 // The direct link's receive callback, first: true when the frame is the mesh's, whose first byte no direct frame has
 bool EspNowMeshHearsFrame(const uint8_t* mac, int8_t rssi, const uint8_t* data, int len);
 bool EspNowMeshHearsFrame(const uint8_t* mac, int8_t rssi, const uint8_t* data, int len) {
+#ifdef USE_ESPNOW_OTA
+  if (EspNowOtaHears(mac, rssi, data, len)) { return true; }
+#endif
   if ((len < 1) || (EspNowMesh::kVersion != data[0])) { return false; }
   EspNowMeshEnqueue(mac, rssi, data, len);
   return true;
@@ -695,6 +703,9 @@ void EspNowMeshRecvCb(const esp_now_recv_info_t* info, const uint8_t* data, int 
 void EspNowMeshRecvCb(const esp_now_recv_info_t* info, const uint8_t* data, int len) {
 #ifdef USE_ESPNOW_MESH_PROBE
   if (EspNowProbeHears(info, data, len)) { return; }
+#endif
+#ifdef USE_ESPNOW_OTA
+  if (EspNowOtaHears(info->src_addr, info->rx_ctrl->rssi, data, len)) { return; }
 #endif
   if ((len < 1) || (EspNowMesh::kVersion != data[0])) { return; }
   EspNowMeshEnqueue(info->src_addr, info->rx_ctrl->rssi, data, len);

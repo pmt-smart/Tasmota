@@ -34,13 +34,7 @@
  * for its signature, under one of the public keys the build carries (ESPNOW_OTA_PUBLIC_KEYS, 32 bytes each, as one
  * string); a build without them refuses every offer.
  *
- * Frames, after the protocol byte, the kind and the sender's number in the network:
- *   beacon  to all, every 2 s       state(1) image(4) block(2) blocks(2)
- *   offer   to the device           size(4) blocks(2) block_kb(1) sha256(32) signature(64), then, unsigned, the sender's
- *                                   name for a display: length(1) name(up to 20)
- *   piece   to the device           image(4) block(2) offset(4) length(4) data
- *   ack     to the sender           image(4) block(2) offset(4) state(1): the block and the byte it wants next
- * The image is the first 4 bytes of the SHA-256. The signature covers the 39 bytes before it.
+ * The frames are espnow_ota.h's, which the sender (xdrv_98_7) speaks too.
  *
  * A station looking for a network out of reach scans every channel at each try, and the radio is off the mesh's channel
  * most of the time. The station is parked, its retries and Tasmota's off and the radio on the channel of the mesh's record,
@@ -63,16 +57,8 @@
 #include <nvs.h>
 #include "miniz.h"                           // tinfl, in the ROM
 #include "include/ed25519.h"
+#include "include/espnow_ota.h"
 
-#define ESPNOW_OTA_PROTOCOL            0x4F
-#define ESPNOW_OTA_TAG_LEN             8
-#define ESPNOW_OTA_MAX_FRAME           250
-#define ESPNOW_OTA_HEADER              3          // protocol, kind, sender
-#define ESPNOW_OTA_PIECE_HEADER        14         // image, block, offset, length
-#define ESPNOW_OTA_OFFER_LEN           103
-#define ESPNOW_OTA_NAME_MAX            20         // the sender's name after an offer
-#define ESPNOW_OTA_SIGNED_LEN          39
-#define ESPNOW_OTA_BLOCK_MAX_KB        64
 #define ESPNOW_OTA_RX_DEPTH            8
 #define ESPNOW_OTA_BEACON_S            2
 #define ESPNOW_OTA_GRACE_S             30         // a device whose WiFi has not connected by then parks it, for the mesh
@@ -86,9 +72,6 @@
 #ifndef ESPNOW_OTA_PUBLIC_KEYS
 #define ESPNOW_OTA_PUBLIC_KEYS         ""
 #endif
-
-enum EspNowOtaKind : uint8_t { kOtaBeacon = 0, kOtaOffer = 1, kOtaPiece = 2, kOtaAck = 3 };
-enum EspNowOtaState : uint8_t { kOtaIdle = 0, kOtaReceiving = 1, kOtaChecking = 2, kOtaDone = 3, kOtaFailed = 4 };
 
 typedef struct {
   uint8_t mac[6];
@@ -123,11 +106,6 @@ struct {
 
 /*********************************************************************************************/
 
-static uint32_t EspNowOtaGet32(const uint8_t *p) { return p[0] | (p[1] << 8) | (p[2] << 16) | ((uint32_t)p[3] << 24); }
-static uint16_t EspNowOtaGet16(const uint8_t *p) { return p[0] | (p[1] << 8); }
-static void EspNowOtaPut32(uint8_t *p, uint32_t v) { p[0] = v; p[1] = v >> 8; p[2] = v >> 16; p[3] = v >> 24; }
-static void EspNowOtaPut16(uint8_t *p, uint16_t v) { p[0] = v; p[1] = v >> 8; }
-
 static uint32_t EspNowOtaSize(void) { return EspNowOtaGet32(EspNowOta.manifest); }
 static uint16_t EspNowOtaBlocks(void) { return EspNowOtaGet16(EspNowOta.manifest + 4); }
 static uint32_t EspNowOtaBlockSize(void) { return EspNowOta.manifest[6] * 1024; }
@@ -161,14 +139,6 @@ static bool EspNowOtaSigned(const uint8_t *offer) {
   return false;
 }
 
-static void EspNowOtaTag(const uint8_t *frame, size_t len, uint8_t out[ESPNOW_OTA_TAG_LEN]);
-static void EspNowOtaTag(const uint8_t *frame, size_t len, uint8_t out[ESPNOW_OTA_TAG_LEN]) {
-  br_hmac_context hc;
-  br_hmac_init(&hc, &EspNowOta.tag, ESPNOW_OTA_TAG_LEN);
-  br_hmac_update(&hc, frame, len);
-  br_hmac_out(&hc, out);
-}
-
 /*********************************************************************************************/
 
 // The device's number, the channel and the network key, from the record of the ESP-NOW mesh
@@ -191,14 +161,7 @@ static bool EspNowOtaReadNetwork(void) {
   if (!ok || !record[ESPNOW_OTA_MESH_HAS_GROUP]) { return false; }
   EspNowOta.node = record[ESPNOW_OTA_MESH_ID];
   EspNowOta.channel = record[ESPNOW_OTA_MESH_CHANNEL];
-  uint8_t key[32];
-  br_hkdf_context hc;
-  br_hkdf_init(&hc, &br_sha256_vtable, "espnow-ota", 10);
-  br_hkdf_inject(&hc, record + ESPNOW_OTA_MESH_GROUP_KEY, 32);
-  br_hkdf_flip(&hc);
-  br_hkdf_produce(&hc, "tag", 3, key, sizeof(key));
-  br_hmac_key_init(&EspNowOta.tag, &br_sha256_vtable, key, sizeof(key));
-  memset(key, 0, sizeof(key));
+  EspNowOtaTagKey(record + ESPNOW_OTA_MESH_GROUP_KEY, &EspNowOta.tag);
   memset(record, 0, sizeof(record));
   return true;
 }
@@ -263,7 +226,7 @@ static void EspNowOtaKeepChannel(void) {
 /*********************************************************************************************/
 
 static void EspNowOtaSend(const uint8_t *mac, uint8_t *frame, size_t len) {
-  EspNowOtaTag(frame, len, frame + len);
+  EspNowOtaTagOf(&EspNowOta.tag, frame, len, frame + len);
   esp_now_send(mac, frame, len + ESPNOW_OTA_TAG_LEN);
 }
 
@@ -279,23 +242,23 @@ static void EspNowOtaSetSender(const uint8_t *mac) {
 }
 
 static void EspNowOtaAck(const uint8_t *mac) {
-  uint8_t frame[ESPNOW_OTA_HEADER + 11 + ESPNOW_OTA_TAG_LEN] = { ESPNOW_OTA_PROTOCOL, kOtaAck, EspNowOta.node };
+  uint8_t frame[ESPNOW_OTA_HEADER + ESPNOW_OTA_ACK_BODY + ESPNOW_OTA_TAG_LEN] = { ESPNOW_OTA_PROTOCOL, kOtaAck, EspNowOta.node };
   memcpy(frame + 3, EspNowOtaSha(), 4);
   EspNowOtaPut16(frame + 7, EspNowOta.block);
   EspNowOtaPut32(frame + 9, EspNowOta.got);
   frame[13] = EspNowOta.state;
-  EspNowOtaSend(mac, frame, ESPNOW_OTA_HEADER + 11);
+  EspNowOtaSend(mac, frame, ESPNOW_OTA_HEADER + ESPNOW_OTA_ACK_BODY);
 }
 
 static void EspNowOtaBeacon(void) {
   static const uint8_t all[6] = { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF };
-  uint8_t frame[ESPNOW_OTA_HEADER + 9 + ESPNOW_OTA_TAG_LEN] = { ESPNOW_OTA_PROTOCOL, kOtaBeacon, EspNowOta.node, EspNowOta.state };
+  uint8_t frame[ESPNOW_OTA_HEADER + ESPNOW_OTA_BEACON_BODY + ESPNOW_OTA_TAG_LEN] = { ESPNOW_OTA_PROTOCOL, kOtaBeacon, EspNowOta.node, EspNowOta.state };
   if (EspNowOta.has_manifest) {
     memcpy(frame + 4, EspNowOtaSha(), 4);
     EspNowOtaPut16(frame + 8, EspNowOta.block);
     EspNowOtaPut16(frame + 10, EspNowOtaBlocks());
   }
-  EspNowOtaSend(all, frame, ESPNOW_OTA_HEADER + 9);
+  EspNowOtaSend(all, frame, ESPNOW_OTA_HEADER + ESPNOW_OTA_BEACON_BODY);
 }
 
 /*********************************************************************************************/
@@ -446,11 +409,8 @@ static void EspNowOtaPiece(const uint8_t *mac, const uint8_t *body, size_t len) 
 
 static void EspNowOtaHandle(const EspNowOtaRx_t &rx);
 static void EspNowOtaHandle(const EspNowOtaRx_t &rx) {
-  if ((rx.len < ESPNOW_OTA_HEADER + ESPNOW_OTA_TAG_LEN) || (rx.data[0] != ESPNOW_OTA_PROTOCOL)) { return; }
+  if (!EspNowOtaTagged(&EspNowOta.tag, rx.data, rx.len)) { return; }
   size_t len = rx.len - ESPNOW_OTA_TAG_LEN;
-  uint8_t tag[ESPNOW_OTA_TAG_LEN];
-  EspNowOtaTag(rx.data, len, tag);
-  if (memcmp(tag, rx.data + len, ESPNOW_OTA_TAG_LEN)) { return; }
   const uint8_t *body = rx.data + ESPNOW_OTA_HEADER;
   len -= ESPNOW_OTA_HEADER;
   switch (rx.data[1]) {
