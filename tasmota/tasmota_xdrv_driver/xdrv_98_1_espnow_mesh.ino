@@ -2369,6 +2369,10 @@ void CmndEspNowMeshClock(void) {
 //                                               by, as old as the last of them. [0, 0] when no way is known or dest is not in the table; false when the task is
 //                                               not running. A heartbeat is not repeated: a script that sees a node by its heartbeats sees one hop, and this
 //                                               says what lies behind
+//   espnow_mesh_pair_key(pub)                -> the 32 bytes this node shares with a service of the network that is no node of the mesh (a server the
+//                                               network pairs with), whose X25519 public key is pub (32 bytes): HKDF-SHA256 of the X25519 of the two
+//                                               identities, salt "casa-server", info "http", which the service derives the same from its own secret and this
+//                                               node's public key. False with no identity, or a key of small order. The node's secret does not leave the driver
 //   espnow_mesh_neighbors()                  -> a list of maps, one for each neighbour (id, state, rssi, age, beat, info, seen, skew, key, keybits), or false.
 //                                               key is the version of the network's key its heartbeat says it sends with (0: it does not say), and keybits has
 //                                               1 it holds the previous key, 2 it needs the key, 4 its heartbeat came under the previous key's tag
@@ -2403,6 +2407,28 @@ int EspNowMeshBerrySend(struct bvm *vm) {
       if (ESPNOW_MESH_QUEUED == EspNowMeshQueueCommand(&cmd)) { ticket = cmd.ticket; }
     }
     if (ticket) { be_pushint(vm, (bint)ticket); } else { be_pushbool(vm, false); }
+    be_return(vm);
+  }
+  be_raise(vm, kTypeError, nullptr);
+}
+
+int EspNowMeshBerryPairKey(struct bvm *vm);
+int EspNowMeshBerryPairKey(struct bvm *vm) {
+  if ((be_top(vm) >= 1) && be_isbytes(vm, 1)) {
+    size_t len = 0;
+    const uint8_t* pub = (const uint8_t*)be_tobytes(vm, 1, &len);
+    uint8_t shared[32];
+    uint8_t key[32];
+    static const char salt[] = "casa-server";
+    static const char info[] = "http";
+    if ((32 == len) && EspNowMeshSettings.has_secret && EspNowMesh::Crypto::X25519(shared, EspNowMeshSettings.secret, pub)) {
+      EspNowMesh::Crypto::Hkdf((const uint8_t*)salt, sizeof(salt) - 1, shared, sizeof(shared), (const uint8_t*)info, sizeof(info) - 1, key, sizeof(key));
+      EspNowMesh::Crypto::Wipe(shared, sizeof(shared));
+      be_pushbytes(vm, key, sizeof(key));
+      EspNowMesh::Crypto::Wipe(key, sizeof(key));
+    } else {
+      be_pushbool(vm, false);
+    }
     be_return(vm);
   }
   be_raise(vm, kTypeError, nullptr);
@@ -2648,6 +2674,9 @@ static void EspNowMeshBerryRegister(void) {
   be_pop(berry.vm, 1);
   be_pushntvfunction(berry.vm, EspNowMeshBerryRoute);
   be_setglobal(berry.vm, "espnow_mesh_route");
+  be_pop(berry.vm, 1);
+  be_pushntvfunction(berry.vm, EspNowMeshBerryPairKey);
+  be_setglobal(berry.vm, "espnow_mesh_pair_key");
   be_pop(berry.vm, 1);
 }
 
