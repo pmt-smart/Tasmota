@@ -60,6 +60,10 @@
 #define ESPNOW_OTA_SIGNED_LEN          39
 #define ESPNOW_OTA_NAME_MAX            20         // the sender's name after an offer
 #define ESPNOW_OTA_BLOCK_MAX_KB        64
+#define ESPNOW_OTA_MAX_BLOCKS          48         // the most blocks of an image fetched over HTTP: 3 MB in 64 KB
+#define ESPNOW_OTA_URL_MAX             120        // a release's address, http://host:port/folder
+#define ESPNOW_OTA_MANIFEST_MAX        2048       // the JSON parser keeps a token's place in 11 bits: 2 KB at most
+#define ESPNOW_OTA_HTTP_MS             2000       // an HTTP request with nothing for this long fails: inside the app's 5 s loop watchdog
 
 enum EspNowOtaKind : uint8_t { kOtaBeacon = 0, kOtaOffer = 1, kOtaPiece = 2, kOtaAck = 3 };
 enum EspNowOtaState : uint8_t { kOtaIdle = 0, kOtaReceiving = 1, kOtaChecking = 2, kOtaDone = 3, kOtaFailed = 4 };
@@ -117,6 +121,49 @@ static inline bool EspNowOtaRecordSigned(const uint8_t *record, const uint8_t si
     if (EspNowOtaVerify(record, ESPNOW_OTA_SIGNED_LEN, signature, (const uint8_t *)keys + i)) { return true; }
   }
   return false;
+}
+
+// A release's manifest.json, as the release tool writes it: "offer", the signed offer in hex, and "blocks", the length of each
+// compressed block in blocks.bin, where they follow each other. The offer and the lengths, when it is one and they agree; the
+// offer's signature is not checked here
+static inline bool EspNowOtaManifestRead(char *text, uint8_t offer[ESPNOW_OTA_OFFER_LEN], uint32_t *lengths, uint32_t max_blocks, uint32_t *blocks) {
+  JsonParser parser(text);
+  JsonParserObject root = parser.getRootObject();
+  const char *hex = root.getStr(PSTR("offer"), "");
+  JsonParserArray list = root[PSTR("blocks")].getArray();
+  if ((2 * ESPNOW_OTA_OFFER_LEN != strlen(hex)) || (HexToBytes(hex, offer, ESPNOW_OTA_OFFER_LEN) != ESPNOW_OTA_OFFER_LEN)) { return false; }
+  uint32_t count = list.size();
+  if (!count || (count > max_blocks) || (count != EspNowOtaGet16(offer + 4))) { return false; }
+  for (uint32_t i = 0; i < count; i++) {
+    lengths[i] = list[i].getUInt(0);
+    if (!lengths[i]) { return false; }
+  }
+  *blocks = count;
+  return true;
+}
+
+// The next len bytes of an HTTP response, with the loop given its turns while they come, which feeds the loop's watchdog
+// (Stream::readBytes waits without yielding); false when none came for ESPNOW_OTA_HTTP_MS, or the connection closed first.
+// Every request of these gives up in ESPNOW_OTA_HTTP_MS too, connecting included, which does not yield
+static inline bool EspNowOtaHttpRead(WiFiClient *stream, uint8_t *buf, uint32_t len) {
+  uint32_t got = 0;
+  uint32_t heard = millis();
+  while (got < len) {
+    int n = stream->available();
+    if (n > 0) {
+      if ((uint32_t)n > len - got) { n = len - got; }
+      n = stream->read(buf + got, n);
+    }
+    if (n > 0) {
+      got += n;
+      heard = millis();
+    } else if (!stream->connected() || ((millis() - heard) > ESPNOW_OTA_HTTP_MS)) {
+      return false;
+    } else {
+      delay(1);
+    }
+  }
+  return true;
 }
 
 // Whether a frame heard is one of these, with its tag right: what it says is `len` - ESPNOW_OTA_TAG_LEN bytes
