@@ -176,28 +176,22 @@ static void EspNowOtaSenderEnd(const char *result) {
   EspNowOtaSender.send = kOtaSendIdle;
 }
 
-// An HTTP request that gives up in ESPNOW_OTA_HTTP_MS, within the loop's watchdog: connecting does not yield
-static void EspNowOtaHttpTimeouts(HTTPClientLight &http) {
-  http.setConnectTimeout(ESPNOW_OTA_HTTP_MS);
-  http.setTimeout(ESPNOW_OTA_HTTP_MS);
-}
-
 // The next len bytes of a response, the loop's watchdog fed while they come (Stream::readBytes waits without yielding);
-// false when none came for ESPNOW_OTA_HTTP_MS, or the connection closed first
-static bool EspNowOtaHttpRead(HTTPClientLight &http, uint8_t *buf, uint32_t len) {
-  auto &stream = http.getStream();
+// false when none came for ESPNOW_OTA_HTTP_MS, or the connection closed first. Every request here gives up in
+// ESPNOW_OTA_HTTP_MS too, connecting included, which does not yield
+static bool EspNowOtaHttpRead(WiFiClient *stream, uint8_t *buf, uint32_t len) {
   uint32_t got = 0;
   uint32_t heard = millis();
   while (got < len) {
-    int n = stream.available();
+    int n = stream->available();
     if (n > 0) {
       if ((uint32_t)n > len - got) { n = len - got; }
-      n = stream.read(buf + got, n);
+      n = stream->read(buf + got, n);
     }
     if (n > 0) {
       got += n;
       heard = millis();
-    } else if (!stream.connected() || ((millis() - heard) > ESPNOW_OTA_HTTP_MS)) {
+    } else if (!stream->connected() || ((millis() - heard) > ESPNOW_OTA_HTTP_MS)) {
       return false;
     } else {
       delay(1);
@@ -219,10 +213,11 @@ static bool EspNowOtaSenderFetch(uint32_t from, uint32_t len) {
   HTTPClientLight http;
   bool ok = http.begin(url);
   if (ok) {
-    EspNowOtaHttpTimeouts(http);
+    http.setConnectTimeout(ESPNOW_OTA_HTTP_MS);
+    http.setTimeout(ESPNOW_OTA_HTTP_MS);
     http.addHeader(F("Range"), range);
     int code = http.GET();
-    ok = ((206 == code) || ((200 == code) && (0 == from))) && EspNowOtaHttpRead(http, EspNowOtaSender.chunk, len);
+    ok = ((206 == code) || ((200 == code) && (0 == from))) && EspNowOtaHttpRead(http.getStreamPtr(), EspNowOtaSender.chunk, len);
     http.end();
   }
   if (ok) {
@@ -367,7 +362,8 @@ static bool EspNowOtaSenderManifest(void) {
   snprintf_P(url, sizeof(url), PSTR("%s/manifest.json"), EspNowOtaSender.url);
   HTTPClientLight http;
   if (!http.begin(url)) { return false; }
-  EspNowOtaHttpTimeouts(http);
+  http.setConnectTimeout(ESPNOW_OTA_HTTP_MS);
+  http.setTimeout(ESPNOW_OTA_HTTP_MS);
   bool ok = (200 == http.GET()) && (http.getSize() > 0) && (http.getSize() < ESPNOW_OTA_MANIFEST_MAX);
   String text;
   if (ok) { text = http.getString(); }
@@ -508,7 +504,8 @@ static void CmndEspNowOtaStop(void) {
 static uint32_t EspNowOtaSafebootPass(const char *url, const esp_partition_t *part, uint8_t digest[32]) {
   HTTPClientLight http;
   if (!http.begin(url)) { return 0; }
-  EspNowOtaHttpTimeouts(http);
+  http.setConnectTimeout(ESPNOW_OTA_HTTP_MS);
+  http.setTimeout(ESPNOW_OTA_HTTP_MS);
   int size = (200 == http.GET()) ? http.getSize() : -1;
   uint8_t *buf = (size > 0) ? (uint8_t *)malloc(ESPNOW_OTA_SAFEBOOT_CHUNK) : nullptr;
   if (nullptr == buf) {
@@ -522,7 +519,7 @@ static uint32_t EspNowOtaSafebootPass(const char *url, const esp_partition_t *pa
   while (ok && (got < (uint32_t)size)) {
     uint32_t want = size - got;
     if (want > ESPNOW_OTA_SAFEBOOT_CHUNK) { want = ESPNOW_OTA_SAFEBOOT_CHUNK; }
-    if (!EspNowOtaHttpRead(http, buf, want)) {
+    if (!EspNowOtaHttpRead(http.getStreamPtr(), buf, want)) {
       ok = false;
       break;
     }
@@ -574,7 +571,8 @@ static void CmndEspNowOtaSafeboot(void) {
   {
     HTTPClientLight http;
     if (http.begin(sig_url)) {
-      EspNowOtaHttpTimeouts(http);
+      http.setConnectTimeout(ESPNOW_OTA_HTTP_MS);
+      http.setTimeout(ESPNOW_OTA_HTTP_MS);
       if ((200 == http.GET()) && (http.getSize() > 0) && (http.getSize() < ESPNOW_OTA_MANIFEST_MAX)) {
         String text = http.getString();
         JsonParser parser((char *)text.c_str());
