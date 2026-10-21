@@ -2373,6 +2373,14 @@ void CmndEspNowMeshClock(void) {
 //                                               network pairs with), whose X25519 public key is pub (32 bytes): HKDF-SHA256 of the X25519 of the two
 //                                               identities, salt "casa-server", info "http", which the service derives the same from its own secret and this
 //                                               node's public key. False with no identity, or a key of small order. The node's secret does not leave the driver
+//   espnow_mesh_group_seal(label, data)      -> [version, sealed]: data (bytes, at most 8 KB) that only the members of the network can read back, as a
+//                                               node's own settings kept by a service of the network: AES-128-CCM under the key HKDF-SHA256 gives for the
+//                                               network's group key (salt "mesh group data", info label), with a random nonce of 12 bytes and the label as
+//                                               associated data. sealed is the nonce, the ciphertext and the tag of 16 bytes; version is the group key's.
+//                                               False with no group key. The key does not leave the driver
+//   espnow_mesh_group_open(label, version, sealed) -> the data, or false: under the group key of that version, the one in use or the previous one
+//                                               the device still holds, and with the same label; false when the tag does not match or no key of that
+//                                               version is held
 //   espnow_mesh_neighbors()                  -> a list of maps, one for each neighbour (id, state, rssi, age, beat, info, seen, skew, key, keybits), or false.
 //                                               key is the version of the network's key its heartbeat says it sends with (0: it does not say), and keybits has
 //                                               1 it holds the previous key, 2 it needs the key, 4 its heartbeat came under the previous key's tag
@@ -2429,6 +2437,98 @@ int EspNowMeshBerryPairKey(struct bvm *vm) {
     } else {
       be_pushbool(vm, false);
     }
+    be_return(vm);
+  }
+  be_raise(vm, kTypeError, nullptr);
+}
+
+// Data at rest that only the members of the network read back: AES-128-CCM under a key derived from a group key and the application's label
+#define ESPNOW_MESH_SEAL_NONCE  12
+#define ESPNOW_MESH_SEAL_TAG    16
+#define ESPNOW_MESH_SEAL_MAX    8192
+
+static void EspNowMeshDataKey(const uint8_t group[32], const char* label, uint8_t key[16]) {
+  static const char salt[] = "mesh group data";
+  EspNowMesh::Crypto::Hkdf((const uint8_t*)salt, sizeof(salt) - 1, group, 32, (const uint8_t*)label, strlen(label), key, 16);
+}
+
+int EspNowMeshBerryGroupSeal(struct bvm *vm);
+int EspNowMeshBerryGroupSeal(struct bvm *vm) {
+  if ((be_top(vm) >= 2) && be_isstring(vm, 1) && be_isbytes(vm, 2)) {
+    const char* label = be_tostring(vm, 1);
+    size_t len = 0;
+    const uint8_t* data = (const uint8_t*)be_tobytes(vm, 2, &len);
+    uint8_t* out = nullptr;
+    if (EspNowMeshSettings.has_group && (len <= ESPNOW_MESH_SEAL_MAX)) {
+      out = (uint8_t*)malloc(ESPNOW_MESH_SEAL_NONCE + len + ESPNOW_MESH_SEAL_TAG);
+    }
+    if (nullptr == out) {
+      be_pushbool(vm, false);
+      be_return(vm);
+    }
+    uint8_t key[16];
+    EspNowMeshDataKey(EspNowMeshSettings.group_key, label, key);
+    esp_fill_random(out, ESPNOW_MESH_SEAL_NONCE);
+    memcpy(out + ESPNOW_MESH_SEAL_NONCE, data, len);
+    bool ok = EspNowMesh::Crypto::CcmSeal(key, out, ESPNOW_MESH_SEAL_NONCE, (const uint8_t*)label, strlen(label), out + ESPNOW_MESH_SEAL_NONCE, len,
+                                          out + ESPNOW_MESH_SEAL_NONCE + len, ESPNOW_MESH_SEAL_TAG);
+    EspNowMesh::Crypto::Wipe(key, sizeof(key));
+    if (ok) {
+      be_newobject(vm, "list");
+      be_pushint(vm, (bint)EspNowMeshSettings.group_version);
+      be_data_push(vm, -2);
+      be_pop(vm, 1);
+      be_pushbytes(vm, out, ESPNOW_MESH_SEAL_NONCE + len + ESPNOW_MESH_SEAL_TAG);
+      be_data_push(vm, -2);
+      be_pop(vm, 1);
+      be_pop(vm, 1);
+    } else {
+      be_pushbool(vm, false);
+    }
+    EspNowMesh::Crypto::Wipe(out, ESPNOW_MESH_SEAL_NONCE + len + ESPNOW_MESH_SEAL_TAG);
+    free(out);
+    be_return(vm);
+  }
+  be_raise(vm, kTypeError, nullptr);
+}
+
+int EspNowMeshBerryGroupOpen(struct bvm *vm);
+int EspNowMeshBerryGroupOpen(struct bvm *vm) {
+  if ((be_top(vm) >= 3) && be_isstring(vm, 1) && be_isint(vm, 2) && be_isbytes(vm, 3)) {
+    const char* label = be_tostring(vm, 1);
+    int32_t version = be_toint(vm, 2);
+    size_t len = 0;
+    const uint8_t* sealed = (const uint8_t*)be_tobytes(vm, 3, &len);
+    // the group key of that version: the one in use, or the previous one while the device holds it
+    const uint8_t* group = nullptr;
+    if (EspNowMeshSettings.has_group && (version == EspNowMeshSettings.group_version)) {
+      group = EspNowMeshSettings.group_key;
+    } else if (EspNowMeshSettings.has_prev && (version == EspNowMeshSettings.prev_version)) {
+      group = EspNowMeshSettings.prev_key;
+    }
+    uint8_t* data = nullptr;
+    size_t n = 0;
+    if ((nullptr != group) && (len >= ESPNOW_MESH_SEAL_NONCE + ESPNOW_MESH_SEAL_TAG) && (len <= ESPNOW_MESH_SEAL_NONCE + ESPNOW_MESH_SEAL_MAX + ESPNOW_MESH_SEAL_TAG)) {
+      n = len - ESPNOW_MESH_SEAL_NONCE - ESPNOW_MESH_SEAL_TAG;
+      data = (uint8_t*)malloc(n > 0 ? n : 1);
+    }
+    if (nullptr == data) {
+      be_pushbool(vm, false);
+      be_return(vm);
+    }
+    uint8_t key[16];
+    EspNowMeshDataKey(group, label, key);
+    memcpy(data, sealed + ESPNOW_MESH_SEAL_NONCE, n);
+    bool ok = EspNowMesh::Crypto::CcmOpen(key, sealed, ESPNOW_MESH_SEAL_NONCE, (const uint8_t*)label, strlen(label), data, n,
+                                          sealed + ESPNOW_MESH_SEAL_NONCE + n, ESPNOW_MESH_SEAL_TAG);
+    EspNowMesh::Crypto::Wipe(key, sizeof(key));
+    if (ok) {
+      be_pushbytes(vm, data, n);
+    } else {
+      be_pushbool(vm, false);
+    }
+    EspNowMesh::Crypto::Wipe(data, n);
+    free(data);
     be_return(vm);
   }
   be_raise(vm, kTypeError, nullptr);
@@ -2677,6 +2777,12 @@ static void EspNowMeshBerryRegister(void) {
   be_pop(berry.vm, 1);
   be_pushntvfunction(berry.vm, EspNowMeshBerryPairKey);
   be_setglobal(berry.vm, "espnow_mesh_pair_key");
+  be_pop(berry.vm, 1);
+  be_pushntvfunction(berry.vm, EspNowMeshBerryGroupSeal);
+  be_setglobal(berry.vm, "espnow_mesh_group_seal");
+  be_pop(berry.vm, 1);
+  be_pushntvfunction(berry.vm, EspNowMeshBerryGroupOpen);
+  be_setglobal(berry.vm, "espnow_mesh_group_open");
   be_pop(berry.vm, 1);
 }
 
