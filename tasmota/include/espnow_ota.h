@@ -32,11 +32,21 @@
  *   piece   sender to receiver           image(4) block(2) offset(4) length(4) data
  *   ack     receiver to sender           image(4) block(2) offset(4) state(1): the block and the byte it wants next
  * The image is the first 4 bytes of its SHA-256, and the signature (Ed25519) covers the 39 bytes of the offer before it.
+ *
+ * The same 39 bytes, a record of size(4) blocks(2) block_kb(1) sha256(32), say any file a release signs: one that goes whole has
+ * 0 blocks of 0 KB. A record is taken when its signature checks under one of the public keys the build carries
+ * (ESPNOW_OTA_PUBLIC_KEYS, 32 bytes each, as one string); a build without them takes none.
 \*********************************************************************************************/
 
 #include <stdint.h>
 #include <stddef.h>
+#include <string.h>
 #include <t_bearssl.h>
+#include "ed25519.h"
+
+#ifndef ESPNOW_OTA_PUBLIC_KEYS
+#define ESPNOW_OTA_PUBLIC_KEYS         ""
+#endif
 
 #define ESPNOW_OTA_PROTOCOL            0x4F       // the first byte: above the types of the other ESP-NOW protocols on the radio
 #define ESPNOW_OTA_TAG_LEN             8
@@ -78,6 +88,35 @@ static inline void EspNowOtaTagOf(const br_hmac_key_context *key, const uint8_t 
   br_hmac_init(&hc, key, ESPNOW_OTA_TAG_LEN);
   br_hmac_update(&hc, frame, len);
   br_hmac_out(&hc, out);
+}
+
+// Ed25519 (RFC 8032) verification, as in the reference implementation
+static inline bool EspNowOtaVerify(const uint8_t *message, size_t len, const uint8_t signature[64], const uint8_t key[32]) {
+  if (signature[63] & 224) { return false; }
+  ge_p3 A;
+  if (ge_frombytes_negate_vartime(&A, key) != 0) { return false; }
+  uint8_t h[64];
+  br_sha512_context ctx;
+  br_sha512_init(&ctx);
+  br_sha512_update(&ctx, signature, 32);
+  br_sha512_update(&ctx, key, 32);
+  br_sha512_update(&ctx, message, len);
+  br_sha512_out(&ctx, h);
+  sc_reduce(h);
+  ge_p2 R;
+  ge_double_scalarmult_vartime(&R, h, &A, signature + 32);
+  uint8_t checker[32];
+  ge_tobytes(checker, &R);
+  return (0 == memcmp(checker, signature, 32));
+}
+
+// Whether a record of ESPNOW_OTA_SIGNED_LEN bytes is signed by one of the build's keys
+static inline bool EspNowOtaRecordSigned(const uint8_t *record, const uint8_t signature[64]) {
+  static const char keys[] = ESPNOW_OTA_PUBLIC_KEYS;
+  for (size_t i = 0; i + 32 <= sizeof(keys) - 1; i += 32) {
+    if (EspNowOtaVerify(record, ESPNOW_OTA_SIGNED_LEN, signature, (const uint8_t *)keys + i)) { return true; }
+  }
+  return false;
 }
 
 // Whether a frame heard is one of these, with its tag right: what it says is `len` - ESPNOW_OTA_TAG_LEN bytes

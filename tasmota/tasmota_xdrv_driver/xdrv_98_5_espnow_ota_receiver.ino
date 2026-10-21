@@ -44,6 +44,10 @@
  * Tasmota's WiFi Manager has the radio while it runs (its access point is on a channel of its own): nothing is parked and
  * the channel is left alone.
  *
+ * This image that restarts ESPNOW_OTA_BOOT_TRIES times in a row, each before ESPNOW_OTA_BOOT_OK_S, gives the device back to its
+ * app when the app partition holds a whole image (the boot loader checks it): Tasmota counts no boot loop in a safeboot image, and
+ * a fault here must not leave the device to a serial cable. The count lives in RTC memory, which a power cut clears.
+ *
  * The buttons of a device of a network do nothing while it runs this image: they are taken before the default handling,
  * which would switch its relays.
 \*********************************************************************************************/
@@ -62,6 +66,9 @@
 #define ESPNOW_OTA_RX_DEPTH            8
 #define ESPNOW_OTA_BEACON_S            2
 #define ESPNOW_OTA_GRACE_S             30         // a device whose WiFi has not connected by then parks it, for the mesh
+#define ESPNOW_OTA_BOOT_TRIES          3          // starts of this image in a row that end early, after which the app is booted
+#define ESPNOW_OTA_BOOT_OK_S           30         // a start that lasts this long is not one of them
+#define ESPNOW_OTA_BOOT_MAGIC          0x4F7A5BB0
 #define ESPNOW_OTA_NVS                 "espnowota"
 #define ESPNOW_OTA_MESH_NVS            "espnowmesh"  // the record of the ESP-NOW mesh: the device's number, the channel and the network key
 #define ESPNOW_OTA_MESH_ID             5          // offsets in that record
@@ -69,9 +76,6 @@
 #define ESPNOW_OTA_MESH_HAS_GROUP      13
 #define ESPNOW_OTA_MESH_GROUP_KEY      48
 
-#ifndef ESPNOW_OTA_PUBLIC_KEYS
-#define ESPNOW_OTA_PUBLIC_KEYS         ""
-#endif
 
 typedef struct {
   uint8_t mac[6];
@@ -111,32 +115,8 @@ static uint16_t EspNowOtaBlocks(void) { return EspNowOtaGet16(EspNowOta.manifest
 static uint32_t EspNowOtaBlockSize(void) { return EspNowOta.manifest[6] * 1024; }
 static const uint8_t *EspNowOtaSha(void) { return EspNowOta.manifest + 7; }
 
-// Ed25519 (RFC 8032) verification, as in the reference implementation
-static bool EspNowOtaVerify(const uint8_t *message, size_t len, const uint8_t signature[64], const uint8_t key[32]) {
-  if (signature[63] & 224) { return false; }
-  ge_p3 A;
-  if (ge_frombytes_negate_vartime(&A, key) != 0) { return false; }
-  uint8_t h[64];
-  br_sha512_context ctx;
-  br_sha512_init(&ctx);
-  br_sha512_update(&ctx, signature, 32);
-  br_sha512_update(&ctx, key, 32);
-  br_sha512_update(&ctx, message, len);
-  br_sha512_out(&ctx, h);
-  sc_reduce(h);
-  ge_p2 R;
-  ge_double_scalarmult_vartime(&R, h, &A, signature + 32);
-  uint8_t checker[32];
-  ge_tobytes(checker, &R);
-  return (0 == memcmp(checker, signature, 32));
-}
-
 static bool EspNowOtaSigned(const uint8_t *offer) {
-  static const char keys[] = ESPNOW_OTA_PUBLIC_KEYS;
-  for (uint32_t i = 0; i + 32 <= sizeof(keys) - 1; i += 32) {
-    if (EspNowOtaVerify(offer, ESPNOW_OTA_SIGNED_LEN, offer + ESPNOW_OTA_SIGNED_LEN, (const uint8_t *)keys + i)) { return true; }
-  }
-  return false;
+  return EspNowOtaRecordSigned(offer, offer + ESPNOW_OTA_SIGNED_LEN);
 }
 
 /*********************************************************************************************/
@@ -459,7 +439,27 @@ static void EspNowOtaLoop(void) {
   while (xQueueReceive(EspNowOta.rx, &rx, 0)) { EspNowOtaHandle(rx); }
 }
 
+// The starts of this image that did not last, kept across a restart and lost with the power
+RTC_NOINIT_ATTR static uint32_t EspNowOtaBootMagic;
+RTC_NOINIT_ATTR static uint32_t EspNowOtaBoots;
+
+static void EspNowOtaBootGuard(void) {
+  if (ESPNOW_OTA_BOOT_MAGIC != EspNowOtaBootMagic) {
+    EspNowOtaBootMagic = ESPNOW_OTA_BOOT_MAGIC;
+    EspNowOtaBoots = 0;
+  }
+  EspNowOtaBoots++;
+  if (EspNowOtaBoots < ESPNOW_OTA_BOOT_TRIES) { return; }
+  EspNowOtaBoots = 0;
+  const esp_partition_t *app = esp_ota_get_next_update_partition(nullptr);
+  if (app && (ESP_OK == esp_ota_set_boot_partition(app))) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("EOT: This image restarted %u times in a row, the app is booted"), ESPNOW_OTA_BOOT_TRIES);
+    EspRestart();
+  }
+}
+
 static void EspNowOtaEverySecond(void) {
+  if (ESPNOW_OTA_BOOT_OK_S == TasmotaGlobal.uptime) { EspNowOtaBoots = 0; }
   if (EspNowOta.has_key && !EspNowOta.parked && (WiFi.getMode() & WIFI_MODE_STA) && EspNowOtaShouldPark()) { EspNowOtaPark(); }
   EspNowOtaKeepChannel();
   EspNowOtaRadioStart();
@@ -479,6 +479,9 @@ bool Xdrv104(uint32_t function) {
       break;
     case FUNC_EVERY_SECOND:
       EspNowOtaEverySecond();
+      break;
+    case FUNC_PRE_INIT:
+      EspNowOtaBootGuard();
       break;
     case FUNC_INIT:
       EspNowOtaInit();

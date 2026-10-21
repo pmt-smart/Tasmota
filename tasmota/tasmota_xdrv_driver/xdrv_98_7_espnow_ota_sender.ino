@@ -38,6 +38,11 @@
  *                                         its display says the image is from, this device's name when not given
  *   EspNowOtaSend                         what the send is doing
  *   EspNowOtaStop                         stops it
+ *   EspNowOtaSafeboot <url>               writes the safeboot image at <url> (a .bin) into this device's safeboot partition: the image
+ *                                         must be signed by one of the build's keys, in <url>.sig.json ("record" and "signature" in hex,
+ *                                         a record of 0 blocks); it is fetched once to check it before anything is erased, then written,
+ *                                         read back and checked by the boot loader. The app keeps running whatever happens; a write that
+ *                                         went wrong says so, and the command is run again
  *
  * Reported to the rule engine:
  *   {"EspNowOta":{"Node":7,"State":1,"Image":"3a91f0c2","Block":2,"Blocks":31,"Rssi":-61}}  a neighbour in its safeboot image,
@@ -52,6 +57,8 @@
 #define XDRV_106                       106
 
 #include "include/espnow_ota.h"
+#include <esp_partition.h>
+#include <esp_image_format.h>
 
 #define ESPNOW_OTA_HEARD_MAX           8          // the neighbours in their safeboot image kept at once
 #define ESPNOW_OTA_GONE_S              30
@@ -62,6 +69,7 @@
 #define ESPNOW_OTA_RX_QUEUE            8
 #define ESPNOW_OTA_URL_MAX             120
 #define ESPNOW_OTA_MANIFEST_MAX        8192
+#define ESPNOW_OTA_SAFEBOOT_CHUNK      4096
 
 enum EspNowOtaSendState : uint8_t { kOtaSendIdle = 0, kOtaSendOffer, kOtaSendPieces };
 
@@ -456,6 +464,132 @@ static void CmndEspNowOtaStop(void) {
   ResponseCmndDone();
 }
 
+// One pass over the image at the url: its SHA-256 and, with a partition, the image written to it as it comes. The bytes it had
+static uint32_t EspNowOtaSafebootPass(const char *url, const esp_partition_t *part, uint8_t digest[32]) {
+  HTTPClientLight http;
+  if (!http.begin(url)) { return 0; }
+  http.setTimeout(10000);
+  int size = (200 == http.GET()) ? http.getSize() : -1;
+  uint8_t *buf = (size > 0) ? (uint8_t *)malloc(ESPNOW_OTA_SAFEBOOT_CHUNK) : nullptr;
+  if (nullptr == buf) {
+    http.end();
+    return 0;
+  }
+  br_sha256_context ctx;
+  br_sha256_init(&ctx);
+  uint32_t got = 0;
+  bool ok = true;
+  while (ok && (got < (uint32_t)size)) {
+    uint32_t want = size - got;
+    if (want > ESPNOW_OTA_SAFEBOOT_CHUNK) { want = ESPNOW_OTA_SAFEBOOT_CHUNK; }
+    uint32_t n = http.getStream().readBytes((char *)buf, want);
+    if (0 == n) {
+      ok = false;
+      break;
+    }
+    br_sha256_update(&ctx, buf, n);
+    if (part) { ok = (ESP_OK == esp_partition_write(part, got, buf, n)); }
+    got += n;
+    delay(1);                                // the loop's turn, for the WiFi and the watchdog
+  }
+  free(buf);
+  http.end();
+  br_sha256_out(&ctx, digest);
+  return ok ? got : 0;
+}
+
+// The partition's first bytes, read back: their SHA-256
+static void EspNowOtaSafebootReadBack(const esp_partition_t *part, uint32_t size, uint8_t digest[32]) {
+  br_sha256_context ctx;
+  br_sha256_init(&ctx);
+  uint8_t *buf = (uint8_t *)malloc(ESPNOW_OTA_SAFEBOOT_CHUNK);
+  for (uint32_t at = 0; buf && (at < size); at += ESPNOW_OTA_SAFEBOOT_CHUNK) {
+    uint32_t n = size - at;
+    if (n > ESPNOW_OTA_SAFEBOOT_CHUNK) { n = ESPNOW_OTA_SAFEBOOT_CHUNK; }
+    if (ESP_OK != esp_partition_read(part, at, buf, n)) { break; }
+    br_sha256_update(&ctx, buf, n);
+  }
+  free(buf);
+  br_sha256_out(&ctx, digest);
+}
+
+static void CmndEspNowOtaSafeboot(void) {
+  if (!XdrvMailbox.data_len || (XdrvMailbox.data_len >= ESPNOW_OTA_URL_MAX) || strncmp_P(XdrvMailbox.data, PSTR("http://"), 7)) {
+    ResponseCmndChar_P(PSTR("EspNowOtaSafeboot <http://...bin>"));
+    return;
+  }
+  const esp_partition_t *factory = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, nullptr);
+  if (!factory || EspRunningFactoryPartition()) {
+    ResponseCmndChar_P(PSTR("no safeboot partition to write"));
+    return;
+  }
+  char url[ESPNOW_OTA_URL_MAX];
+  strlcpy(url, XdrvMailbox.data, sizeof(url));
+  // the signed record, beside the image
+  char sig_url[ESPNOW_OTA_URL_MAX + 12];
+  snprintf_P(sig_url, sizeof(sig_url), PSTR("%s.sig.json"), url);
+  uint8_t record[ESPNOW_OTA_SIGNED_LEN];
+  uint8_t signature[64];
+  bool ok = false;
+  {
+    HTTPClientLight http;
+    if (http.begin(sig_url)) {
+      http.setTimeout(5000);
+      if ((200 == http.GET()) && (http.getSize() > 0) && (http.getSize() < ESPNOW_OTA_MANIFEST_MAX)) {
+        String text = http.getString();
+        JsonParser parser((char *)text.c_str());
+        JsonParserObject root = parser.getRootObject();
+        const char *r = root.getStr(PSTR("record"), "");
+        const char *g = root.getStr(PSTR("signature"), "");
+        ok = (2 * ESPNOW_OTA_SIGNED_LEN == strlen(r)) && (128 == strlen(g)) &&
+             (HexToBytes(r, record, sizeof(record)) == ESPNOW_OTA_SIGNED_LEN) && (HexToBytes(g, signature, sizeof(signature)) == 64);
+      }
+      http.end();
+    }
+  }
+  if (!ok) {
+    ResponseCmndChar_P(PSTR("the signature could not be fetched or read"));
+    return;
+  }
+  if (!EspNowOtaRecordSigned(record, signature)) {
+    ResponseCmndChar_P(PSTR("the image is not signed by a key of this build"));
+    return;
+  }
+  uint32_t size = EspNowOtaGet32(record);
+  const uint8_t *sha = record + 7;
+  if (EspNowOtaGet16(record + 4) || record[6] || !size || (size > factory->size)) {
+    ResponseCmndChar_P(PSTR("the image does not fit the safeboot partition"));
+    return;
+  }
+  // what the server has is the image signed, before anything is erased
+  uint8_t digest[32];
+  if ((EspNowOtaSafebootPass(url, nullptr, digest) != size) || memcmp(digest, sha, 32)) {
+    ResponseCmndChar_P(PSTR("the image fetched is not the one signed"));
+    return;
+  }
+  AddLog(LOG_LEVEL_INFO, PSTR("EOS: Writing a safeboot image of %u bytes"), size);
+  uint32_t erase = (size + SPI_FLASH_SEC_SIZE - 1) & ~(SPI_FLASH_SEC_SIZE - 1);
+  ok = (ESP_OK == esp_partition_erase_range(factory, 0, erase)) && (EspNowOtaSafebootPass(url, factory, digest) == size) && !memcmp(digest, sha, 32);
+  if (ok) {
+    EspNowOtaSafebootReadBack(factory, size, digest);
+    ok = !memcmp(digest, sha, 32);
+  }
+  if (ok) {
+    esp_partition_pos_t pos = { .offset = factory->address, .size = factory->size };
+    esp_image_metadata_t meta;
+    ok = (ESP_OK == esp_image_verify(ESP_IMAGE_VERIFY, &pos, &meta));
+  }
+  if (!ok) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("EOS: The safeboot partition holds a broken image: run EspNowOtaSafeboot again before any update"));
+    ResponseCmndChar_P(PSTR("written wrong: run it again before any update"));
+    return;
+  }
+  char hex[17];
+  ToHex_P(sha, 8, hex, sizeof(hex));
+  AddLog(LOG_LEVEL_INFO, PSTR("EOS: Safeboot image of %u bytes written and checked, SHA-256 %s..."), size, hex);
+  Response_P(PSTR("{\"%s\":{\"Written\":%u,\"Sha256\":\"%s\"}}"), XdrvMailbox.command, size, hex);
+}
+
 // What the safeboot image kept of an image under way: a device that runs its app takes none
 static void EspNowOtaSenderInit(void) {
   if (nullptr == EspNowOtaSender.rx) { EspNowOtaSender.rx = xQueueCreate(ESPNOW_OTA_RX_QUEUE, sizeof(EspNowOtaHeardFrame_t)); }
@@ -478,9 +612,9 @@ static void EspNowOtaSenderInit(void) {
 \*********************************************************************************************/
 
 const char kEspNowOtaCommands[] PROGMEM = "EspNowOta|"
-  "Arm|Nodes|Send|Stop";
+  "Arm|Nodes|Send|Stop|Safeboot";
 void (* const kEspNowOtaCommand[])(void) PROGMEM = {
-  &CmndEspNowOtaArm, &CmndEspNowOtaNodes, &CmndEspNowOtaSend, &CmndEspNowOtaStop };
+  &CmndEspNowOtaArm, &CmndEspNowOtaNodes, &CmndEspNowOtaSend, &CmndEspNowOtaStop, &CmndEspNowOtaSafeboot };
 
 bool Xdrv106(uint32_t function) {
   bool result = false;
