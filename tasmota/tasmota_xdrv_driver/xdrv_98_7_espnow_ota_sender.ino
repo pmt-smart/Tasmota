@@ -50,7 +50,7 @@
  *                                                                                           when what it says changes
  *   {"EspNowOta":{"Node":7,"Gone":1}}                      not heard for ESPNOW_OTA_GONE_S
  *   {"EspNowOtaSend":{"Node":7,"Result":"Done"}}           the end of a send: Done, Failed (the receiver says so), NoAnswer,
- *                                                          Fetch (the image could not be fetched) or Stopped
+ *                                                          Fetch (the image could not be fetched, 5 times in a row) or Stopped
  *
  * The app that starts clears what the safeboot image kept of an image under way: a device that runs its app takes none.
 \*********************************************************************************************/
@@ -70,6 +70,8 @@
 #define ESPNOW_OTA_RX_QUEUE            8
 #define ESPNOW_OTA_URL_MAX             120
 #define ESPNOW_OTA_MANIFEST_MAX        2048       // the JSON parser keeps a token's place in 11 bits: 2 KB at most
+#define ESPNOW_OTA_HTTP_MS             2000       // an HTTP request with nothing for this long fails: inside the loop's 5 s watchdog
+#define ESPNOW_OTA_FETCH_TRIES         5          // the blocks not fetched this many times in a row end the send
 #define ESPNOW_OTA_SAFEBOOT_CHUNK      4096
 #define ESPNOW_OTA_SAFEBOOT_ERASE      0x10000    // the safeboot partition erased a 64 KB block at a time
 
@@ -121,6 +123,7 @@ struct {
   uint32_t pieces = 0;                       // sent, and sent again
   uint32_t again = 0;
   uint32_t fetches = 0;
+  uint8_t fetch_fails = 0;                   // in a row
 } EspNowOtaSender;
 
 /*********************************************************************************************/
@@ -173,6 +176,36 @@ static void EspNowOtaSenderEnd(const char *result) {
   EspNowOtaSender.send = kOtaSendIdle;
 }
 
+// An HTTP request that gives up in ESPNOW_OTA_HTTP_MS, within the loop's watchdog: connecting does not yield
+static void EspNowOtaHttpTimeouts(HTTPClientLight &http) {
+  http.setConnectTimeout(ESPNOW_OTA_HTTP_MS);
+  http.setTimeout(ESPNOW_OTA_HTTP_MS);
+}
+
+// The next len bytes of a response, the loop's watchdog fed while they come (Stream::readBytes waits without yielding);
+// false when none came for ESPNOW_OTA_HTTP_MS, or the connection closed first
+static bool EspNowOtaHttpRead(HTTPClientLight &http, uint8_t *buf, uint32_t len) {
+  auto &stream = http.getStream();
+  uint32_t got = 0;
+  uint32_t heard = millis();
+  while (got < len) {
+    int n = stream.available();
+    if (n > 0) {
+      if ((uint32_t)n > len - got) { n = len - got; }
+      n = stream.read(buf + got, n);
+    }
+    if (n > 0) {
+      got += n;
+      heard = millis();
+    } else if (!stream.connected() || ((millis() - heard) > ESPNOW_OTA_HTTP_MS)) {
+      return false;
+    } else {
+      delay(1);
+    }
+  }
+  return true;
+}
+
 // The bytes [from, from + len) of blocks.bin
 static bool EspNowOtaSenderFetch(uint32_t from, uint32_t len) {
   if (nullptr == EspNowOtaSender.chunk) {
@@ -186,13 +219,10 @@ static bool EspNowOtaSenderFetch(uint32_t from, uint32_t len) {
   HTTPClientLight http;
   bool ok = http.begin(url);
   if (ok) {
-    http.setTimeout(5000);
+    EspNowOtaHttpTimeouts(http);
     http.addHeader(F("Range"), range);
     int code = http.GET();
-    ok = (206 == code) || ((200 == code) && (0 == from));
-    if (ok) {
-      ok = ((uint32_t)http.getStream().readBytes((char *)EspNowOtaSender.chunk, len) == len);
-    }
+    ok = ((206 == code) || ((200 == code) && (0 == from))) && EspNowOtaHttpRead(http, EspNowOtaSender.chunk, len);
     http.end();
   }
   if (ok) {
@@ -232,7 +262,13 @@ static void EspNowOtaSenderPiece(void) {
   if ((from < EspNowOtaSender.chunk_from) || (from + n > EspNowOtaSender.chunk_from + EspNowOtaSender.chunk_len)) {
     uint32_t len = length - got;             // to the end of the block at most: a chunk is of one block
     if (len > ESPNOW_OTA_CHUNK) { len = ESPNOW_OTA_CHUNK; }
-    if (!EspNowOtaSenderFetch(from, len)) { return EspNowOtaSenderEnd(PSTR("Fetch")); }
+    if (!EspNowOtaSenderFetch(from, len)) {
+      if (++EspNowOtaSender.fetch_fails >= ESPNOW_OTA_FETCH_TRIES) { return EspNowOtaSenderEnd(PSTR("Fetch")); }
+      AddLog(LOG_LEVEL_DEBUG, PSTR("EOS: Bytes %u of the blocks not fetched, tried again"), from);
+      EspNowOtaSender.sent_ms = millis();    // fetched again when the time for an ack has gone
+      return;
+    }
+    EspNowOtaSender.fetch_fails = 0;
   }
   uint8_t frame[ESPNOW_OTA_MAX_FRAME] = { ESPNOW_OTA_PROTOCOL, kOtaPiece, EspNowMeshSettings.id };
   memcpy(frame + 3, EspNowOtaSender.offer + 7, 4);  // the image: the first bytes of its SHA-256
@@ -331,7 +367,7 @@ static bool EspNowOtaSenderManifest(void) {
   snprintf_P(url, sizeof(url), PSTR("%s/manifest.json"), EspNowOtaSender.url);
   HTTPClientLight http;
   if (!http.begin(url)) { return false; }
-  http.setTimeout(5000);
+  EspNowOtaHttpTimeouts(http);
   bool ok = (200 == http.GET()) && (http.getSize() > 0) && (http.getSize() < ESPNOW_OTA_MANIFEST_MAX);
   String text;
   if (ok) { text = http.getString(); }
@@ -456,6 +492,7 @@ static void CmndEspNowOtaSend(void) {
   EspNowOtaSender.pieces = 0;
   EspNowOtaSender.again = 0;
   EspNowOtaSender.fetches = 0;
+  EspNowOtaSender.fetch_fails = 0;
   EspNowOtaSender.send = kOtaSendOffer;
   EspNowOtaSenderOffer();
   AddLog(LOG_LEVEL_INFO, PSTR("EOS: Sending node %u the image at %s, %u blocks"), node, EspNowOtaSender.url, EspNowOtaSender.blocks);
@@ -471,7 +508,7 @@ static void CmndEspNowOtaStop(void) {
 static uint32_t EspNowOtaSafebootPass(const char *url, const esp_partition_t *part, uint8_t digest[32]) {
   HTTPClientLight http;
   if (!http.begin(url)) { return 0; }
-  http.setTimeout(10000);
+  EspNowOtaHttpTimeouts(http);
   int size = (200 == http.GET()) ? http.getSize() : -1;
   uint8_t *buf = (size > 0) ? (uint8_t *)malloc(ESPNOW_OTA_SAFEBOOT_CHUNK) : nullptr;
   if (nullptr == buf) {
@@ -485,14 +522,13 @@ static uint32_t EspNowOtaSafebootPass(const char *url, const esp_partition_t *pa
   while (ok && (got < (uint32_t)size)) {
     uint32_t want = size - got;
     if (want > ESPNOW_OTA_SAFEBOOT_CHUNK) { want = ESPNOW_OTA_SAFEBOOT_CHUNK; }
-    uint32_t n = http.getStream().readBytes((char *)buf, want);
-    if (0 == n) {
+    if (!EspNowOtaHttpRead(http, buf, want)) {
       ok = false;
       break;
     }
-    br_sha256_update(&ctx, buf, n);
-    if (part) { ok = (ESP_OK == esp_partition_write(part, got, buf, n)); }
-    got += n;
+    br_sha256_update(&ctx, buf, want);
+    if (part) { ok = (ESP_OK == esp_partition_write(part, got, buf, want)); }
+    got += want;
     delay(1);                                // the loop's turn, for the WiFi and the watchdog
   }
   free(buf);
@@ -538,7 +574,7 @@ static void CmndEspNowOtaSafeboot(void) {
   {
     HTTPClientLight http;
     if (http.begin(sig_url)) {
-      http.setTimeout(5000);
+      EspNowOtaHttpTimeouts(http);
       if ((200 == http.GET()) && (http.getSize() > 0) && (http.getSize() < ESPNOW_OTA_MANIFEST_MAX)) {
         String text = http.getString();
         JsonParser parser((char *)text.c_str());
@@ -568,7 +604,7 @@ static void CmndEspNowOtaSafeboot(void) {
   // what the server has is the image signed, before anything is erased
   uint8_t digest[32];
   if ((EspNowOtaSafebootPass(url, nullptr, digest) != size) || memcmp(digest, sha, 32)) {
-    ResponseCmndChar_P(PSTR("the image fetched is not the one signed"));
+    ResponseCmndChar_P(PSTR("the image could not be fetched whole, or is not the one signed"));
     return;
   }
   AddLog(LOG_LEVEL_INFO, PSTR("EOS: Writing a safeboot image of %u bytes"), size);
