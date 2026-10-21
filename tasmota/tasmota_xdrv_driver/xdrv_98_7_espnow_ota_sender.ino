@@ -70,6 +70,7 @@
 #define ESPNOW_OTA_URL_MAX             120
 #define ESPNOW_OTA_MANIFEST_MAX        8192
 #define ESPNOW_OTA_SAFEBOOT_CHUNK      4096
+#define ESPNOW_OTA_SAFEBOOT_ERASE      0x10000    // the safeboot partition erased a 64 KB block at a time
 
 enum EspNowOtaSendState : uint8_t { kOtaSendIdle = 0, kOtaSendOffer, kOtaSendPieces };
 
@@ -508,6 +509,7 @@ static void EspNowOtaSafebootReadBack(const esp_partition_t *part, uint32_t size
     if (n > ESPNOW_OTA_SAFEBOOT_CHUNK) { n = ESPNOW_OTA_SAFEBOOT_CHUNK; }
     if (ESP_OK != esp_partition_read(part, at, buf, n)) { break; }
     br_sha256_update(&ctx, buf, n);
+    yield();
   }
   free(buf);
   br_sha256_out(&ctx, digest);
@@ -569,7 +571,13 @@ static void CmndEspNowOtaSafeboot(void) {
   }
   AddLog(LOG_LEVEL_INFO, PSTR("EOS: Writing a safeboot image of %u bytes"), size);
   uint32_t erase = (size + SPI_FLASH_SEC_SIZE - 1) & ~(SPI_FLASH_SEC_SIZE - 1);
-  ok = (ESP_OK == esp_partition_erase_range(factory, 0, erase)) && (EspNowOtaSafebootPass(url, factory, digest) == size) && !memcmp(digest, sha, 32);
+  for (uint32_t at = 0; ok && (at < erase); at += ESPNOW_OTA_SAFEBOOT_ERASE) {
+    uint32_t n = erase - at;
+    if (n > ESPNOW_OTA_SAFEBOOT_ERASE) { n = ESPNOW_OTA_SAFEBOOT_ERASE; }
+    ok = (ESP_OK == esp_partition_erase_range(factory, at, n));
+    yield();                                 // a block at a time: the whole partition at once outlasts the loop's watchdog
+  }
+  ok = ok && (EspNowOtaSafebootPass(url, factory, digest) == size) && !memcmp(digest, sha, 32);
   if (ok) {
     EspNowOtaSafebootReadBack(factory, size, digest);
     ok = !memcmp(digest, sha, 32);
