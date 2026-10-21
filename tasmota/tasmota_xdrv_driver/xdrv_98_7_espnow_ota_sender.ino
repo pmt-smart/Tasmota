@@ -26,7 +26,8 @@
  * fetches over HTTP a few KB at a time; and it puts its own device into its safeboot image, to take an image that way.
  *
  * The image is a folder, as a release tool packs it: manifest.json, whose "offer" is the 103-byte signed offer in hex and
- * whose "blocks" are the offset and length of each compressed block in blocks.bin, the other file. The sender takes the
+ * whose "blocks" are the length of each compressed block in blocks.bin, the other file, where they follow each other; the
+ * manifest is compact JSON of 2 KB at most, which is what the JSON parser reads. The sender takes the
  * receiver's word for where it is at every ack, and sends the piece it asks for: one piece at a time, sent again when no ack
  * comes, the blocks fetched with a Range of ESPNOW_OTA_CHUNK bytes. The frames go on the mesh's radio, under its lock and with
  * its peers, and the sender takes the OTA frames the radio hears before the mesh does.
@@ -68,7 +69,7 @@
 #define ESPNOW_OTA_TRIES               24         // and given up after as many, which outlasts a block's erase and write
 #define ESPNOW_OTA_RX_QUEUE            8
 #define ESPNOW_OTA_URL_MAX             120
-#define ESPNOW_OTA_MANIFEST_MAX        8192
+#define ESPNOW_OTA_MANIFEST_MAX        2048       // the JSON parser keeps a token's place in 11 bits: 2 KB at most
 #define ESPNOW_OTA_SAFEBOOT_CHUNK      4096
 #define ESPNOW_OTA_SAFEBOOT_ERASE      0x10000    // the safeboot partition erased a 64 KB block at a time
 
@@ -343,11 +344,12 @@ static bool EspNowOtaSenderManifest(void) {
   if ((2 * ESPNOW_OTA_OFFER_LEN != strlen(offer)) || (HexToBytes(offer, EspNowOtaSender.offer, ESPNOW_OTA_OFFER_LEN) != ESPNOW_OTA_OFFER_LEN)) { return false; }
   uint32_t count = blocks.size();
   if (!count || (count > ESPNOW_OTA_SEND_BLOCKS) || (count != EspNowOtaGet16(EspNowOtaSender.offer + 4))) { return false; }
+  uint32_t offset = 0;
   for (uint32_t i = 0; i < count; i++) {
-    JsonParserObject b = blocks[i].getObject();
-    EspNowOtaSender.block_offset[i] = b.getUInt(PSTR("offset"), 0);
-    EspNowOtaSender.block_length[i] = b.getUInt(PSTR("length"), 0);
+    EspNowOtaSender.block_offset[i] = offset;
+    EspNowOtaSender.block_length[i] = blocks[i].getUInt(0);
     if (!EspNowOtaSender.block_length[i]) { return false; }
+    offset += EspNowOtaSender.block_length[i];
   }
   EspNowOtaSender.blocks = count;
   return true;
