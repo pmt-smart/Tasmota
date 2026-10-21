@@ -119,6 +119,8 @@ struct {
   uint32_t chunk_from = 0;
   uint32_t chunk_len = 0;
   uint32_t sent_ms = 0;
+  uint16_t sent_block = 0;                   // the last piece sent
+  uint32_t sent_got = 0;
   uint8_t tries = 0;
   uint32_t pieces = 0;                       // sent, and sent again
   uint32_t again = 0;
@@ -273,6 +275,8 @@ static void EspNowOtaSenderPiece(void) {
   memcpy(frame + ESPNOW_OTA_HEADER + ESPNOW_OTA_PIECE_HEADER, EspNowOtaSender.chunk + (from - EspNowOtaSender.chunk_from), n);
   EspNowOtaSenderTx(EspNowOtaSender.mac, frame, ESPNOW_OTA_HEADER + ESPNOW_OTA_PIECE_HEADER + n);
   EspNowOtaSender.sent_ms = millis();
+  EspNowOtaSender.sent_block = block;
+  EspNowOtaSender.sent_got = got;
   EspNowOtaSender.pieces++;
 }
 
@@ -285,6 +289,10 @@ static void EspNowOtaSenderAck(const uint8_t *mac, const uint8_t *body) {
   if (kOtaDone == EspNowOtaSender.at_state) { return EspNowOtaSenderEnd(PSTR("Done")); }
   if (kOtaFailed == EspNowOtaSender.at_state) { return EspNowOtaSenderEnd(PSTR("Failed")); }
   if (kOtaChecking == EspNowOtaSender.at_state) { return; }  // reading the image back: the next ack says how it went
+  // the piece it asks for went just now: this ack answers a piece it heard twice (one sent again), and sending it once
+  // more would put two pieces on the air for every ack from here on
+  if ((kOtaSendPieces == EspNowOtaSender.send) && (EspNowOtaSender.at_block == EspNowOtaSender.sent_block) &&
+      (EspNowOtaSender.at_got == EspNowOtaSender.sent_got) && ((millis() - EspNowOtaSender.sent_ms) < ESPNOW_OTA_ANSWER_MS)) { return; }
   EspNowOtaSender.send = kOtaSendPieces;
   EspNowOtaSenderPiece();
 }
