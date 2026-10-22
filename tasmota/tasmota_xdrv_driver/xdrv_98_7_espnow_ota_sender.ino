@@ -541,9 +541,10 @@ static void EspNowOtaSafebootReadBack(const esp_partition_t *part, uint32_t size
   br_sha256_out(&ctx, digest);
 }
 
-// The signed record of the safeboot image an install checked, kept: what tells EspNowOtaArm the partition holds one that takes
-// an image over ESP-NOW
-static void EspNowOtaSafebootKeep(const uint8_t record[ESPNOW_OTA_SIGNED_LEN], const uint8_t signature[64]) {
+// The signed record of the safeboot image an install checked (ESPNOW_OTA_SIGNED_LEN bytes, and its 64-byte signature), kept: what
+// tells EspNowOtaArm the partition holds one that takes an image over ESP-NOW. Plain pointers: the prototypes the build writes for
+// the .ino files come before the header that defines the length
+static void EspNowOtaSafebootKeep(const uint8_t *record, const uint8_t *signature) {
   nvs_handle_t handle;
   if (ESP_OK != nvs_open(ESPNOW_OTA_SAFEBOOT_NVS, NVS_READWRITE, &handle)) { return; }
   uint8_t kept[ESPNOW_OTA_SIGNED_LEN + 64];
