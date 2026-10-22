@@ -55,6 +55,11 @@
  * app when the app partition holds a whole image (the boot loader checks it): Tasmota counts no boot loop in a safeboot image, and
  * a fault here must not leave the device to a serial cable. The count lives in RTC memory, which a power cut clears.
  *
+ * An image the application asked for (the NVS key "armed", or a release's "url") that nobody offers ESPNOW_OTA_WAIT_S after
+ * this image started gives the device back to its app the same way: a neighbour that was to send it and did not must not leave
+ * the device here, where it would stay across a power cut too (the restart into this image erased the boot partition's choice).
+ * Once an offer is taken, the app partition is being written over, and the device waits for the image.
+ *
  * The buttons of a device of a network do nothing while it runs this image: they are taken before the default handling,
  * which would switch its relays.
 \*********************************************************************************************/
@@ -79,6 +84,7 @@
 #define ESPNOW_OTA_BOOT_TRIES          3          // starts of this image in a row that end early, after which the app is booted
 #define ESPNOW_OTA_BOOT_OK_S           30         // a start that lasts this long is not one of them
 #define ESPNOW_OTA_BOOT_MAGIC          0x4F7A5BB0
+#define ESPNOW_OTA_WAIT_S              600        // an image asked for that nobody offers in this long: the app is booted
 #define ESPNOW_OTA_NVS                 "espnowota"
 #define ESPNOW_OTA_MESH_NVS            "espnowmesh"  // the record of the ESP-NOW mesh: the device's number, the channel and the network key
 #define ESPNOW_OTA_MESH_ID             5          // offsets in that record
@@ -111,6 +117,7 @@ struct {
   bool has_manifest = false;
   bool armed = false;                        // the application asked for the image over ESP-NOW
   bool parked = false;                       // the station, on the mesh's channel
+  bool waited = false;                       // the app was booted for an image nobody offered, or could not be
   uint8_t sender_node = 0;                   // the sender's number in the network
   char sender_name[ESPNOW_OTA_NAME_MAX + 1] = "";
   uint32_t last_piece_ms = 0;                // when the last piece was taken
@@ -593,8 +600,22 @@ static void EspNowOtaBootGuard(void) {
   }
 }
 
+// An image asked for that nobody offered: the app, when its partition holds a whole image
+static void EspNowOtaWaitedEnough(void) {
+  if (EspNowOta.waited || EspNowOta.has_manifest || (!EspNowOta.armed && !EspNowOta.url[0]) || (TasmotaGlobal.uptime < ESPNOW_OTA_WAIT_S)) { return; }
+  EspNowOta.waited = true;
+  const esp_partition_t *app = esp_ota_get_next_update_partition(nullptr);
+  if (app && (ESP_OK == esp_ota_set_boot_partition(app))) {
+    AddLog(LOG_LEVEL_INFO, PSTR("EOT: No image offered in %u s, the app is booted"), ESPNOW_OTA_WAIT_S);
+    EspRestart();
+  } else {
+    AddLog(LOG_LEVEL_INFO, PSTR("EOT: No image offered in %u s, and no whole app to boot: waiting for one"), ESPNOW_OTA_WAIT_S);
+  }
+}
+
 static void EspNowOtaEverySecond(void) {
   if (ESPNOW_OTA_BOOT_OK_S == TasmotaGlobal.uptime) { EspNowOtaBoots = 0; }
+  EspNowOtaWaitedEnough();
   if (EspNowOta.has_key && !EspNowOta.parked && (WiFi.getMode() & WIFI_MODE_STA) && EspNowOtaShouldPark()) { EspNowOtaPark(); }
   EspNowOtaKeepChannel();
   EspNowOtaRadioStart();

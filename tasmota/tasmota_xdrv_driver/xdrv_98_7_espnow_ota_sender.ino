@@ -33,7 +33,11 @@
  * its peers, and the sender takes the OTA frames the radio hears before the mesh does.
  *
  *   EspNowOtaArm                          restarts this device into its safeboot image, to take an image over ESP-NOW: the NVS key
- *                                         "armed" tells the receiver to keep the radio on the mesh's channel at once
+ *                                         "armed" tells the receiver to keep the radio on the mesh's channel at once. Only when the
+ *                                         safeboot partition holds an image known to take one over ESP-NOW: the one whose signed
+ *                                         record EspNowOtaSafeboot or EspNowOtaUpgrade kept when they checked it, read back whole.
+ *                                         Any other safeboot image (Tasmota's own has no receiver) would leave a device without WiFi
+ *                                         in it, out of reach
  *   EspNowOtaNodes                        the neighbours heard in their safeboot image
  *   EspNowOtaSend <node> <url> [<name>]   sends neighbour <node>, heard in its safeboot image, the image at <url>; <name> is what
  *                                         its display says the image is from, this device's name when not given
@@ -76,6 +80,8 @@
 #define ESPNOW_OTA_FETCH_TRIES         5          // the blocks not fetched this many times in a row end the send
 #define ESPNOW_OTA_SAFEBOOT_CHUNK      4096
 #define ESPNOW_OTA_SAFEBOOT_ERASE      0x10000    // the safeboot partition erased a 64 KB block at a time
+#define ESPNOW_OTA_SAFEBOOT_NVS        "espnowota_sb"  // the signed record of the safeboot image an install checked; apart from
+                                                       // "espnowota", which the app clears at every start
 
 enum EspNowOtaSendState : uint8_t { kOtaSendIdle = 0, kOtaSendOffer, kOtaSendPieces };
 
@@ -366,9 +372,15 @@ static bool EspNowOtaSenderManifest(void) {
   return true;
 }
 
+static bool EspNowOtaSafebootKnown(void);
+
 static void CmndEspNowOtaArm(void) {
   if (!EspSingleOtaPartition() || EspRunningFactoryPartition()) {
     ResponseCmndChar_P(PSTR("no safeboot image to restart into"));
+    return;
+  }
+  if (!EspNowOtaSafebootKnown()) {
+    ResponseCmndChar_P(PSTR("the safeboot image is not one known to take an image over ESP-NOW"));
     return;
   }
   nvs_handle_t handle;
@@ -529,8 +541,46 @@ static void EspNowOtaSafebootReadBack(const esp_partition_t *part, uint32_t size
   br_sha256_out(&ctx, digest);
 }
 
+// The signed record of the safeboot image an install checked, kept: what tells EspNowOtaArm the partition holds one that takes
+// an image over ESP-NOW
+static void EspNowOtaSafebootKeep(const uint8_t record[ESPNOW_OTA_SIGNED_LEN], const uint8_t signature[64]) {
+  nvs_handle_t handle;
+  if (ESP_OK != nvs_open(ESPNOW_OTA_SAFEBOOT_NVS, NVS_READWRITE, &handle)) { return; }
+  uint8_t kept[ESPNOW_OTA_SIGNED_LEN + 64];
+  memcpy(kept, record, ESPNOW_OTA_SIGNED_LEN);
+  memcpy(kept + ESPNOW_OTA_SIGNED_LEN, signature, 64);
+  nvs_set_blob(handle, "record", kept, sizeof(kept));
+  nvs_commit(handle);
+  nvs_close(handle);
+}
+
+// Whether the safeboot partition's first `size` bytes hash to `sha`
+static bool EspNowOtaSafebootHolds(const esp_partition_t *factory, uint32_t size, const uint8_t sha[32]) {
+  if (!size || (size > factory->size)) { return false; }
+  uint8_t digest[32];
+  EspNowOtaSafebootReadBack(factory, size, digest);
+  return !memcmp(digest, sha, 32);
+}
+
+// Whether the safeboot partition holds an image known to take one over ESP-NOW: the one whose signed record an install kept
+static bool EspNowOtaSafebootKnown(void) {
+  const esp_partition_t *factory = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, nullptr);
+  if (!factory) { return false; }
+  nvs_handle_t handle;
+  if (ESP_OK == nvs_open(ESPNOW_OTA_SAFEBOOT_NVS, NVS_READONLY, &handle)) {
+    uint8_t kept[ESPNOW_OTA_SIGNED_LEN + 64];
+    size_t len = sizeof(kept);
+    bool got = (ESP_OK == nvs_get_blob(handle, "record", kept, &len)) && (sizeof(kept) == len);
+    nvs_close(handle);
+    if (got && EspNowOtaRecordSigned(kept, kept + ESPNOW_OTA_SIGNED_LEN) && EspNowOtaSafebootHolds(factory, EspNowOtaGet32(kept), kept + 7)) {
+      return true;
+    }
+  }
+  return false;
+}
+
 // The safeboot image at url, signed, in the safeboot partition: nullptr when the partition holds it, written now (`written`) or
-// already, and why not otherwise. `record` gets the image's signed record
+// already, and why not otherwise. `record` gets the image's signed record, which is kept (EspNowOtaSafebootKeep)
 static const char *EspNowOtaSafebootInstall(const char *url, bool *written, uint8_t record[ESPNOW_OTA_SIGNED_LEN]) {
   *written = false;
   const esp_partition_t *factory = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, nullptr);
@@ -565,7 +615,10 @@ static const char *EspNowOtaSafebootInstall(const char *url, bool *written, uint
   // the partition holds it already: nothing is written
   uint8_t digest[32];
   EspNowOtaSafebootReadBack(factory, size, digest);
-  if (!memcmp(digest, sha, 32)) { return nullptr; }
+  if (!memcmp(digest, sha, 32)) {
+    EspNowOtaSafebootKeep(record, signature);
+    return nullptr;
+  }
   // what the server has is the image signed, before anything is erased
   if ((EspNowOtaSafebootPass(url, nullptr, digest) != size) || memcmp(digest, sha, 32)) {
     return PSTR("the image could not be fetched whole, or is not the one signed");
@@ -595,6 +648,7 @@ static const char *EspNowOtaSafebootInstall(const char *url, bool *written, uint
   char hex[17];
   ToHex_P(sha, 8, hex, sizeof(hex));
   AddLog(LOG_LEVEL_INFO, PSTR("EOS: Safeboot image of %u bytes written and checked, SHA-256 %s..."), size, hex);
+  EspNowOtaSafebootKeep(record, signature);
   *written = true;
   return nullptr;
 }
