@@ -35,9 +35,10 @@
  *   EspNowOtaArm                          restarts this device into its safeboot image, to take an image over ESP-NOW: the NVS key
  *                                         "armed" tells the receiver to keep the radio on the mesh's channel at once. Only when the
  *                                         safeboot partition holds an image known to take one over ESP-NOW: the one whose signed
- *                                         record EspNowOtaSafeboot or EspNowOtaUpgrade kept when they checked it, read back whole.
- *                                         Any other safeboot image (Tasmota's own has no receiver) would leave a device without WiFi
- *                                         in it, out of reach
+ *                                         record EspNowOtaSafeboot or EspNowOtaUpgrade kept when they checked it, or the one the build
+ *                                         pins (ESPNOW_OTA_SAFEBOOT_SIZE and ESPNOW_OTA_SAFEBOOT_SHA256, the factory image's), read
+ *                                         back whole. Any other safeboot image (Tasmota's own has no receiver) would leave a device
+ *                                         without WiFi in it, out of reach
  *   EspNowOtaNodes                        the neighbours heard in their safeboot image
  *   EspNowOtaSend <node> <url> [<name>]   sends neighbour <node>, heard in its safeboot image, the image at <url>; <name> is what
  *                                         its display says the image is from, this device's name when not given
@@ -563,7 +564,8 @@ static bool EspNowOtaSafebootHolds(const esp_partition_t *factory, uint32_t size
   return !memcmp(digest, sha, 32);
 }
 
-// Whether the safeboot partition holds an image known to take one over ESP-NOW: the one whose signed record an install kept
+// Whether the safeboot partition holds an image known to take one over ESP-NOW: the one whose signed record an install kept,
+// or the one the build pins, which a device flashed with the factory image holds without any record
 static bool EspNowOtaSafebootKnown(void) {
   const esp_partition_t *factory = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, nullptr);
   if (!factory) { return false; }
@@ -577,6 +579,13 @@ static bool EspNowOtaSafebootKnown(void) {
       return true;
     }
   }
+#if defined(ESPNOW_OTA_SAFEBOOT_SIZE) && defined(ESPNOW_OTA_SAFEBOOT_SHA256)
+  uint8_t pinned[32];
+  if ((HexToBytes(ESPNOW_OTA_SAFEBOOT_SHA256, pinned, sizeof(pinned)) == sizeof(pinned)) &&
+      EspNowOtaSafebootHolds(factory, ESPNOW_OTA_SAFEBOOT_SIZE, pinned)) {
+    return true;
+  }
+#endif
   return false;
 }
 
