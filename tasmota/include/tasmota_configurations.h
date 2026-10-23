@@ -1077,7 +1077,9 @@
       #endif
     #endif // ESP8266
     #define USE_SPI
-    #define USE_SDCARD
+    #ifndef NO_USE_SDCARD                        // Define NO_USE_SDCARD in user_config_override.h for a device without a card slot
+      #define USE_SDCARD
+    #endif  // NO_USE_SDCARD
     #define USE_PING
   #endif // FIRMWARE_MINIMAL
 
