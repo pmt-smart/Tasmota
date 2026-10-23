@@ -88,7 +88,9 @@
 #include <SD_MMC.h>
 #endif  // SOC_SDMMC_HOST_SUPPORTED
 #endif  // USE_SDCARD
+#ifndef NO_USE_FFAT
 #include "FFat.h"
+#endif  // NO_USE_FFAT
 #include "FS.h"
 #endif  // ESP32
 #endif  // USE_UFILESYS

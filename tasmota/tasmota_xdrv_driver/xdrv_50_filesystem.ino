@@ -132,6 +132,11 @@ void UfsInitOnce(void) {
   // try lfs first
   ffsp = &LittleFS;
  if (!LittleFS.begin(true, "") && !LittleFS.begin(true, "", 5, "fs_1")) {         // force empty mount point to make it the fallback FS
+#ifdef NO_USE_FFAT
+    // no FAT fallback: a partition table without a FAT partition never mounts one
+    ffsp = nullptr;
+    return;
+#else
     // ffat is second
     ffsp = &FFat;
    if (!FFat.begin(true, "")) {
@@ -143,6 +148,7 @@ void UfsInitOnce(void) {
     ufsp = ffsp;
     dfsp = ffsp;
     return;
+#endif  // NO_USE_FFAT
   }
 #endif // ESP32
   ffs_type = UFS_TLFS;
@@ -345,13 +351,13 @@ uint32_t UfsInfo(uint32_t sel, uint32_t type) {
       break;
 
     case UFS_TFAT:
-#ifdef ESP32
+#if defined(ESP32) && !defined(NO_USE_FFAT)
       if (sel == 0) {
         result = FFat.totalBytes();
       } else {
         result = FFat.freeBytes();
       }
-#endif  // ESP32
+#endif  // ESP32 && !NO_USE_FFAT
       break;
 
   }
