@@ -1,7 +1,7 @@
 /*
   xdrv_97_button_decouple.ino - Relay buttons with a decoupled tap and a guarded hold
 
-  Copyright (C) 2026  Casa Inteligente
+  Copyright (C) 2026  HouseWeave
 
   This program is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by

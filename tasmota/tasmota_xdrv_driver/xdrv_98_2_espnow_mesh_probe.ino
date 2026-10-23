@@ -1,7 +1,7 @@
 /*
   xdrv_98_2_espnow_mesh_probe.ino - ESP-NOW off-channel probe: frames sent and heard on a channel other than the station's
 
-  Copyright (C) 2026  Casa Inteligente
+  Copyright (C) 2026  HouseWeave
 
   This program is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by

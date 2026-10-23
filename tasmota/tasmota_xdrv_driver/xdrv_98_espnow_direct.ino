@@ -1,7 +1,7 @@
 /*
   xdrv_98_espnow_direct.ino - ESP-NOW peer-to-peer transport
 
-  Copyright (C) 2026  Casa Inteligente
+  Copyright (C) 2026  HouseWeave
 
   This program is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by

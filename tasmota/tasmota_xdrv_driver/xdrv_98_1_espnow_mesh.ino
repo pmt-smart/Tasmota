@@ -1,7 +1,7 @@
 /*
   xdrv_98_1_espnow_mesh.ino - ESP-NOW mesh: the radio task and the commands around the mesh core
 
-  Copyright (C) 2026  Casa Inteligente
+  Copyright (C) 2026  HouseWeave
 
   This program is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
@@ -2371,8 +2371,9 @@ void CmndEspNowMeshClock(void) {
 //                                               says what lies behind
 //   espnow_mesh_pair_key(pub)                -> the 32 bytes this node shares with a service of the network that is no node of the mesh (a server the
 //                                               network pairs with), whose X25519 public key is pub (32 bytes): HKDF-SHA256 of the X25519 of the two
-//                                               identities, salt "casa-server", info "http", which the service derives the same from its own secret and this
-//                                               node's public key. False with no identity, or a key of small order. The node's secret does not leave the driver
+//                                               identities, salt "houseweave-server", info "http", which the service derives the same from its own secret and
+//                                               this node's public key. False with no identity, or a key of small order. The node's secret does not leave the
+//                                               driver
 //   espnow_mesh_group_seal(label, data)      -> [version, sealed]: data (bytes, at most 8 KB) that only the members of the network can read back, as a
 //                                               node's own settings kept by a service of the network: AES-128-CCM under the key HKDF-SHA256 gives for the
 //                                               network's group key (salt "mesh group data", info label), with a random nonce of 12 bytes and the label as
@@ -2427,7 +2428,7 @@ int EspNowMeshBerryPairKey(struct bvm *vm) {
     const uint8_t* pub = (const uint8_t*)be_tobytes(vm, 1, &len);
     uint8_t shared[32];
     uint8_t key[32];
-    static const char salt[] = "casa-server";
+    static const char salt[] = "houseweave-server";
     static const char info[] = "http";
     if ((32 == len) && EspNowMeshSettings.has_secret && EspNowMesh::Crypto::X25519(shared, EspNowMeshSettings.secret, pub)) {
       EspNowMesh::Crypto::Hkdf((const uint8_t*)salt, sizeof(salt) - 1, shared, sizeof(shared), (const uint8_t*)info, sizeof(info) - 1, key, sizeof(key));

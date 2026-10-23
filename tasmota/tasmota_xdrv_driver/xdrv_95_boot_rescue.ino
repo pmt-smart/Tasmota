@@ -1,7 +1,7 @@
 /*
   xdrv_95_boot_rescue.ino - open the WiFi Manager after a few short boots in a row
 
-  Copyright (C) 2026  Casa Inteligente
+  Copyright (C) 2026  HouseWeave
 
   This program is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by

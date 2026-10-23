@@ -1,7 +1,7 @@
 /*
   xdrv_96_wifi_station.ino - scan, join and forget a WiFi network without a restart
 
-  Copyright (C) 2026  Casa Inteligente
+  Copyright (C) 2026  HouseWeave
 
   This program is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by

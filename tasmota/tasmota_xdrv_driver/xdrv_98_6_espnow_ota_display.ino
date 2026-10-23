@@ -1,7 +1,7 @@
 /*
   xdrv_98_6_espnow_ota_display.ino - the ESP-NOW OTA receiver's page on a Nextion display
 
-  Copyright (C) 2026  Casa Inteligente
+  Copyright (C) 2026  HouseWeave
 
   This program is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by

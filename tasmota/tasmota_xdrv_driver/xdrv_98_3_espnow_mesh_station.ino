@@ -1,7 +1,7 @@
 /*
   xdrv_98_3_espnow_mesh_station.ino - ESP-NOW mesh: a node's WiFi station keeps to the mesh's channel, and looks for its network there
 
-  Copyright (C) 2026  Casa Inteligente
+  Copyright (C) 2026  HouseWeave
 
   This program is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by

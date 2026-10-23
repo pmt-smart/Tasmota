@@ -1,7 +1,7 @@
 /*
   xdrv_98_5_espnow_ota_receiver.ino - ESP-NOW OTA receiver for the safeboot image
 
-  Copyright (C) 2026  Casa Inteligente
+  Copyright (C) 2026  HouseWeave
 
   This program is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by

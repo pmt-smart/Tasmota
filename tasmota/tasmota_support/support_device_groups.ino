@@ -53,12 +53,8 @@ struct device_group {
   uint8_t initial_status_requests_remaining;
   uint8_t multicasts_remaining;
   char group_name[TOPSZ];
-  // Era 128 bytes — achado um overflow real aqui (memcpy de item string sem
-  // checagem de limite, ver o bounds-check adicionado no loop de
-  // ProcessDeviceGroupMessage/item-writing). Dobrado pra 256 como margem
-  // de segurança adicional, e a checagem de limite agora barra qualquer
-  // mensagem que não caiba, em vez de escrever fora do array (docs/00-diario-de-bordo.md
-  // no repo CasaInteligente tem o diagnóstico completo).
+  // 256 bytes, and _SendDeviceGroupMessage checks each item's size before it writes it: an
+  // item that does not fit is dropped instead of being written past the end of the buffer.
   uint8_t message[256];
   struct device_group_member * device_group_members;
 #ifdef USE_DEVICE_GROUPS_SEND
@@ -472,14 +468,12 @@ write_log:
 
   // If this is a message being sent, send it.
   else {
-    // Se o WiFi ainda não terminou de conectar (comum logo no boot, no
-    // pequeno intervalo entre o anúncio inicial do Device Groups e a
-    // associação com o AP completar), nem tenta mandar — só loga em
-    // DEBUG, sem gastar as 5 tentativas nem assustar ninguém com um
-    // "DGR: Error sending message" em nível ERROR pra algo esperado e
-    // que se resolve sozinho no próximo ciclo de anúncio periódico.
+    // A Wi-Fi still connecting (common right after boot, between the first announcement and the
+    // association with the access point) is not sent to: the message waits for the next periodic
+    // announcement, logged at DEBUG, instead of spending the five attempts and logging an error
+    // for something that resolves itself.
     if (Wifi.status != WL_CONNECTED) {
-      AddLog(LOG_LEVEL_DEBUG, PSTR("DGR: WiFi ainda não conectado, adiando envio"));
+      AddLog(LOG_LEVEL_DEBUG, PSTR("DGR: Wi-Fi not connected yet, message deferred"));
       goto cleanup;
     }
     int attempt;
@@ -784,17 +778,10 @@ bool _SendDeviceGroupMessage(int32_t device, DevGroupMessageType message_type, .
         }
       }
       if (shared) {
-        // BUGFIX: calcula o tamanho necessário ANTES de escrever qualquer
-        // byte, e recusa o item (com log de erro) se não couber no buffer
-        // fixo `device_group->message[]` — o código original escrevia
-        // (inclusive o memcpy do valor de itens string, ex: DGR_ITEM_COMMAND)
-        // sem NENHUMA checagem de limite, causando overflow de heap real e
-        // reproduzível (crash LoadProhibited, sempre no mesmo ponto —
-        // rastreado via addr2line, ver docs/00-diario-de-bordo.md no repo
-        // CasaInteligente). Isso não é hipotético: um `DevGroupSend` nosso
-        // com grupo+comando um pouco mais longos (~135 bytes) já estourava
-        // o limite de 128 bytes de antes.
-        int dgr_item_needed = (item_ptr->flags ? 2 : 0) + 1;  // flags(opcional) + byte do item
+        // The size the item needs is worked out before any byte of it is written, and an item
+        // that does not fit in device_group->message[] is dropped with an error log: no item, a
+        // string's value included (DGR_ITEM_COMMAND), is written past the end of the buffer.
+        int dgr_item_needed = (item_ptr->flags ? 2 : 0) + 1;  // the flags (optional) and the item's byte
         if (item <= DGR_ITEM_MAX_32BIT) {
           dgr_item_needed += 1;
           if (item > DGR_ITEM_MAX_8BIT) {
@@ -813,13 +800,13 @@ bool _SendDeviceGroupMessage(int32_t device, DevGroupMessageType message_type, .
                 break;
             }
           }
-          dgr_item_needed += 1 + value;  // byte de tamanho + dado
+          dgr_item_needed += 1 + value;  // the length byte and the value
         }
 
         int dgr_bytes_used = (int)(message_ptr - device_group->message);
         int dgr_bytes_available = (int)sizeof(device_group->message) - dgr_bytes_used;
         if (dgr_item_needed > dgr_bytes_available) {
-          AddLog(LOG_LEVEL_ERROR, PSTR("DGR: mensagem do grupo '%s' grande demais (item=%u precisa de %d bytes, só %d disponíveis) - item descartado"),
+          AddLog(LOG_LEVEL_ERROR, PSTR("DGR: message of group '%s' too large (item=%u needs %d bytes, %d available) - item dropped"),
                  device_group->group_name, item, dgr_item_needed, dgr_bytes_available);
         }
         else {
@@ -1026,10 +1013,8 @@ AddLog(LOG_LEVEL_DEBUG, PSTR("DGR: Checking next_check_time=%u, now=%u"), next_c
                 // If we haven't receive an ack from this member in DGR_MEMBER_TIMEOUT ms, assume
                 // they're offline and remove them from the group.
                 if ((int32_t)(now - device_group->member_timeout_time) >= 0) {
-                  // BUGFIX: logar (e capturar o IP) ANTES de free() — a ordem original lia
-                  // device_group_member->ip_address DEPOIS do free(), um use-after-free real
-                  // (achado rastreando o crash LoadProhibited via addr2line, ver
-                  // docs/00-diario-de-bordo.md no repo CasaInteligente).
+                  // the member's address is taken before free(), and the log uses the copy: the member is
+                  // not read once it is freed
                   IPAddress removed_ip = device_group_member->ip_address;
                   *flink = device_group_member->flink;
                   free(device_group_member);

@@ -1,7 +1,7 @@
 /*
   xdrv_98_7_espnow_ota_sender.ino - ESP-NOW OTA in the app: the neighbours in their safeboot image, and an image sent to one
 
-  Copyright (C) 2026  Casa Inteligente
+  Copyright (C) 2026  HouseWeave
 
   This program is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by

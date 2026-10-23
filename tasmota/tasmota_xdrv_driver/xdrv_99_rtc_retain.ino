@@ -1,7 +1,7 @@
 /*
   xdrv_99_rtc_retain.ino - keep the clock's time across a restart that is not a power cycle
 
-  Copyright (C) 2026  Casa Inteligente
+  Copyright (C) 2026  HouseWeave
 
   This program is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by

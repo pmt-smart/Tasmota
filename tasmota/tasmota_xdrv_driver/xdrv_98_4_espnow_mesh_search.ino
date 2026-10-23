@@ -1,7 +1,7 @@
 /*
   xdrv_98_4_espnow_mesh_search.ino - ESP-NOW mesh: a node that hears none of its nodes looks for them on the other channels
 
-  Copyright (C) 2026  Casa Inteligente
+  Copyright (C) 2026  HouseWeave
 
   This program is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by

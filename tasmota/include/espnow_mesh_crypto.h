@@ -1,7 +1,7 @@
 /*
   espnow_mesh_crypto.h - ESP-NOW mesh: the keys and the cipher the mesh core asks for, on BearSSL
 
-  Copyright (C) 2026  Casa Inteligente
+  Copyright (C) 2026  HouseWeave
 
   This program is free software: you can redistribute it and/or modify
   it under the terms of the GNU General Public License as published by
