@@ -88,6 +88,7 @@
 #define ESPNOW_OTA_FETCH_TRIES         5          // the blocks not fetched this many times in a row end the send
 #define ESPNOW_OTA_SAFEBOOT_CHUNK      4096
 #define ESPNOW_OTA_SAFEBOOT_ERASE      0x10000    // the safeboot partition erased a 64 KB block at a time
+#define ESPNOW_OTA_APP_DESC_MAGIC      0xABCD5432 // an app image's description, at the start of its first segment: offset 32 of the image
 #define ESPNOW_OTA_SAFEBOOT_NVS        "espnowota_sb"  // the signed record of the safeboot image an install checked; apart from
                                                        // "espnowota", which the app clears at every start
 
@@ -655,10 +656,13 @@ static const char *EspNowOtaSafebootBegin(const uint8_t *record, const uint8_t *
   return nullptr;
 }
 
-// The image's next `len` bytes, at `offset`: false when they are not the next ones, or go past its end, or the flash refuses them
+// The image's next `len` bytes, at `offset`: false when they are not the next ones, or go past its end, or the flash refuses them. The
+// first ones are an app image's, or are refused before anything is erased: the header's 0xE9, and the description's magic word at offset
+// 32. Bytes spoilt on their way (a carrier that ends a binary file at its first zero byte) leave the image the partition holds as it is
 static bool EspNowOtaSafebootWrite(uint32_t offset, const uint8_t *data, uint32_t len) {
   EspNowOtaSafebootWriter_t &w = EspNowOtaSafebootWriter;
   if (!w.part || (offset != w.at) || (len > w.size - w.at)) { return false; }
+  if (!w.at && ((len < 36) || (0xE9 != data[0]) || (ESPNOW_OTA_APP_DESC_MAGIC != EspNowOtaGet32(data + 32)))) { return false; }
   // the partition erased a block at a time as the write reaches it: the first block ends the image it held
   uint32_t end = w.at + len;
   uint32_t erase = (w.size + SPI_FLASH_SEC_SIZE - 1) & ~(SPI_FLASH_SEC_SIZE - 1);
