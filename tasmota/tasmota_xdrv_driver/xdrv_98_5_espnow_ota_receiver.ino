@@ -53,7 +53,8 @@
  *
  * This image that restarts ESPNOW_OTA_BOOT_TRIES times in a row, each before ESPNOW_OTA_BOOT_OK_S, gives the device back to its
  * app when the app partition holds a whole image (the boot loader checks it): Tasmota counts no boot loop in a safeboot image, and
- * a fault here must not leave the device to a serial cable. The count lives in RTC memory, which a power cut clears.
+ * a fault here must not leave the device to a serial cable. The count lives in RTC memory, which a power cut clears. An image installed
+ * ends the count: an install over HTTP takes less than ESPNOW_OTA_BOOT_OK_S, and quick installs in a row are not a fault.
  *
  * An image the application asked for (the NVS key "armed", or a release's "url") that nobody offers ESPNOW_OTA_WAIT_S after
  * this image started gives the device back to its app the same way: a neighbour that was to send it and did not must not leave
@@ -302,6 +303,10 @@ static bool EspNowOtaWriteBlock(void) {
   return ok;
 }
 
+// The starts of this image that did not last, kept across a restart and lost with the power
+RTC_NOINIT_ATTR static uint32_t EspNowOtaBootMagic;
+RTC_NOINIT_ATTR static uint32_t EspNowOtaBoots;
+
 // Every block is written: the image is read back and checked before the device is set to boot it
 static void EspNowOtaCheck(void) {
   EspNowOta.state = kOtaChecking;
@@ -328,6 +333,7 @@ static void EspNowOtaCheck(void) {
   }
   if (ESP_OK != esp_ota_set_boot_partition(EspNowOta.part)) { return EspNowOtaFail("image refused by the boot loader"); }
   EspNowOta.state = kOtaDone;
+  EspNowOtaBoots = 0;                        // a start that installed its image is not one that ended early
   nvs_handle_t handle;
   if (ESP_OK == nvs_open(ESPNOW_OTA_NVS, NVS_READWRITE, &handle)) {
     nvs_erase_all(handle);
@@ -580,10 +586,6 @@ static void EspNowOtaLoop(void) {
   EspNowOtaRx_t rx;
   while (xQueueReceive(EspNowOta.rx, &rx, 0)) { EspNowOtaHandle(rx); }
 }
-
-// The starts of this image that did not last, kept across a restart and lost with the power
-RTC_NOINIT_ATTR static uint32_t EspNowOtaBootMagic;
-RTC_NOINIT_ATTR static uint32_t EspNowOtaBoots;
 
 static void EspNowOtaBootGuard(void) {
   if (ESPNOW_OTA_BOOT_MAGIC != EspNowOtaBootMagic) {
