@@ -38,7 +38,10 @@
  *                                         record EspNowOtaSafeboot or EspNowOtaUpgrade kept when they checked it, or the one the build
  *                                         pins (ESPNOW_OTA_SAFEBOOT_SIZE and ESPNOW_OTA_SAFEBOOT_SHA256, the factory image's), read
  *                                         back whole. Any other safeboot image (Tasmota's own has no receiver) would leave a device
- *                                         without WiFi in it, out of reach
+ *                                         without WiFi in it, out of reach. With the pinned image's signed record and signature
+ *                                         (ESPNOW_OTA_SAFEBOOT_RECORD and ESPNOW_OTA_SAFEBOOT_SIGNATURE, in hex), a device found to
+ *                                         hold that image keeps its record: an app that pins another image still knows this one, on a
+ *                                         device that never takes a safeboot image over HTTP
  *   EspNowOtaNodes                        the neighbours heard in their safeboot image
  *   EspNowOtaSend <node> <url> [<name>]   sends neighbour <node>, heard in its safeboot image, the image at <url>; <name> is what
  *                                         its display says the image is from, this device's name when not given
@@ -565,7 +568,9 @@ static bool EspNowOtaSafebootHolds(const esp_partition_t *factory, uint32_t size
 }
 
 // Whether the safeboot partition holds an image known to take one over ESP-NOW: the one whose signed record an install kept,
-// or the one the build pins, which a device flashed with the factory image holds without any record
+// or the one the build pins, which a device flashed with the factory image holds without any record. The pinned one has its
+// signed record kept when the build carries it: without it, the first app that pins another image would refuse this one, and a
+// device out of WiFi's reach would take no image again
 static bool EspNowOtaSafebootKnown(void) {
   const esp_partition_t *factory = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, nullptr);
   if (!factory) { return false; }
@@ -583,6 +588,15 @@ static bool EspNowOtaSafebootKnown(void) {
   uint8_t pinned[32];
   if ((HexToBytes(ESPNOW_OTA_SAFEBOOT_SHA256, pinned, sizeof(pinned)) == sizeof(pinned)) &&
       EspNowOtaSafebootHolds(factory, ESPNOW_OTA_SAFEBOOT_SIZE, pinned)) {
+#if defined(ESPNOW_OTA_SAFEBOOT_RECORD) && defined(ESPNOW_OTA_SAFEBOOT_SIGNATURE)
+    uint8_t record[ESPNOW_OTA_SIGNED_LEN];
+    uint8_t signature[64];
+    if ((HexToBytes(ESPNOW_OTA_SAFEBOOT_RECORD, record, sizeof(record)) == sizeof(record)) &&
+        (HexToBytes(ESPNOW_OTA_SAFEBOOT_SIGNATURE, signature, sizeof(signature)) == sizeof(signature)) &&
+        (EspNowOtaGet32(record) == ESPNOW_OTA_SAFEBOOT_SIZE) && !memcmp(record + 7, pinned, 32) && EspNowOtaRecordSigned(record, signature)) {
+      EspNowOtaSafebootKeep(record, signature);
+    }
+#endif
     return true;
   }
 #endif
