@@ -49,10 +49,11 @@
  *   EspNowOtaStop                         stops it
  *   EspNowOtaSafeboot <url>               writes the safeboot image at <url> (a .bin) into this device's safeboot partition: the image
  *                                         must be signed by one of the build's keys, in <url>.sig.json ("record" and "signature" in hex,
- *                                         a record of 0 blocks); it is fetched once to check it before anything is erased, then written,
- *                                         read back and checked by the boot loader. The app keeps running whatever happens; a write that
- *                                         went wrong says so, and the command is run again; a partition that holds the image
- *                                         signed already is kept as it is
+ *                                         a record of 0 blocks); it is fetched once to check it before anything is erased, then written
+ *                                         with its first sector last, read back and checked by the boot loader. The app keeps running
+ *                                         whatever happens; a write that went wrong says so, leaves the partition with no image the boot
+ *                                         loader would start, and the command is run again; a partition that holds the image signed
+ *                                         already is kept as it is
  *   EspNowOtaUpgrade <release> <safeboot> takes the release at <release> (the folder the release tool packs, signed by one of
  *                                         the build's keys) in this device's safeboot image, over HTTP: the safeboot image at
  *                                         <safeboot> is written first, as EspNowOtaSafeboot does, unless the partition holds it,
@@ -67,6 +68,9 @@
  *                                                          Fetch (the image could not be fetched, 5 times in a row) or Stopped
  *
  * The app that starts clears what the safeboot image kept of an image under way: a device that runs its app takes none.
+ *
+ * Berry writes a safeboot image that it fetches another way, a piece at a time (espnow_ota_safeboot_begin, _write, _finish and
+ * _unfinished, below): with the same checks, and the same first sector written last.
 \*********************************************************************************************/
 
 #define XDRV_106                       106
@@ -495,40 +499,6 @@ static void CmndEspNowOtaStop(void) {
   ResponseCmndDone();
 }
 
-// One pass over the image at the url: its SHA-256 and, with a partition, the image written to it as it comes. The bytes it had
-static uint32_t EspNowOtaSafebootPass(const char *url, const esp_partition_t *part, uint8_t digest[32]) {
-  HTTPClientLight http;
-  if (!http.begin(url)) { return 0; }
-  http.setConnectTimeout(ESPNOW_OTA_HTTP_MS);
-  http.setTimeout(ESPNOW_OTA_HTTP_MS);
-  int size = (200 == http.GET()) ? http.getSize() : -1;
-  uint8_t *buf = (size > 0) ? (uint8_t *)malloc(ESPNOW_OTA_SAFEBOOT_CHUNK) : nullptr;
-  if (nullptr == buf) {
-    http.end();
-    return 0;
-  }
-  br_sha256_context ctx;
-  br_sha256_init(&ctx);
-  uint32_t got = 0;
-  bool ok = true;
-  while (ok && (got < (uint32_t)size)) {
-    uint32_t want = size - got;
-    if (want > ESPNOW_OTA_SAFEBOOT_CHUNK) { want = ESPNOW_OTA_SAFEBOOT_CHUNK; }
-    if (!EspNowOtaHttpRead(http.getStreamPtr(), buf, want)) {
-      ok = false;
-      break;
-    }
-    br_sha256_update(&ctx, buf, want);
-    if (part) { ok = (ESP_OK == esp_partition_write(part, got, buf, want)); }
-    got += want;
-    delay(1);                                // the loop's turn, for the WiFi and the watchdog
-  }
-  free(buf);
-  http.end();
-  br_sha256_out(&ctx, digest);
-  return ok ? got : 0;
-}
-
 // The partition's first bytes, read back: their SHA-256
 static void EspNowOtaSafebootReadBack(const esp_partition_t *part, uint32_t size, uint8_t digest[32]) {
   br_sha256_context ctx;
@@ -547,16 +517,19 @@ static void EspNowOtaSafebootReadBack(const esp_partition_t *part, uint32_t size
 
 // The signed record of the safeboot image an install checked (ESPNOW_OTA_SIGNED_LEN bytes, and its 64-byte signature), kept: what
 // tells EspNowOtaArm the partition holds one that takes an image over ESP-NOW. Plain pointers: the prototypes the build writes for
-// the .ino files come before the header that defines the length
-static void EspNowOtaSafebootKeep(const uint8_t *record, const uint8_t *signature) {
+// the .ino files come before the header that defines the length. False, and said, when NVS did not take it
+static bool EspNowOtaSafebootKeep(const uint8_t *record, const uint8_t *signature) {
   nvs_handle_t handle;
-  if (ESP_OK != nvs_open(ESPNOW_OTA_SAFEBOOT_NVS, NVS_READWRITE, &handle)) { return; }
-  uint8_t kept[ESPNOW_OTA_SIGNED_LEN + 64];
-  memcpy(kept, record, ESPNOW_OTA_SIGNED_LEN);
-  memcpy(kept + ESPNOW_OTA_SIGNED_LEN, signature, 64);
-  nvs_set_blob(handle, "record", kept, sizeof(kept));
-  nvs_commit(handle);
-  nvs_close(handle);
+  bool ok = (ESP_OK == nvs_open(ESPNOW_OTA_SAFEBOOT_NVS, NVS_READWRITE, &handle));
+  if (ok) {
+    uint8_t kept[ESPNOW_OTA_SIGNED_LEN + 64];
+    memcpy(kept, record, ESPNOW_OTA_SIGNED_LEN);
+    memcpy(kept + ESPNOW_OTA_SIGNED_LEN, signature, 64);
+    ok = (ESP_OK == nvs_set_blob(handle, "record", kept, sizeof(kept))) && (ESP_OK == nvs_commit(handle));
+    nvs_close(handle);
+  }
+  if (!ok) { AddLog(LOG_LEVEL_ERROR, PSTR("EOS: The safeboot image's record could not be kept: EspNowOtaArm will not know the image by it")); }
+  return ok;
 }
 
 // Whether the safeboot partition's first `size` bytes hash to `sha`
@@ -603,6 +576,202 @@ static bool EspNowOtaSafebootKnown(void) {
   return false;
 }
 
+/*********************************************************************************************\
+ * The safeboot image written a piece at a time, by EspNowOtaSafeboot over HTTP or by a script that fetches the image another way
+ * (espnow_ota_safeboot_begin, _write and _finish in Berry). The partition is erased a block at a time as the write reaches it, and the
+ * image's first sector waits in RAM until the whole image checks against its signed record, and is written last. The boot loader does
+ * not check an image's hash when it boots: an image whose bytes went wrong would start, and fail, at every restart into the safeboot
+ * image, while a partition with no first sector holds no image, and the boot loader starts the app instead. From the first erase until
+ * the image checks, the NVS key "writing" says the partition holds no safeboot image.
+\*********************************************************************************************/
+
+typedef struct {
+  const esp_partition_t *part = nullptr;     // while a write is under way
+  uint8_t *first = nullptr;                  // the image's first sector, written last
+  uint8_t record[ESPNOW_OTA_SIGNED_LEN];
+  uint8_t signature[64];
+  uint32_t size = 0;
+  uint32_t at = 0;                           // the bytes given so far
+  uint32_t erased = 0;                       // the partition erased up to here
+} EspNowOtaSafebootWriter_t;
+static EspNowOtaSafebootWriter_t EspNowOtaSafebootWriter;
+
+// A write that erased the partition and has not ended with the image checked, said in NVS, or no longer
+static void EspNowOtaSafebootWriting(bool writing) {
+  nvs_handle_t handle;
+  if (ESP_OK != nvs_open(ESPNOW_OTA_SAFEBOOT_NVS, NVS_READWRITE, &handle)) { return; }
+  if (writing) {
+    nvs_set_u8(handle, "writing", 1);
+  } else {
+    nvs_erase_key(handle, "writing");
+  }
+  nvs_commit(handle);
+  nvs_close(handle);
+}
+
+// Whether a write erased the partition and did not end with the image checked, before this start or since: the partition holds no
+// safeboot image
+static bool EspNowOtaSafebootUnfinished(void) {
+  nvs_handle_t handle;
+  if (ESP_OK != nvs_open(ESPNOW_OTA_SAFEBOOT_NVS, NVS_READONLY, &handle)) { return false; }
+  uint8_t writing = 0;
+  bool got = (ESP_OK == nvs_get_u8(handle, "writing", &writing));
+  nvs_close(handle);
+  return got && writing;
+}
+
+static void EspNowOtaSafebootStop(void) {
+  free(EspNowOtaSafebootWriter.first);
+  EspNowOtaSafebootWriter.first = nullptr;
+  EspNowOtaSafebootWriter.part = nullptr;
+}
+
+// The write of the safeboot image whose signed record (ESPNOW_OTA_SIGNED_LEN bytes) and signature (64 bytes) these are, in place of any
+// write under way: nullptr when it begins, or when the partition holds that image already (`kept`, its record kept), and why not
+// otherwise. Nothing is erased until the first bytes are given
+static const char *EspNowOtaSafebootBegin(const uint8_t *record, const uint8_t *signature, bool *kept) {
+  *kept = false;
+  EspNowOtaSafebootStop();
+  const esp_partition_t *factory = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_FACTORY, nullptr);
+  if (!factory || EspRunningFactoryPartition()) { return PSTR("no safeboot partition to write"); }
+  if (!EspNowOtaRecordSigned(record, signature)) { return PSTR("the image is not signed by a key of this build"); }
+  uint32_t size = EspNowOtaGet32(record);
+  if (EspNowOtaGet16(record + 4) || record[6] || !size || (size > factory->size)) { return PSTR("the image does not fit the safeboot partition"); }
+  if (EspNowOtaSafebootHolds(factory, size, record + 7)) {
+    EspNowOtaSafebootKeep(record, signature);
+    *kept = true;
+    return nullptr;
+  }
+  uint8_t *first = (uint8_t *)malloc(SPI_FLASH_SEC_SIZE);
+  if (nullptr == first) { return PSTR("not enough memory"); }
+  EspNowOtaSafebootWriter_t &w = EspNowOtaSafebootWriter;
+  w.part = factory;
+  w.first = first;
+  memcpy(w.record, record, ESPNOW_OTA_SIGNED_LEN);
+  memcpy(w.signature, signature, 64);
+  w.size = size;
+  w.at = 0;
+  w.erased = 0;
+  return nullptr;
+}
+
+// The image's next `len` bytes, at `offset`: false when they are not the next ones, or go past its end, or the flash refuses them
+static bool EspNowOtaSafebootWrite(uint32_t offset, const uint8_t *data, uint32_t len) {
+  EspNowOtaSafebootWriter_t &w = EspNowOtaSafebootWriter;
+  if (!w.part || (offset != w.at) || (len > w.size - w.at)) { return false; }
+  // the partition erased a block at a time as the write reaches it: the first block ends the image it held
+  uint32_t end = w.at + len;
+  uint32_t erase = (w.size + SPI_FLASH_SEC_SIZE - 1) & ~(SPI_FLASH_SEC_SIZE - 1);
+  while (w.erased < end) {
+    if (!w.erased) {
+      EspNowOtaSafebootWriting(true);
+      AddLog(LOG_LEVEL_INFO, PSTR("EOS: Writing a safeboot image of %u bytes"), w.size);
+    }
+    uint32_t n = erase - w.erased;
+    if (n > ESPNOW_OTA_SAFEBOOT_ERASE) { n = ESPNOW_OTA_SAFEBOOT_ERASE; }
+    if (ESP_OK != esp_partition_erase_range(w.part, w.erased, n)) { return false; }
+    w.erased += n;
+    yield();                                 // a block at a time: the whole partition at once outlasts the loop's watchdog
+  }
+  // the first sector waits in RAM
+  if (w.at < SPI_FLASH_SEC_SIZE) {
+    uint32_t n = SPI_FLASH_SEC_SIZE - w.at;
+    if (n > len) { n = len; }
+    memcpy(w.first + w.at, data, n);
+    w.at += n;
+    data += n;
+    len -= n;
+  }
+  if (len && (ESP_OK != esp_partition_write(w.part, w.at, data, len))) { return false; }
+  w.at += len;
+  return true;
+}
+
+// The image given whole: checked against its signed record, its first sector written, the whole read back and checked as the boot
+// loader does, and its record kept. nullptr then, and why not otherwise, with the partition left with no first sector once the write
+// erased it: no image the boot loader would start
+static const char *EspNowOtaSafebootFinish(void) {
+  EspNowOtaSafebootWriter_t &w = EspNowOtaSafebootWriter;
+  if (!w.part) { return PSTR("no safeboot image is being written"); }
+  const char *why = nullptr;
+  uint32_t head = (w.size < SPI_FLASH_SEC_SIZE) ? w.size : SPI_FLASH_SEC_SIZE;
+  uint8_t digest[32];
+  if (w.at != w.size) { why = PSTR("the image is not whole"); }
+  if (!why) {
+    // the first sector as it waits in RAM, and the rest read back
+    br_sha256_context ctx;
+    br_sha256_init(&ctx);
+    br_sha256_update(&ctx, w.first, head);
+    uint8_t *buf = (uint8_t *)malloc(ESPNOW_OTA_SAFEBOOT_CHUNK);
+    bool ok = (nullptr != buf);
+    for (uint32_t at = head; ok && (at < w.size); at += ESPNOW_OTA_SAFEBOOT_CHUNK) {
+      uint32_t n = w.size - at;
+      if (n > ESPNOW_OTA_SAFEBOOT_CHUNK) { n = ESPNOW_OTA_SAFEBOOT_CHUNK; }
+      ok = (ESP_OK == esp_partition_read(w.part, at, buf, n));
+      br_sha256_update(&ctx, buf, n);
+      yield();
+    }
+    free(buf);
+    br_sha256_out(&ctx, digest);
+    if (!ok || memcmp(digest, w.record + 7, 32)) { why = PSTR("the image written is not the one signed"); }
+  }
+  if (!why && (ESP_OK != esp_partition_write(w.part, 0, w.first, head))) { why = PSTR("the flash refused the image"); }
+  if (!why) {
+    EspNowOtaSafebootReadBack(w.part, w.size, digest);
+    if (memcmp(digest, w.record + 7, 32)) { why = PSTR("the image read back is not the one signed"); }
+  }
+  if (!why) {
+    esp_partition_pos_t pos = { .offset = w.part->address, .size = w.part->size };
+    esp_image_metadata_t meta;
+    if (ESP_OK != esp_image_verify(ESP_IMAGE_VERIFY, &pos, &meta)) { why = PSTR("the boot loader would not take the image"); }
+  }
+  if (why) {
+    if (w.erased) { esp_partition_erase_range(w.part, 0, SPI_FLASH_SEC_SIZE); }
+  } else {
+    char hex[17];
+    ToHex_P(w.record + 7, 8, hex, sizeof(hex));
+    AddLog(LOG_LEVEL_INFO, PSTR("EOS: Safeboot image of %u bytes written and checked, SHA-256 %s..."), w.size, hex);
+    EspNowOtaSafebootKeep(w.record, w.signature);
+    EspNowOtaSafebootWriting(false);
+  }
+  EspNowOtaSafebootStop();
+  return why;
+}
+
+// One pass over the image at the url: its SHA-256 and, with `write`, the image given to the writer as it comes. The bytes it had
+static uint32_t EspNowOtaSafebootPass(const char *url, bool write, uint8_t digest[32]) {
+  HTTPClientLight http;
+  if (!http.begin(url)) { return 0; }
+  http.setConnectTimeout(ESPNOW_OTA_HTTP_MS);
+  http.setTimeout(ESPNOW_OTA_HTTP_MS);
+  int size = (200 == http.GET()) ? http.getSize() : -1;
+  uint8_t *buf = (size > 0) ? (uint8_t *)malloc(ESPNOW_OTA_SAFEBOOT_CHUNK) : nullptr;
+  if (nullptr == buf) {
+    http.end();
+    return 0;
+  }
+  br_sha256_context ctx;
+  br_sha256_init(&ctx);
+  uint32_t got = 0;
+  bool ok = true;
+  while (ok && (got < (uint32_t)size)) {
+    uint32_t want = size - got;
+    if (want > ESPNOW_OTA_SAFEBOOT_CHUNK) { want = ESPNOW_OTA_SAFEBOOT_CHUNK; }
+    if (!EspNowOtaHttpRead(http.getStreamPtr(), buf, want)) {
+      ok = false;
+      break;
+    }
+    br_sha256_update(&ctx, buf, want);
+    if (write) { ok = EspNowOtaSafebootWrite(got, buf, want); }
+    got += want;
+    delay(1);                                // the loop's turn, for the WiFi and the watchdog
+  }
+  free(buf);
+  http.end();
+  br_sha256_out(&ctx, digest);
+  return ok ? got : 0;
+}
+
 // The safeboot image at url, signed, in the safeboot partition: nullptr when the partition holds it, written now (`written`) or
 // already, and why not otherwise. `record` gets the image's signed record, which is kept (EspNowOtaSafebootKeep)
 static const char *EspNowOtaSafebootInstall(const char *url, bool *written, uint8_t record[ESPNOW_OTA_SIGNED_LEN]) {
@@ -632,47 +801,21 @@ static const char *EspNowOtaSafebootInstall(const char *url, bool *written, uint
     }
   }
   if (!ok) { return PSTR("the signature could not be fetched or read"); }
-  if (!EspNowOtaRecordSigned(record, signature)) { return PSTR("the image is not signed by a key of this build"); }
-  uint32_t size = EspNowOtaGet32(record);
-  const uint8_t *sha = record + 7;
-  if (EspNowOtaGet16(record + 4) || record[6] || !size || (size > factory->size)) { return PSTR("the image does not fit the safeboot partition"); }
-  // the partition holds it already: nothing is written
+  bool kept = false;
+  const char *why = EspNowOtaSafebootBegin(record, signature, &kept);
+  if (why || kept) { return why; }
   uint8_t digest[32];
-  EspNowOtaSafebootReadBack(factory, size, digest);
-  if (!memcmp(digest, sha, 32)) {
-    EspNowOtaSafebootKeep(record, signature);
-    return nullptr;
-  }
   // what the server has is the image signed, before anything is erased
-  if ((EspNowOtaSafebootPass(url, nullptr, digest) != size) || memcmp(digest, sha, 32)) {
+  if ((EspNowOtaSafebootPass(url, false, digest) != EspNowOtaGet32(record)) || memcmp(digest, record + 7, 32)) {
+    EspNowOtaSafebootStop();
     return PSTR("the image could not be fetched whole, or is not the one signed");
   }
-  AddLog(LOG_LEVEL_INFO, PSTR("EOS: Writing a safeboot image of %u bytes"), size);
-  uint32_t erase = (size + SPI_FLASH_SEC_SIZE - 1) & ~(SPI_FLASH_SEC_SIZE - 1);
-  for (uint32_t at = 0; ok && (at < erase); at += ESPNOW_OTA_SAFEBOOT_ERASE) {
-    uint32_t n = erase - at;
-    if (n > ESPNOW_OTA_SAFEBOOT_ERASE) { n = ESPNOW_OTA_SAFEBOOT_ERASE; }
-    ok = (ESP_OK == esp_partition_erase_range(factory, at, n));
-    yield();                                 // a block at a time: the whole partition at once outlasts the loop's watchdog
-  }
-  ok = ok && (EspNowOtaSafebootPass(url, factory, digest) == size) && !memcmp(digest, sha, 32);
-  if (ok) {
-    EspNowOtaSafebootReadBack(factory, size, digest);
-    ok = !memcmp(digest, sha, 32);
-  }
-  if (ok) {
-    esp_partition_pos_t pos = { .offset = factory->address, .size = factory->size };
-    esp_image_metadata_t meta;
-    ok = (ESP_OK == esp_image_verify(ESP_IMAGE_VERIFY, &pos, &meta));
-  }
-  if (!ok) {
-    AddLog(LOG_LEVEL_ERROR, PSTR("EOS: The safeboot partition holds a broken image: run EspNowOtaSafeboot again before any update"));
+  EspNowOtaSafebootPass(url, true, digest);  // what the writer was given, it checks at its end
+  why = EspNowOtaSafebootFinish();
+  if (why) {
+    AddLog(LOG_LEVEL_ERROR, PSTR("EOS: The safeboot image was not written (%s): the partition holds none, run EspNowOtaSafeboot again before any update"), why);
     return PSTR("written wrong: run it again before any update");
   }
-  char hex[17];
-  ToHex_P(sha, 8, hex, sizeof(hex));
-  AddLog(LOG_LEVEL_INFO, PSTR("EOS: Safeboot image of %u bytes written and checked, SHA-256 %s..."), size, hex);
-  EspNowOtaSafebootKeep(record, signature);
   *written = true;
   return nullptr;
 }
@@ -784,6 +927,81 @@ static void EspNowOtaSenderInit(void) {
   }
 }
 
+#ifdef USE_BERRY
+/*********************************************************************************************\
+ * Berry's way to the writer of the safeboot image, for a script that fetches the image where this device's HTTP does not reach:
+ *
+ *   espnow_ota_safeboot_begin(record, signature) -> "Kept" when the partition holds that image already (its record kept), "Begun", or
+ *                                                   why not; record and signature are bytes, the image's signed record (39) and its
+ *                                                   signature (64), as its .sig.json says them
+ *   espnow_ota_safeboot_write(offset, data)      -> true when data (bytes) are the image's next ones, at offset, and were written
+ *   espnow_ota_safeboot_finish()                 -> "Written" when the image is whole and checks, or why not, with the partition
+ *                                                   then holding no image
+ *   espnow_ota_safeboot_unfinished()             -> true while a write that erased the partition has not ended with the image checked
+\*********************************************************************************************/
+
+int EspNowOtaBerrySafebootBegin(struct bvm *vm);
+int EspNowOtaBerrySafebootBegin(struct bvm *vm) {
+  if ((be_top(vm) >= 2) && be_isbytes(vm, 1) && be_isbytes(vm, 2)) {
+    size_t record_len = 0;
+    size_t signature_len = 0;
+    const uint8_t *record = (const uint8_t *)be_tobytes(vm, 1, &record_len);
+    const uint8_t *signature = (const uint8_t *)be_tobytes(vm, 2, &signature_len);
+    if ((ESPNOW_OTA_SIGNED_LEN == record_len) && (64 == signature_len)) {
+      bool kept = false;
+      const char *why = EspNowOtaSafebootBegin(record, signature, &kept);
+      be_pushstring(vm, why ? why : (kept ? "Kept" : "Begun"));
+      be_return(vm);
+    }
+  }
+  be_raise(vm, kTypeError, nullptr);
+}
+
+int EspNowOtaBerrySafebootWrite(struct bvm *vm);
+int EspNowOtaBerrySafebootWrite(struct bvm *vm) {
+  if ((be_top(vm) >= 2) && be_isint(vm, 1) && be_isbytes(vm, 2)) {
+    size_t len = 0;
+    const uint8_t *data = (const uint8_t *)be_tobytes(vm, 2, &len);
+    be_pushbool(vm, EspNowOtaSafebootWrite((uint32_t)be_toint(vm, 1), data, len));
+    be_return(vm);
+  }
+  be_raise(vm, kTypeError, nullptr);
+}
+
+int EspNowOtaBerrySafebootFinish(struct bvm *vm);
+int EspNowOtaBerrySafebootFinish(struct bvm *vm) {
+  const char *why = EspNowOtaSafebootFinish();
+  be_pushstring(vm, why ? why : "Written");
+  be_return(vm);
+}
+
+int EspNowOtaBerrySafebootUnfinished(struct bvm *vm);
+int EspNowOtaBerrySafebootUnfinished(struct bvm *vm) {
+  be_pushbool(vm, EspNowOtaSafebootUnfinished());
+  be_return(vm);
+}
+
+// The entry points put in the Berry machine, and again in a new one after BrRestart, which has none of what the old one had
+static void EspNowOtaBerryCheck(void) {
+  if (nullptr == berry.vm) { return; }
+  bool there = be_getglobal(berry.vm, "espnow_ota_safeboot_begin");
+  be_pop(berry.vm, 1);
+  if (there) { return; }
+  be_pushntvfunction(berry.vm, EspNowOtaBerrySafebootBegin);
+  be_setglobal(berry.vm, "espnow_ota_safeboot_begin");
+  be_pop(berry.vm, 1);
+  be_pushntvfunction(berry.vm, EspNowOtaBerrySafebootWrite);
+  be_setglobal(berry.vm, "espnow_ota_safeboot_write");
+  be_pop(berry.vm, 1);
+  be_pushntvfunction(berry.vm, EspNowOtaBerrySafebootFinish);
+  be_setglobal(berry.vm, "espnow_ota_safeboot_finish");
+  be_pop(berry.vm, 1);
+  be_pushntvfunction(berry.vm, EspNowOtaBerrySafebootUnfinished);
+  be_setglobal(berry.vm, "espnow_ota_safeboot_unfinished");
+  be_pop(berry.vm, 1);
+}
+#endif  // USE_BERRY
+
 /*********************************************************************************************\
  * Interface
 \*********************************************************************************************/
@@ -799,12 +1017,18 @@ bool Xdrv106(uint32_t function) {
   switch (function) {
     case FUNC_INIT:
       EspNowOtaSenderInit();
+#ifdef USE_BERRY
+      EspNowOtaBerryCheck();
+#endif
       break;
     case FUNC_LOOP:
       EspNowOtaSenderLoop();
       break;
     case FUNC_EVERY_SECOND:
       EspNowOtaSenderEverySecond();
+#ifdef USE_BERRY
+      EspNowOtaBerryCheck();
+#endif
       break;
     case FUNC_COMMAND:
       result = DecodeCommand(kEspNowOtaCommands, kEspNowOtaCommand);
