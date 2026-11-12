@@ -38,7 +38,8 @@
  * SSerialMode 0                 - Default mode (Console tee off, 115200bps, 8N1)
  * SSerialMode 1                 - Enable console tee
  * SSerialMode 2                 - Enable dump of serial data in log level 4
- * SSerialMode 3                 - Enable Sonoff WTS01 sensor decoding (ESP32 only)
+ * SSerialMode 3                 - Enable Sonoff WTS01 sensor decoding (ESP32 only). Its temperature is reported only from the first
+ *                                 valid datagram on, and no longer once none came for SERIAL_BRIDGE_WTS01_TIMEOUT seconds
  * SerialDelimiter 255           - Receive data between 32 and 127 only
  * SerialDelimiter 254           - Receive hexadecimal data
  * SerialDelimiter 128           - Receive no data between 32 and 127
@@ -52,6 +53,10 @@
 #ifdef ESP32
 #define USE_SERIAL_BRIDGE_WTS01
 #endif  // ESP32
+
+#ifndef SERIAL_BRIDGE_WTS01_TIMEOUT
+#define SERIAL_BRIDGE_WTS01_TIMEOUT 5      // Seconds without a valid WTS01 datagram (one a second) before its temperature is no longer reported
+#endif
 
 #ifdef SERIAL_BRIDGE_BUFFER_SIZE
 const uint16_t SERIAL_BRIDGE_BUFSIZE = SERIAL_BRIDGE_BUFFER_SIZE;
@@ -78,10 +83,12 @@ char *serial_bridge_buffer = nullptr;
 
 struct {
   uint32_t polling_window;
+  uint32_t wts01_received;                       // millis() of the last valid WTS01 datagram
   int      in_byte_counter = 0;
   float    temperature;
   uint8_t  log_index;
   bool     raw = false;
+  bool     wts01_seen = false;                   // A valid WTS01 datagram came since the mode was set
 } SBridge;
 
 /********************************************************************************************/
@@ -265,6 +272,8 @@ void SerialBridgeLoop(void) {
             sign = -1;
           }
           SBridge.temperature = sign * ((float)temp + ((float)serial_bridge_buffer[7] / 100.0f));
+          SBridge.wts01_received = millis();
+          SBridge.wts01_seen = true;
         }
       }
     }
@@ -426,6 +435,7 @@ void CmndSSerialMode(void) {
 #ifdef USE_SERIAL_BRIDGE_WTS01
       case SB_WTS01:
         Settings->sserial_mode = XdrvMailbox.payload;
+        SBridge.wts01_seen = false;                // A temperature from before the mode was set is no sensor's
         Settings->flag3.sb_receive_invert = 0;     // SetOption69  - (Serial) Invert Serial receive on SerialBridge
         Settings->sbaudrate = 9600 / 300;          // 9600bps
         SetSSerialConfig(3);                       // 8N1
@@ -442,9 +452,17 @@ void CmndSSerialMode(void) {
  * Presentation
 \*********************************************************************************************/
 
+#ifdef USE_SERIAL_BRIDGE_WTS01
+// The WTS01 temperature is only reported while datagrams come: before the first one it would be 0, and a sensor
+// unplugged or broken would otherwise keep reporting its last value
+bool SerialBridgeWts01Valid(void) {
+  return SBridge.wts01_seen && (TimePassedSince(SBridge.wts01_received) < SERIAL_BRIDGE_WTS01_TIMEOUT * 1000);
+}
+#endif  // USE_SERIAL_BRIDGE_WTS01
+
 void SerialBridgeShow(bool json) {
 #ifdef USE_SERIAL_BRIDGE_WTS01
-  if (SB_WTS01 == Settings->sserial_mode) {
+  if ((SB_WTS01 == Settings->sserial_mode) && SerialBridgeWts01Valid()) {
     float temperature = ConvertTemp(SBridge.temperature);
     if (json) {
       ResponseAppend_P(PSTR(",\"WTS01\":{\"" D_JSON_TEMPERATURE "\":%*_f}"), Settings->flag2.temperature_resolution, &temperature);
